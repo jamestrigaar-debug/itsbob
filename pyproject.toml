@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itsbob"
+version = "0.1.0"
+description = "A tick-based character simulation whose agent can spend energy to consult free-tier LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+]
+
+[project.optional-dependencies]
+# All three providers speak the OpenAI wire format, so langchain is not required.
+# Install this extra only if you want to wrap the router in a LangChain chain.
+langchain = ["langchain>=0.3", "langchain-openai>=0.2"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+itsbob = "itsbob.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
