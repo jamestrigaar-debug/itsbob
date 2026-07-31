@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "itsbob"
-version = "0.1.0"
-description = "A tick-based character simulation whose agent can spend energy to consult free-tier LLMs."
+version = "0.2.0"
+description = "A roleplay chatbot who earns credits to message you first, with file-injected persona and memory."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,6 +23,9 @@ itsbob = "itsbob.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+itsbob = ["templates/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

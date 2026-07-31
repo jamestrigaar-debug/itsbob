@@ -1,223 +1,258 @@
-# itsbob
+# 1tsb0b
 
-A tick-based character simulation where the character can call LLMs — and has to
-pay for it.
+A roleplay chatbot who speaks l33t, has to earn the right to message you, and
+never lets a language model write his dialogue.
 
-Bob has two memory banks, a finite pool of energy, and access to several free
-LLM providers. Every tick he decides what to do. Deciding *well* means thinking
-with a model, and thinking with a model costs energy priced on the tokens the
-call actually burned. Deciding *cheaply* means falling back on instinct. That
-trade-off, made every tick under a real budget, is the whole game.
+He runs on your laptop, always on, reachable from a browser anywhere. Talking
+*to* him is free. Messaging *you* first costs credits he earns by waiting and
+behaving — and when he spends them, you judge whether it was worth it.
 
-This is the framework, not the game: the loop runs, everything is wired
-together, and the interesting knobs are exposed and documented.
+Two things matter. **The API makes decisions, not sentences** — it is called
+under a rigid protocol and must answer with exactly one control line, and the
+words come from a pool of 426 pre-written, tone-tagged lines. And **his
+personality is learned, not configured** — from your feedback and his memory,
+with no API calls at all.
 
 ```
-                    ┌─────────────────────────────────────────┐
-   world ──perceive─▶│              MemoryBank                 │
-                    │  short term (bounded, decaying)         │
-                    │        │ consolidate ▼                  │
-                    │  long term (SQLite, importance-ranked)  │
-                    └────────┬────────────────────────────────┘
-                             │ recall
-                             ▼
-   needs ──▶  DecisionPolicy ──▶ Decision ──▶ Action ──▶ ActionResult
-   traits         │  instinct (free)                        │
-                  │  deliberation ──▶ LLMRouter ──▶ tokens ──┤
-                  └───────────────────────────────┐         │
-                                                  ▼         ▼
-                                            EnergyLedger ◀───┘
+   1TSB0B|P00L|8.4|0.3|0.0|7.5|1.0|7.0|good news
+   ───┬── ─┬── ─────────┬───────────── ────┬────
+   sentinel │      six tone axes        topic hint
+          action
 ```
 
-## Install
+Anything else — a stray "Sure!", a code fence, `8` instead of `8.0` — is a
+protocol violation. One terse correction, then a deterministic local decision
+takes over. A model having a bad day can produce a malformed line; it cannot
+produce a surprising personality or an unbounded bill.
+
+## The loop
+
+```
+  message ──► read persona.md + short_term.md + long_term.md, recall memories
+                 │
+                 ▼
+            STRICT PROTOCOL CALL ──► 1TSB0B|<ACTION>|<6 tone axes>|<topic>
+                 │                        │
+                 │                   violation? one correction, then local
+                 ▼
+            P00L ────► nearest line in tone-space (426 pre-written l33t lines)
+            C0MP0S3 ─► write one in that exact tone, forced to l33t
+            S1L3NC3 ─► say nothing (a real veto on spending credits)
+```
+
+## Start here
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+
+cp .env.example .env        # paste in whichever free API keys you have
+itsbob init                 # creates data/ — persona, memories, pool
+itsbob serve --open         # he's live; the browser opens with your token
 ```
 
-The only runtime dependency is `openai` — all three providers speak the OpenAI
-wire format, so no per-vendor SDK is needed. LangChain is available as an
-optional extra (`pip install -e ".[langchain]"`) if you want to wrap the router
-in a chain, but nothing here requires it.
+No keys? Still runs. The local decision path covers everything and the pool
+supplies the words, so he is never mute and never out of character.
 
-## Keys
+## Commands
 
 ```bash
-cp .env.example .env   # then fill in whichever keys you have
+itsbob serve                       # always-on: web UI + the outreach loop
+itsbob serve --tunnel              # ...and publish a public URL
+itsbob chat                        # terminal, shows the tone of every reply
+itsbob pool --tone 0,8,9.5,0,2,9   # what he'd say at that mood
+itsbob pool --category sarcasm     # browse by declared category
+itsbob credits                     # balance, standing, why he can't message you
+itsbob traits                      # his learned personality and what it earns him
+itsbob doctor --probe              # which providers answer right now
+itsbob models                      # what each provider will actually try
+itsbob memory --query boats        # what he remembers
 ```
 
-`.env` is gitignored. Every provider is optional: with no keys at all the
-simulation runs on a deterministic offline provider and still exercises every
-real code path, so nothing about the framework requires a network.
+## The six axes
 
-```bash
-itsbob doctor --probe        # which providers actually answer right now
-```
-
-## Run
-
-```bash
-itsbob run --ticks 25 --seed 7            # narrate a run
-itsbob run --ticks 25 --offline           # no network, deterministic
-itsbob run --ticks 50 --db runs/bob.db    # persist long-term memory
-itsbob run --ticks 25 --json              # machine-readable
-itsbob ask "what is a memory bank?"       # one-shot through the router
-itsbob memory runs/bob.db --query oracle  # inspect what stuck
-```
+Every pool line is tagged, in leet, with where it sits on:
 
 ```
-t  1  [  instinct   ] consult_oracle  energy 100.0→ 96.8 | Bob consults the oracle — Systematically inspect and catalog…
-t  2  [  instinct   ] eat             energy  96.8→100.0 | Bob eats, without ceremony.
-t  3  [deliberation ] observe         energy 100.0→ 90.8 | Bob looks around: there are footprints that do not match anyone here
-t  4  [  instinct   ] rest            energy  90.8→100.0 | Bob sits down and does nothing on purpose.
-t  5  [  fallback   ] socialize       energy 100.0→ 90.5 | Bob talks with the quiet neighbour.
+[P0s1t1v1ty: 8.4] [N3g4t1v1ty: 0.3] [H0st1l1ty: 0.0]
+[C0m3dy: 7.5] [S4rc4sm: 1.0] [H0n3sty: 7.0]
 ```
 
-In code:
+The **first tag is the declared category** — that is how the shipped pool
+breaks down:
 
-```python
-from itsbob import build_simulation
+| category | lines |
+|---|---|
+| comedy | 95 |
+| positivity | 89 |
+| honesty | 71 |
+| negativity | 64 |
+| sarcasm | 55 |
+| hostility | 52 |
 
-sim = build_simulation(seed=7, policy="hybrid")
-for report in sim.stream(20):
-    print(report.line())
-sim.finish()
-print(sim.summary())
-```
+(Category comes from tag *order*, not the largest number. Honesty is rated high
+on nearly every line, so taking the max would file 100 of them under "honesty".)
 
-## How it works
+Selection trades off three things, because nearest-tone alone is not enough:
 
-### The tick
+- **tone** — distance in six-dimensional mood space, the dominant term;
+- **relevance** — lexical overlap with what you actually said, so the reply is
+  about something rather than merely correctly-moody;
+- **recency** — a penalty on lines used lately, or the pool repeats
+  itself in an afternoon.
 
-`Simulation.step()` runs one cycle, and every other part of the framework exists
-to serve it:
+Variety comes from sampling among lines *close to* the best, never from a flat
+top-K — otherwise a badly-toned line gets picked exactly when the pool is
+thinnest.
 
-1. **world advances** — clock, phase, weather drift
-2. **perceive** — an observation is written to memory
-3. **recall** — memory is queried using the most pressing need as the query
-4. **decide** — a policy picks one available action
-5. **act** — the action runs and reports consequences
-6. **pay & record** — energy is debited, needs and mood shift, memories are written
-7. **consolidate** — the working set decays; what survives moves to long-term
-8. **regenerate** — a trickle of energy comes back
+## L33t
 
-### Energy
+`a→4 e→3 i→1 o→0`, encoded on the way out, decoded for matching so "h3ll0" and
+"hello" are the same word to retrieval. Composed replies are re-encoded rather
+than trusted to the model, because models drift out of leet constantly.
 
-One currency, `EnergyLedger`, with a full audit trail (`spent_by_reason()`
-breaks a run down by where it went). Actions have fixed prices; LLM calls do
-not. `TokenCostModel` bills a call *after* it returns, from real usage, with
-completion tokens weighted double — so a rambling answer genuinely costs more
-than a terse one.
+Real numbers survive: a lone `1` is "i", but `100,000` stays `100,000`.
 
-Two consequences worth knowing:
+## The economy
 
-- `affordable_max_tokens()` shrinks the output budget to what the ledger can
-  cover, so a tired character asks a shorter question rather than being locked
-  out of thinking entirely.
-- Below `exhaustion_threshold`, deliberation is off the table and recovery
-  actions get a large scoring bonus. Exhaustion changes what Bob *can* consider,
-  not just what he prefers.
+| | |
+|---|---|
+| **credits** | Spendable. Accrue with time, consumed by outreach. |
+| **standing** | Reputation, 0–1. Scales earn rate, gates outreach, and **colours his voice** — a Bob who's been told off gets audibly sourer. |
 
-### Memory
-
-Two stores behind one `MemoryBank` facade.
-
-**Short term** is a bounded deque with per-tick salience decay. Capacity is the
-point: every arrival forces a keep-or-drop decision. A record leaves by being
-pushed off the end or by fading below the salience floor — either way it is
-handed to consolidation, never silently dropped.
-
-**Long term** is SQLite. Retrieval blends three signals — lexical relevance,
-importance, and recency decay — the generative-agents recipe. SQL narrows the
-candidates, Python scores them, which means swapping the bag-of-words scorer for
-a real embedder is a `relevance_fn` argument and nothing else.
-
-**Consolidation** is selective, and that is the interesting part. A memory is
-promoted if it was important when formed, *or* if it was recalled more than once
-(rehearsal is evidence of usefulness), *or* if it is a reflection or a fact. The
-rest is forgotten on purpose.
-
-**Reflection** periodically asks an LLM to distill recent memories into durable
-insights, stored as high-importance records that then shape later recalls. It
-degrades to a no-op without a router — reflection is a luxury, never a
-dependency.
-
-### Decisions
-
-Three policies, differing only in what deliberation costs:
-
-| policy | cost | behavior |
+| What you do | Credits | Standing |
 |---|---|---|
-| `heuristic` | free | scores actions by need relief ÷ energy price, nudged by traits |
-| `llm` | `deliberation_cost` + tokens | asks a model, validates the reply against the real option list |
-| `hybrid` | *sometimes* | deliberates only when pressure is high and energy allows |
+| Approve a message | +6 | +0.10 |
+| Reply to it | +3 | +0.05 |
+| Turn it down | −8 | −0.20 |
+| Ignore it for 6 hours | −3 | −0.08 |
 
-Traits amplify needs rather than acting as flat bonuses — a curious character
-reaches for the oracle *when curious*, not unconditionally. Without this, one
-trait quietly dominates every choice.
+Silence counts. Unanswered outreach is swept as *ignored* — the mechanism that
+stops him learning that sending more messages is free.
 
-The LLM policy never trusts the model: a hallucinated action name, malformed
-JSON, or a dead provider all fall back to instinct with the reason recorded in
-the decision's rationale. A tick cannot fail because a model misbehaved.
+Even with credits he won't message you if he's grounded (standing under 0.15),
+within 45 minutes of his last, over the daily cap of 8, in quiet hours
+(23:00–08:00), or already holding an unanswered message. And the protocol can
+return `S1L3NC3`, which is a real veto — deciding not to speak costs nothing.
 
-### The LLM layer
+## Personality he earns
 
-`LLMRouter` sits over any number of providers and is useful on its own,
-independent of the simulation.
+He starts with a disposition and it moves. Approve a hostile line and hostility
+becomes native. Turn his sarcasm down enough times and it drains out. **None of
+this costs an API call** — it is arithmetic over verdicts and memory, so it keeps
+working when every free tier is rate limited.
 
-- **Failover** in priority, round-robin, random, or least-used order.
-- **Error semantics that match reality.** A bad model id (404) is a *model*
-  problem, so the router tries that provider's next model. A 5xx or timeout is a
-  *provider* problem, so it moves on — retrying a second model on the same dead
-  host is wasted time. A 429 is either, depending on the vendor:
-  `rate_limit_scope` marks Gemini as per-model (siblings still have budget) and
-  Groq/OpenRouter as per-account.
-- **Local rate budget** per provider, so free quota is spent deliberately rather
-  than discovered through 429s.
-- **Circuit breaker** with a half-open probe after cooldown.
-- **Usage tracking** of every attempt, success or failure — this is what the
-  energy economy bills against.
-
-Free model ids churn constantly. Everything in `llm/catalog.py` is a default,
-overridable per provider by env var, with fallbacks the router walks
-automatically. `discover_openrouter_free_models()` asks OpenRouter what is
-actually free today.
-
-## Extending it
-
-Each seam is a constructor argument, so nothing requires forking the loop.
-
-```python
-from itsbob import ActionResult, build_simulation, default_registry
-from itsbob.memory import MemoryKind
-
-registry = default_registry()
-
-@registry.add("forage", "Search the yard for food and see what else turns up.",
-              energy_cost=4, satisfies={"sustenance": 0.5, "curiosity": 0.35})
-def forage(ctx):
-    found = ctx.rng.random() < 0.5
-    return ActionResult(
-        narrative="Bob turns up something edible." if found else "Bob finds nothing.",
-        needs_delta={"sustenance": -0.5 if found else 0.0, "curiosity": -0.2},
-    ).remember(f"Foraged the yard: {'found food' if found else 'nothing'}",
-               MemoryKind.ACTION, 0.4)
-
-sim = build_simulation(registry=registry, policy="heuristic", seed=11)
+```
+   you approve  ──► disposition pulls toward the tone that worked
+   you turn down ─► disposition pushes toward its opposite (harder than approval pulls)
+   you reply     ─► a weaker pull — engaging is the outcome he wants
+   you ignore    ─► a weaker push, and patience erodes
 ```
 
-Note the `satisfies` map is what the heuristic policy scores against, so it has
-to be honest about what the action relieves — declare too little and the action
-never gets picked, too much and it crowds everything else out.
+Five traits fall out of that, all derived rather than stored:
 
-- **New verbs** — register an `Action`; every policy picks it up automatically.
-- **New policies** — anything with `decide(ctx) -> Decision` satisfies the protocol.
-- **New providers** — add a `ProviderConfig`; unknown names get the generic
-  OpenAI-compatible client, so a new vendor is usually config, not code.
-- **Real embeddings** — pass `relevance_fn` to either memory store.
-- **Observability** — subscribe to the `EventBus` (`decision`, `action`, `tick`,
-  `action_error`); a listener that raises cannot take the run down.
+| trait | what it measures |
+|---|---|
+| **attunement** | share of judged messages that landed, smoothed while the sample is small |
+| **rapport** | shared history — grows with what he actually *remembers* about you |
+| **warmth** | how warm the things you approve of are |
+| **volatility** | how much his temperament has been swinging |
+| **patience** | tolerance for being ignored; rapport buys it |
+
+**Rewards are literally more credits.** Attunement and rapport set an earn-rate
+multiplier from x0.4 to x1.8, so judgement you keep approving compounds and
+judgement you keep rejecting starves. Standing (fast, forgiving) and the trait
+multiplier (slow, earned) move on different timescales rather than
+double-counting one good day.
+
+The disposition then biases every reply — protocol decisions *and* the local
+floor — weakly at first and more strongly as rapport grows. It never replaces
+the decision; the situation still leads.
+
+```bash
+itsbob traits
+```
+
+```
+after you approve 8 hostile messages
+  disposition  pos 1.2, neg 6.8, hos 7.1, com 1.4, sar 6.3, hon 8.8
+  attunement 0.83   rapport 0.32
+  credit rate  x1.46
+
+after you then turn down 10 of them
+  disposition  pos 9.1, neg 2.5, hos 1.7, com 9.1, sar 3.3, hon 1.8
+  credit rate  x1.09
+```
+
+One thing to know: disapproval reflects *every* axis of the rejected tone, not
+just the loud one. Turning down a hostile-but-honest line teaches him to be
+less honest too. That is the simple, predictable rule; retune `_PULL`/`_PUSH` in
+`traits.py` if you want something more surgical.
+
+Delete `data/traits.json` and he reverts to his starting temperament.
+
+## The files are the interface
+
+| File | What it is |
+|---|---|
+| `data/persona.md` | Who he is. Read on every response — edit it and his next message changes. |
+| `data/memory/short_term.md` | The last ~20 turns. Rewritten automatically. |
+| `data/memory/long_term.md` | What he knows about you. **Source of truth** — delete a line and he forgets it. |
+| `data/pool.txt` | The 426 tone-tagged lines. Add your own. |
+| `data/traits.json` | His learned personality. Delete it to reset him. |
+| `data/responses.json` | Intent-matched lines, used as the last-resort floor. |
+
+All reloaded on change. No restart.
+
+Behind the markdown, `memory/` keeps a SQLite store doing ranked retrieval so
+recall works past what fits in a prompt. Handwritten long-term lines survive
+every sync, and important disclosures are written immediately rather than
+waiting for eviction.
+
+## Reaching him from anywhere
+
+`itsbob serve` binds to `127.0.0.1` and every API call needs a token (generated
+into `data/token.txt`). To reach him off your laptop:
+
+```bash
+itsbob serve --tunnel            # cloudflared or ngrok, whichever is installed
+```
+
+It prints a public URL with the token in it. **Treat that link as a password.**
+If no tunnel client is installed it says so and carries on locally.
+
+## Examples
+
+```bash
+python examples/01_talk_to_bob.py          # replies, with the decision behind each
+python examples/02_credits_and_feedback.py # earning, spending, discipline
+python examples/03_router_only.py          # the failover router by itself
+python examples/04_memory_only.py          # the memory bank by itself
+python examples/05_the_protocol.py         # what's accepted, rejected, and why
+python examples/06_personality.py          # feedback becoming personality, offline
+```
+
+## Repository map
+
+```
+src/itsbob/
+  protocol.py      the strict control-line spec, validator, and fallback
+  tone.py          the six axes: parsing, distance, blending
+  pool.py          the tone-tagged pool and its selection
+  leet.py          a→4 e→3 i→1 o→0, both directions
+  bob.py           reply() and consider_outreach()
+  credits.py       the economy: balance, standing, the outreach gate
+  traits.py        learned personality, and the credit reward loop
+  persona.py       reads/writes persona.md and the memory files
+  conversation.py  the message log
+  server.py        HTTP API + the always-on outreach loop
+  ui.py            the browser page, showing each reply's tone
+  tunnel.py        cloudflared / ngrok
+  llm/             failover router over the free providers
+  memory/          two-tier memory behind the markdown files
+  templates/       the shipped pool
+tests/             212 tests, no network required
+```
 
 ## Tests
 
@@ -225,20 +260,27 @@ never gets picked, too much and it crowds everything else out.
 pytest
 ```
 
-87 tests, no network, no API keys, fully deterministic — the offline provider is
-a real fallback rather than a mock, so the suite exercises the same paths a live
-run takes.
+212 tests, no network, no API keys. The protocol tests pin every rejection case
+individually — preamble, missing decimal, wrong sentinel, two lines, fenced
+output — because "highly strict" is only true if it's enforced. One test asserts
+the whole trait engine makes exactly zero API calls. Tests named as
+regressions pin behaviour that was actually broken once.
 
-## Known constraints
+## Troubleshooting
 
-- **Free tiers fail constantly**, and that is the router's entire reason to
-  exist. In live testing Gemini returned both a 503 (model overloaded) and a 429
-  (quota) within a handful of ticks; the run continued on fallbacks. Expect
-  `doctor --probe` to show a partly-degraded set of providers as the normal
-  state.
-- **Reasoning models need output headroom.** Gemini's flash models spend part of
-  `max_tokens` on hidden thinking and will return empty content with
-  `finish_reason: length` if the budget is too tight. The provider surfaces that
-  as retryable rather than as an empty answer; keep `max_tokens` ≥ ~256.
-- **The economy constants are a starting point, not a balanced game.** They live
-  in `EnergySettings` and the action definitions, and are meant to be tuned.
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every reply says `source: local` | no provider answering, or none complying | `itsbob doctor --probe` |
+| Replies feel off-tone | the pool has nothing near that mood | add lines, or retune vectors in `data/pool.txt` |
+| He never messages first | working as designed — he declines most ticks | `itsbob credits` names the gate that's blocking him |
+| He's suddenly sour | low standing, or a learned disposition | `itsbob traits`; approve a few, or delete `data/traits.json` |
+| He earns credits oddly fast/slow | the trait multiplier | `itsbob traits` shows it; it follows your approvals |
+| Replies aren't in leet | a composed line drifted | it's re-encoded automatically; report it if you see plain text |
+| Forgot the token | | `cat data/token.txt` |
+| Want him to forget something | | delete the line from `data/memory/long_term.md` |
+
+## A note on privacy
+
+`data/` holds your access token, the whole conversation, and everything he has
+concluded about you. It's gitignored. Behind a tunnel, the link is the only
+thing standing between that and anyone who has it.
