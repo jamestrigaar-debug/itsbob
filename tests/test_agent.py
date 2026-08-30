@@ -277,6 +277,25 @@ def test_the_writer_stores_extracted_facts(tmp_path):
     assert [r.content for r in written] == ["James lives in Reading"]
 
 
+def test_what_the_agent_remembered_is_hidden_from_the_writer(tmp_path):
+    """Otherwise one statement becomes three near-identical rows."""
+    store = LongTermMemory(":memory:", embedder=None)
+    toolbox = build_toolbox(memory=store, workspace=tmp_path / "ws", mode=Mode.TRUSTED, env={})
+    brain = FakeBrain(
+        [
+            {"tool": "remember", "params": {"content": "James keeps SSH keys in ~/.ssh/work"}},
+            {"final": "Noted."},
+            {"memories": []},  # what the writer is asked
+        ]
+    )
+    agent = Agent(brain=brain, toolbox=toolbox, memory=store, gatekeeper=Gatekeeper())
+    agent.writer = MemoryWriter(brain=brain, store=store)
+    agent.chat("I keep my SSH keys in ~/.ssh/work, remember that please")
+    # The writer's prompt must list what was just stored as already known.
+    assert "~/.ssh/work" in brain.requests[-1].messages[-1].content
+    assert len(store) == 1
+
+
 def test_the_writer_skips_a_duplicate(tmp_path):
     store = LongTermMemory(":memory:", embedder=None)
     store.add(MemoryRecord(content="James lives in Reading"))

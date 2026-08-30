@@ -205,7 +205,14 @@ class Agent:
         emit("final", text=answer, tier=tier.value, steps=len(turn.steps))
 
         if self.writer is not None and answer:
-            for record in self.writer.write(message=message, answer=answer, known=memories):
+            # Anything the agent already wrote with `remember` this turn counts
+            # as known. Without this the writer re-extracts what was just
+            # stored, in slightly different words, and near-duplicates are the
+            # one thing that degrades recall fastest: three rows saying the
+            # same thing all surface with equal confidence, and none of them is
+            # the one you would have written.
+            known = [*memories, *_written_this_turn(turn)]
+            for record in self.writer.write(message=message, answer=answer, known=known):
                 turn.remembered.append(record.content)
                 emit("memory", wrote=record.content, id=record.id)
 
@@ -234,7 +241,7 @@ class Agent:
                 memories=memories,
                 steps=turn.steps,
                 apis=self.toolbox.catalog.render_for_prompt(self.toolbox.env)
-                if self.toolbox.catalog and len(self.toolbox.catalog)
+                if self.toolbox.catalog is not None and len(self.toolbox.catalog)
                 else "",
                 workspace=self.toolbox.policy.workspace,
                 policy_note=_policy_note(self.toolbox),
@@ -395,6 +402,23 @@ class Agent:
             f"I stopped because {why}. Steps completed: {len(turn.steps)} "
             f"(tools used: {done}). Ask again with a narrower request and I'll pick it up."
         )
+
+
+class _Known:
+    """Adapter so a plain string looks like a recall hit to the writer."""
+
+    __slots__ = ("content",)
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+def _written_this_turn(turn: Turn) -> list[_Known]:
+    return [
+        _Known(str(step.params.get("content", "")).strip())
+        for step in turn.steps
+        if step.tool == "remember" and step.ok and step.params.get("content")
+    ]
 
 
 def _user_refused(result: Any) -> bool:

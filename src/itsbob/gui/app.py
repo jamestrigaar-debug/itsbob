@@ -1,493 +1,410 @@
-"""A chat + live "thinking" monitor GUI over the complexity router.
+"""Browser interface: chat on the left, what it is doing on the right.
 
-Left: a chat box — type a game state (JSON, or plain text — plain text is
-wrapped into `{"facts": {"message": "..."}}` automatically) and see itsbob's
-reply. Right: a running feed of what the pipeline actually did for each
-message — which tier answered, the Gatekeeper's reasoning and fingerprint,
-cache hit/miss, which provider/model got called, any escalation, which
-scripts ran, and latency against the 1.8s budget. That right-hand feed is
-the "monitor" — it's meant to answer "why did it do that" and "which model
-is it actually calling" without reading logs.
+The point of the right-hand panel is that an agent with tools is opaque in a
+way a chatbot is not. "It said it updated the file" and "it updated the file"
+are different claims, and only one of them is verifiable from a transcript. So
+every step is shown as it happens: the tier chosen and why, which model
+answered, each tool call with its arguments and result, what was recalled from
+memory, and what was written back.
 
-Deliberately a single Flask file with the page template inlined as a string
-— there is exactly one page worth having a GUI for, so a build step or a
-frontend framework would be pure overhead. Flask is an optional dependency
-(the `gui` extra); everything else in this package works without it.
+Binds to 127.0.0.1 with no authentication. It is a local interface for one
+person, not a deployed service — anything that can reach the port can run
+tools as you.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import threading
+import time
 import webbrowser
+from pathlib import Path
 from typing import Any
-
-from ..config import Settings
-from ..factory import build_router
-from ..llm.local import is_ollama_running
-from ..router import build_complexity_router
 
 __all__ = ["create_app", "run_gui"]
 
-EXAMPLE_MESSAGES = [
-    '{"facts": {"stamina": 15, "minute": 60}}',
-    '{"facts": {"opponent_formation": "4-3-3", "minute": 78}, "events": ["opponent playing narrow tactic"]}',
-    '{"facts": {"player": "star striker"}, "events": ["player unhappy about contract renegotiation"]}',
-]
 
-
-def _parse_as_state(text: str, *, wrap_key: str) -> dict[str, Any]:
-    """JSON (either flat facts, or {"facts":..., "events":...}) or plain text,
-    normalized to {"facts": {...}, "events": [...]}."""
-    stripped = text.strip()
-    if not stripped:
-        return {"facts": {}, "events": []}
+def create_app(home: Path | None = None, *, mode: str | None = None):
     try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        return {"facts": {wrap_key: stripped}, "events": []}
-    if isinstance(parsed, dict):
-        if "facts" in parsed or "events" in parsed:
-            return {"facts": dict(parsed.get("facts") or {}), "events": list(parsed.get("events") or [])}
-        return {"facts": parsed, "events": []}
-    return {"facts": {wrap_key: stripped}, "events": []}
-
-
-def _merge_context_and_message(context_text: str, message_text: str) -> dict[str, Any]:
-    """Context is background state (set/overridden first); the message is the
-    live turn on top of it — mirroring how a real screen-scrape (context)
-    plus a fresh event (message) would combine. Both accept JSON or plain
-    text independently, which is the point: for testing, you can hold a
-    context fixed as JSON and vary the message as plain text, or vice versa.
-    """
-    ctx = _parse_as_state(context_text, wrap_key="context")
-    msg = _parse_as_state(message_text, wrap_key="message")
-    return {
-        "facts": {**ctx["facts"], **msg["facts"]},
-        "events": [*ctx["events"], *msg["events"]],
-    }
-
-
-def create_app():
-    try:
-        from flask import Flask, jsonify, render_template_string, request
-    except ImportError as exc:  # pragma: no cover - exercised via cli error path
-        raise ImportError(
-            "Flask is required for the GUI. Install it with: pip install -e \".[gui]\""
+        from flask import Flask, Response, jsonify, request
+    except ImportError as exc:  # pragma: no cover - depends on install
+        raise SystemExit(
+            "the GUI needs Flask — install it with:  pip install -e '.[gui]'"
         ) from exc
 
-    app = Flask(__name__)
-    settings = Settings.from_env()
-    state_lock = threading.Lock()
-    router_holder: dict[str, Any] = {"router": None}
+    from ..agent import build_agent, default_home
+    from ..agent.context import Conversation
+    from ..daemon import TaskStore
+    from ..tools import Mode
 
-    def get_router():
-        with state_lock:
-            if router_holder["router"] is None:
-                router_holder["router"] = build_complexity_router(settings)
-            return router_holder["router"]
+    root = Path(home) if home else default_home()
+    app = Flask(__name__)
+    state: dict[str, Any] = {"agent": None, "tasks": None}
+    lock = threading.Lock()
+
+    def agent():
+        # Built on first use, not at import: a browser tab opening should not
+        # be what discovers that a key is missing.
+        with lock:
+            if state["agent"] is None:
+                state["agent"] = build_agent(
+                    home=root,
+                    mode=Mode(mode) if mode else None,
+                    # No confirm handler: a web request has nobody attached to
+                    # it, so confirm-gated tools are refused rather than
+                    # silently approved by whoever left the tab open.
+                    confirm=None,
+                )
+            return state["agent"]
+
+    def tasks():
+        with lock:
+            if state["tasks"] is None:
+                state["tasks"] = TaskStore(root / "tasks.sqlite")
+            return state["tasks"]
 
     @app.get("/")
     def index():
-        return render_template_string(_PAGE, examples=json.dumps(EXAMPLE_MESSAGES))
+        return Response(PAGE, mimetype="text/html")
 
     @app.get("/favicon.ico")
     def favicon():
-        return "", 204
+        return Response(status=204)
 
     @app.get("/api/status")
     def status():
-        mode = os.environ.get("ITSBOB_ROUTER_MODE", "priority").strip() or "priority"
-
-        def describe(router) -> list[dict[str, Any]]:
-            return [
-                {
-                    "name": row["provider"],
-                    "configured": row["configured"],
-                    "models": row["models"],
-                    "circuit_open": row["circuit_open"],
-                }
-                for row in router.describe()
-            ]
-
-        if mode == "google-tiered":
-            router = get_router()
-            tier_info = {
-                "tier_b": describe(router.cloud_router),
-                "tier_a": describe(router.premium_router),
-            }
-            providers = tier_info["tier_b"]  # for clients that only read the flat list
-        else:
-            tier_info = None
-            providers = describe(build_router(settings))
-
+        bob = agent()
+        # `is not None`, not truthiness: LongTermMemory defines __len__, so an
+        # empty store is falsy and a fresh install would report no memory
+        # subsystem at all rather than an empty one.
+        memory = bob.memory.stats() if bob.memory is not None else {}
         return jsonify(
             {
-                "mode": mode,
-                "local_back_brain": {
-                    "reachable": is_ollama_running(),
-                    "note": "ollama serve on 127.0.0.1:11434",
+                "home": str(root),
+                "policy": bob.toolbox.policy.describe(),
+                "tools": bob.toolbox.registry.names(),
+                "tiers": {
+                    tier: {
+                        "label": info["label"],
+                        "providers": [
+                            {"name": row["provider"], "model": (row["models"] or [None])[0],
+                             "configured": row["configured"]}
+                            for row in info["providers"]
+                        ],
+                    }
+                    for tier, info in bob.brain.describe()["tiers"].items()
                 },
-                "cloud_providers": providers,
-                "tiers": tier_info,
+                "local": bob.brain.describe()["local"],
+                "memory": memory,
+                "apis": bob.toolbox.catalog.describe() if bob.toolbox.catalog else [],
+                "tasks": [t.as_dict() for t in tasks().all()],
+                "turns": len(bob.conversation),
             }
         )
 
     @app.post("/api/chat")
     def chat():
-        """One turn: context + message in (each freeform or JSON), a chat reply + full trace out.
-
-        ``context`` is optional background state, merged in *before* the
-        message so a message's facts/events win on overlap — meant for
-        testing a fixed scenario (context) against varying inputs (message)
-        without retyping the whole state each time.
-        """
         payload = request.get_json(force=True, silent=True) or {}
-        message_text = str(payload.get("message", ""))
-        context_text = str(payload.get("context", ""))
-        goal = payload.get("goal") or "win the league"
-        classify_only = bool(payload.get("classify_only"))
+        message = str(payload.get("message", "")).strip()
+        if not message:
+            return jsonify({"error": "empty message"}), 400
 
-        parsed = _merge_context_and_message(context_text, message_text)
+        bob = agent()
+        events: list[dict[str, Any]] = []
+        turn = bob.chat(
+            message,
+            context=payload.get("context") or None,
+            on_event=lambda e: events.append(e.as_dict()),
+        )
+        return jsonify({"reply": turn.final, "turn": turn.as_dict(), "events": events})
 
-        router = get_router()
-        router.goal = goal
+    @app.post("/api/reset")
+    def reset():
+        agent().conversation = Conversation()
+        return jsonify({"ok": True})
 
-        if classify_only:
-            from ..router import compress
+    @app.get("/api/memory")
+    def memory_search():
+        bob = agent()
+        if bob.memory is None:
+            return jsonify({"hits": []})
+        query = request.args.get("q", "").strip()
+        limit = min(50, int(request.args.get("limit", 12)))
+        hits = (
+            bob.memory.search(query, limit=limit)
+            if query
+            else [type("H", (), {"as_dict": lambda s, r=r: _record_dict(r)})()
+                  for r in bob.memory.recent(limit)]
+        )
+        return jsonify({"hits": [h.as_dict() for h in hits]})
 
-            decision = router.gatekeeper.classify(compress(parsed))
-            trace = {"classify_only": True, "decision": decision.as_dict()}
-            reply = (
-                f"[classify only] Tier {decision.tier.value} ({decision.tier.label}) — "
-                f"{decision.reasoning}"
+    @app.post("/api/memory/forget")
+    def memory_forget():
+        payload = request.get_json(force=True, silent=True) or {}
+        bob = agent()
+        ok = bool(bob.memory is not None and bob.memory.forget(str(payload.get("id", ""))))
+        return jsonify({"ok": ok})
+
+    @app.get("/api/audit")
+    def audit():
+        return jsonify({"entries": agent().toolbox.audit.recent(40)})
+
+    @app.post("/api/task")
+    def task_create():
+        payload = request.get_json(force=True, silent=True) or {}
+        try:
+            task = tasks().create(
+                str(payload.get("name", "")).strip() or "untitled",
+                str(payload.get("prompt", "")).strip(),
+                str(payload.get("schedule", "")).strip(),
             )
-            return jsonify({"reply": reply, "trace": trace})
+        except Exception as exc:  # noqa: BLE001 - a bad schedule is user error
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"task": task.as_dict()})
 
-        try:
-            result = router.route(parsed)
-        except Exception as exc:  # noqa: BLE001 - surface it in chat, don't 500 blindly
-            return jsonify(
-                {
-                    "reply": f"Pipeline error: {type(exc).__name__}: {exc}",
-                    "trace": {"error": str(exc)},
-                }
-            )
-
-        trace = result.as_dict()
-        trace["cache_stats"] = router.cache.stats()
-
-        if result.needs_user:
-            reply = f"⚠ {result.note} ({result.error})"
-        elif result.actions:
-            reply = f"{result.note}".strip() or f"Ran: {', '.join(result.actions)}"
-        else:
-            reply = result.note or "(no action taken)"
-
-        return jsonify({"reply": reply, "trace": trace})
-
-    # Kept for scripting/curl use and backward compatibility with earlier GUI versions.
-    @app.post("/api/route")
-    def route():
+    @app.post("/api/task/remove")
+    def task_remove():
         payload = request.get_json(force=True, silent=True) or {}
-        raw_state = payload.get("state")
-        goal = payload.get("goal") or "win the league"
-        if raw_state is None:
-            return jsonify({"error": "missing 'state'"}), 400
-        try:
-            parsed = json.loads(raw_state) if isinstance(raw_state, str) else raw_state
-        except json.JSONDecodeError as exc:
-            return jsonify({"error": f"invalid JSON: {exc}"}), 400
-
-        router = get_router()
-        router.goal = goal
-        try:
-            result = router.route(parsed)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
-        payload = result.as_dict()
-        payload["cache_stats"] = router.cache.stats()
-        return jsonify(payload)
-
-    @app.post("/api/classify")
-    def classify():
-        payload = request.get_json(force=True, silent=True) or {}
-        raw_state = payload.get("state")
-        if raw_state is None:
-            return jsonify({"error": "missing 'state'"}), 400
-        try:
-            parsed = json.loads(raw_state) if isinstance(raw_state, str) else raw_state
-        except json.JSONDecodeError as exc:
-            return jsonify({"error": f"invalid JSON: {exc}"}), 400
-
-        from ..router import compress
-
-        router = get_router()
-        decision = router.gatekeeper.classify(compress(parsed))
-        return jsonify(decision.as_dict())
+        return jsonify({"ok": tasks().remove(str(payload.get("id", "")))})
 
     return app
 
 
-def run_gui(*, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
-    app = create_app()
-    url = f"http://{host}:{port}/"
-    print(f"itsbob GUI running at {url}  (Ctrl+C to stop)")
+def _record_dict(record: Any) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "content": record.content,
+        "kind": record.kind.value,
+        "created_at": record.created_at,
+        "score": 0.0,
+        "why": "recent",
+    }
+
+
+def run_gui(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    open_browser: bool = True,
+    home: Path | None = None,
+    mode: str | None = None,
+) -> None:
+    app = create_app(home, mode=mode)
+    url = f"http://{host}:{port}"
+    print(f"itsbob gui → {url}   (ctrl-c to stop)")
     if open_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
-_PAGE = """
-<!doctype html>
-<html lang="en" data-theme="light">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>itsbob router</title>
-<style>
-  :root {
-    --bg: #f7f7f5; --panel: #ffffff; --border: #e3e1db; --text: #1c1c1a;
-    --muted: #6b6b63; --accent: #2f6f4f;
-    --tier-d: #6b6b63; --tier-c: #2f6f4f; --tier-b: #1d6fa8; --tier-a: #a8631d; --tier-s: #a82f2f;
-    --bubble-user: #eaf1ee; --bubble-bot: #f3f2ee;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden;
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    display: flex; flex-direction: column; }
-  header { padding: 14px 20px 10px; border-bottom: 1px solid var(--border); flex: none; }
-  header h1 { margin: 0 0 4px; font-size: 18px; }
-  header p { margin: 0; color: var(--muted); font-size: 12.5px; }
-  #status-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-  .stat { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
-  .stat.ok { color: var(--accent); border-color: var(--accent); }
-  .stat.down { color: var(--muted); }
-
-  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
-    gap: 0; overflow: hidden; }
-  @media (max-width: 860px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
-
-  section.chat { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
-  #chat-log { flex: 1; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
-  .bubble { max-width: 82%; padding: 9px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; }
-  .bubble.user { align-self: flex-end; background: var(--bubble-user); border-bottom-right-radius: 3px; }
-  .bubble.bot { align-self: flex-start; background: var(--bubble-bot); border-bottom-left-radius: 3px; }
-  .bubble.bot.tier-S { background: #fdf0f0; border: 1px solid var(--tier-s); }
-  .bubble .meta { display: block; margin-top: 5px; font-size: 10.5px; color: var(--muted); }
-  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px;
-    font-weight: 700; font-size: 11px; color: white; }
-  .badge.D { background: var(--tier-d); } .badge.C { background: var(--tier-c); }
-  .badge.B { background: var(--tier-b); } .badge.A { background: var(--tier-a); } .badge.S { background: var(--tier-s); }
-
-  #composer { flex: none; border-top: 1px solid var(--border); padding: 10px 14px; display: flex; flex-direction: column; gap: 8px; }
-  #composer .row1 { display: flex; gap: 8px; }
-  #msg { flex: 1; resize: none; height: 46px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
-    font-size: 13.5px; font-family: inherit; }
-  #composer button { cursor: pointer; border: none; border-radius: 8px; padding: 0 16px; font-size: 13px; font-weight: 600; }
-  #composer .send { background: var(--accent); color: white; }
-  .row2 { display: flex; gap: 14px; align-items: center; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
-  .row2 label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
-  .row2 .examples span { cursor: pointer; text-decoration: underline; margin-right: 10px; }
-  #context-toggle { cursor: pointer; text-decoration: underline; color: var(--muted); font-size: 11.5px; user-select: none; }
-  #context-wrap { display: none; flex-direction: column; gap: 4px; }
-  #context-wrap.open { display: flex; }
-  #context-wrap label { font-size: 11px; color: var(--muted); }
-  #ctx { resize: vertical; min-height: 40px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
-    font-size: 12.5px; font-family: ui-monospace, Menlo, Consolas, monospace; }
-
-  section.monitor { display: flex; flex-direction: column; min-width: 0; }
-  section.monitor h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
-    margin: 0; padding: 12px 16px 8px; flex: none; border-bottom: 1px solid var(--border); }
-  #trace-log { flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column-reverse; gap: 10px; }
-  .trace { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--panel); font-size: 12px; }
-  .trace.latest { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
-  .trace .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
-  .trace dl { display: grid; grid-template-columns: 84px 1fr; gap: 3px 8px; margin: 0; }
-  .trace dt { color: var(--muted); }
-  .trace dd { margin: 0; word-break: break-word; }
-  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; background: #eef0ea; font-size: 10.5px; margin-right: 4px; }
-  .empty { color: var(--muted); font-size: 13px; padding: 16px; }
-  details.raw { margin-top: 6px; }
-  details.raw summary { cursor: pointer; color: var(--muted); font-size: 11px; }
-  pre.raw { white-space: pre-wrap; font-size: 10.5px; background: #faf9f6; border: 1px solid var(--border);
-    border-radius: 6px; padding: 8px; max-height: 160px; overflow: auto; margin: 6px 0 0; }
-</style>
-</head>
-<body>
-<header>
-  <h1>itsbob — Complexity-Based Hierarchical Router</h1>
-  <p>Classify First, Execute Cheapest, Fallback Gracefully. Chat on the left; watch what it actually did on the right.</p>
-  <div id="status-strip"></div>
-</header>
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>itsbob</title><style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--text:#e6e8ee;--dim:#8b93a7;--accent:#6ea8fe;
+--D:#7c8794;--C:#4cc38a;--B:#6ea8fe;--A:#e0a458;--S:#e5534b;--ok:#4cc38a;--bad:#e5534b}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:15px;margin:0;letter-spacing:.4px}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:#25543f}.pill.bad{color:var(--bad);border-color:#5a2b28}
+main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);height:calc(100vh - 45px)}
+@media(max-width:900px){main{grid-template-columns:1fr;height:auto}}
+section{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+.head{padding:8px 14px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+.head b{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);font-weight:600}
+.tabs{display:flex;gap:4px;margin-left:auto}
+.tab{font-size:11px;padding:3px 9px;border-radius:6px;border:1px solid var(--line);background:none;color:var(--dim);cursor:pointer}
+.tab.on{color:var(--text);border-color:var(--accent)}
+.scroll{flex:1;overflow-y:auto;padding:14px;min-height:320px}
+.msg{margin-bottom:14px;max-width:88%}
+.msg.you{margin-left:auto}
+.bub{padding:9px 12px;border-radius:12px;background:var(--panel);border:1px solid var(--line);white-space:pre-wrap;word-wrap:break-word}
+.msg.you .bub{background:#1d2633;border-color:#2b3a4d}
+.who{font-size:10px;color:var(--dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.6px}
+.msg.you .who{text-align:right}
+form{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--line)}
+textarea{flex:1;resize:none;background:var(--panel);border:1px solid var(--line);color:var(--text);
+border-radius:8px;padding:9px 11px;font:inherit;min-height:44px;max-height:160px}
+textarea:focus{outline:none;border-color:var(--accent)}
+button{background:var(--accent);border:none;color:#0b1220;font-weight:600;border-radius:8px;padding:0 16px;cursor:pointer;font:inherit}
+button:disabled{opacity:.45;cursor:default}
+.card{border:1px solid var(--line);border-radius:9px;margin-bottom:12px;overflow:hidden;background:var(--panel)}
+.card > .top{display:flex;gap:9px;align-items:center;padding:8px 11px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tier{font-weight:700;width:20px;height:20px;border-radius:5px;display:grid;place-items:center;font-size:11px;color:#0b1220}
+.body{padding:9px 11px;font-size:12.5px}
+.step{padding:6px 0;border-top:1px dashed var(--line)}
+.step:first-child{border-top:none}
+.tool{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--accent);word-break:break-all}
+.obs{color:var(--dim);white-space:pre-wrap;margin-top:3px;max-height:130px;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+.obs.bad{color:#f0a29c}
+.muted{color:var(--dim)}.thought{color:var(--dim);font-style:italic;margin-bottom:2px}
+.row{display:flex;gap:8px;align-items:baseline;padding:5px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.row:last-child{border:none}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--dim)}
+.x{margin-left:auto;background:none;border:1px solid var(--line);color:var(--dim);padding:1px 7px;border-radius:5px;font-size:11px}
+.empty{color:var(--dim);text-align:center;padding:40px 20px;font-size:13px}
+.mini{display:flex;gap:6px;padding:10px 14px;border-top:1px solid var(--line);flex-wrap:wrap}
+.mini input{flex:1;min-width:110px;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:7px;padding:6px 9px;font:inherit;font-size:12.5px}
+.spin{display:inline-block;width:9px;height:9px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+</style></head><body>
+<header><h1>itsbob</h1><span id="strip" class="muted" style="font-size:12px">connecting…</span></header>
 <main>
-  <section class="chat">
-    <div id="chat-log"></div>
-    <div id="composer">
-      <div id="context-wrap">
-        <label for="ctx">Context (optional, sent with every message — background facts/state, JSON or plain text; useful for testing the same message against different scenarios)</label>
-        <textarea id="ctx" placeholder='e.g. {"facts": {"opponent_formation": "4-4-2", "morale": "low"}, "events": ["68 Yellow card"]}'></textarea>
-      </div>
-      <span id="context-toggle" onclick="toggleContext()">+ add context</span>
-      <div class="row1">
-        <textarea id="msg" placeholder='Describe a situation, or paste JSON — e.g. {"facts": {"stamina": 15, "minute": 60}}'></textarea>
-        <button class="send" onclick="send()">Send</button>
-      </div>
-      <div class="row2">
-        <label><input type="checkbox" id="classify-only"> classify only (no execution)</label>
-        <span>goal:</span>
-        <input id="goal" type="text" value="win the league" style="flex:0 0 160px; padding:3px 6px; border-radius:6px; border:1px solid var(--border); font-size:11.5px;">
-        <span class="examples" id="examples"></span>
+  <section>
+    <div class="head"><b>conversation</b>
+      <div class="tabs"><button class="tab" onclick="resetChat()">new conversation</button></div>
+    </div>
+    <div class="scroll" id="chat"><p class="empty">Ask it something, or tell it something worth remembering.</p></div>
+    <form id="form">
+      <textarea id="msg" placeholder="Message… (Enter to send, Shift+Enter for a newline)" rows="1"></textarea>
+      <button id="send">Send</button>
+    </form>
+  </section>
+  <section style="border-right:none">
+    <div class="head"><b id="rt">what it did</b>
+      <div class="tabs">
+        <button class="tab on" data-panel="trace">trace</button>
+        <button class="tab" data-panel="memory">memory</button>
+        <button class="tab" data-panel="tasks">tasks</button>
+        <button class="tab" data-panel="audit">audit</button>
       </div>
     </div>
-  </section>
-  <section class="monitor">
-    <h2>Live processing</h2>
-    <div id="trace-log"><p class="empty">Nothing routed yet — send a message to see the Gatekeeper's reasoning, which model gets called, cache hits, and any escalation here.</p></div>
+    <div class="scroll" id="right"><p class="empty">Every step of every turn appears here.</p></div>
+    <div class="mini" id="mini" hidden></div>
   </section>
 </main>
 <script>
-const examples = {{ examples|safe }};
+const TIER={D:'--D',C:'--C',B:'--B',A:'--A',S:'--S'};
+let panel='trace', traces=[];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
-async function refreshStatus() {
-  const el = document.getElementById('status-strip');
-  try {
-    const r = await fetch('/api/status'); const s = await r.json();
-    const bits = [];
-    bits.push(`<span class="stat">mode: ${s.mode}</span>`);
-    bits.push(`<span class="stat ${s.local_back_brain.reachable ? 'ok' : 'down'}">Back Brain (Tier C): ${s.local_back_brain.reachable ? 'reachable' : 'offline → heuristic fallback'}</span>`);
-    const providerPill = (p) => `<span class="stat ${p.configured ? 'ok' : 'down'}">${p.name}${p.models && p.models[0] ? ' · ' + p.models[0] : ''}: ${p.configured ? 'configured' : 'no key'}</span>`;
-    if (s.tiers) {
-      bits.push('<span class="stat">Tier B (Google, cheap):</span>');
-      s.tiers.tier_b.forEach(p => bits.push(providerPill(p)));
-      bits.push('<span class="stat">Tier A (Google, premium):</span>');
-      s.tiers.tier_a.forEach(p => bits.push(providerPill(p)));
-    } else {
-      for (const p of s.cloud_providers) bits.push(providerPill(p));
+async function api(url,opts){const r=await fetch(url,opts);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.statusText);return r.json();}
+
+async function status(){
+  try{
+    const s=await api('/api/status');
+    const bits=[`<span class="pill">${esc(s.policy.mode)} mode</span>`];
+    for(const [t,info] of Object.entries(s.tiers)){
+      const p=info.providers.find(x=>x.configured);
+      bits.push(`<span class="pill ${p?'ok':'bad'}">${t}: ${p?esc(p.model):'none'}</span>`);
     }
-    el.innerHTML = bits.join('');
-  } catch (e) { el.innerHTML = '<span class="stat down">status unavailable</span>'; }
+    if(s.local) bits.push(`<span class="pill ok">ollama</span>`);
+    bits.push(`<span class="pill ${s.memory.semantic_recall?'ok':''}">${s.memory.records} memories${s.memory.semantic_recall?'':' · keyword only'}</span>`);
+    bits.push(`<span class="pill">${s.tasks.length} task${s.tasks.length===1?'':'s'}</span>`);
+    $('strip').innerHTML=bits.join(' ');
+  }catch(e){$('strip').innerHTML=`<span class="pill bad">${esc(e.message)}</span>`;}
 }
 
-function renderExamples() {
-  const el = document.getElementById('examples');
-  el.innerHTML = examples.map((ex, i) => `<span onclick="useExample(${i})">example ${i + 1}</span>`).join('');
-}
-function useExample(i) {
-  document.getElementById('msg').value = examples[i];
-}
-
-function toggleContext() {
-  const wrap = document.getElementById('context-wrap');
-  const toggle = document.getElementById('context-toggle');
-  const open = wrap.classList.toggle('open');
-  toggle.textContent = open ? '- hide context' : '+ add context';
+function bubble(who,text,cls){
+  const chat=$('chat'); chat.querySelector('.empty')?.remove();
+  const d=document.createElement('div'); d.className='msg '+(cls||'');
+  d.innerHTML=`<div class="who">${who}</div><div class="bub">${esc(text)}</div>`;
+  chat.appendChild(d); chat.scrollTop=chat.scrollHeight; return d;
 }
 
-function addBubble(role, text, tier) {
-  const log = document.getElementById('chat-log');
-  const empty = log.querySelector('.empty');
-  if (empty) empty.remove();
-  const b = document.createElement('div');
-  b.className = 'bubble ' + role + (tier ? ' tier-' + tier : '');
-  b.textContent = text;
-  log.appendChild(b);
-  log.scrollTop = log.scrollHeight;
-  return b;
+function traceCard(turn,events){
+  const cls=TIER[turn.tier]||'--B';
+  const recalled=events.filter(e=>e.kind==='memory'&&e.data.recalled).flatMap(e=>e.data.recalled);
+  const wrote=events.filter(e=>e.kind==='memory'&&e.data.wrote).map(e=>e.data.wrote);
+  const cl=events.find(e=>e.kind==='classified');
+  const steps=turn.steps.map(s=>`<div class="step">
+      ${s.thought?`<div class="thought">${esc(s.thought)}</div>`:''}
+      ${s.tool?`<div class="tool">${esc(s.tool)}(${esc(Object.entries(s.params||{}).map(([k,v])=>k+'='+JSON.stringify(v).slice(0,60)).join(', '))})</div>
+        <div class="obs ${s.ok?'':'bad'}">${esc(s.observation)}</div>`:''}
+      <div class="mono">tier ${esc(s.tier)} · ${esc(s.model)} · ${Math.round(s.latency_ms)}ms</div>
+    </div>`).join('');
+  return `<div class="card">
+    <div class="top"><span class="tier" style="background:var(${cls})">${esc(turn.tier)}</span>
+      <span>${esc(turn.message).slice(0,60)}</span>
+      <span class="mono" style="margin-left:auto">${Math.round(turn.duration_ms)}ms · ${turn.tokens} tok</span></div>
+    <div class="body">
+      ${cl?`<div class="muted" style="margin-bottom:6px">${esc(cl.data.decision.reasoning)}</div>`:''}
+      ${recalled.length?`<div class="muted" style="margin-bottom:6px">recalled: ${recalled.map(h=>esc(h.content).slice(0,70)).join(' · ')}</div>`:''}
+      ${steps||'<div class="muted">answered directly</div>'}
+      ${wrote.length?`<div class="step muted">remembered: ${wrote.map(esc).join(' · ')}</div>`:''}
+    </div></div>`;
 }
 
-function tierBadge(tier, label) {
-  return tier ? `<span class="badge ${tier}">${tier} · ${label || ''}</span>` : '';
+function render(){
+  const right=$('right'), mini=$('mini');
+  mini.hidden = panel==='trace'||panel==='audit';
+  if(panel==='trace'){
+    $('rt').textContent='what it did';
+    right.innerHTML = traces.length?traces.join(''):'<p class="empty">Every step of every turn appears here.</p>';
+  } else if(panel==='memory'){ $('rt').textContent='memory'; loadMemory();
+    mini.innerHTML=`<input id="mq" placeholder="search memory…"><button onclick="loadMemory()">Search</button>`;
+    $('mq').onkeydown=e=>{if(e.key==='Enter')loadMemory();};
+  } else if(panel==='tasks'){ $('rt').textContent='scheduled tasks'; loadTasks();
+    mini.innerHTML=`<input id="tn" placeholder="name"><input id="tp" placeholder="what to do…">
+      <input id="ts" placeholder="every 30m"><button onclick="addTask()">Add</button>`;
+  } else { $('rt').textContent='tool activity'; loadAudit(); }
 }
 
-function addTrace(data, mode) {
-  const tlog = document.getElementById('trace-log');
-  const empty = tlog.querySelector('.empty');
-  if (empty) empty.remove();
-  tlog.querySelectorAll('.trace.latest').forEach(el => el.classList.remove('latest'));
+async function loadMemory(){
+  const q=$('mq')?.value||'';
+  const {hits}=await api('/api/memory?q='+encodeURIComponent(q));
+  $('right').innerHTML = hits.length?hits.map(h=>`<div class="row">
+      <div><div>${esc(h.content)}</div><div class="mono">${esc(h.kind)} · ${esc(h.why)}</div></div>
+      <button class="x" onclick="forget('${h.id}')">forget</button></div>`).join('')
+    :'<p class="empty">Nothing remembered yet.</p>';
+}
+async function forget(id){await api('/api/memory/forget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadMemory();status();}
 
-  const div = document.createElement('div');
-  div.className = 'trace latest';
+async function loadTasks(){
+  const s=await api('/api/status');
+  $('right').innerHTML = s.tasks.length?s.tasks.map(t=>`<div class="row">
+      <div><div>${esc(t.name)} <span class="mono">${esc(t.schedule)}</span></div>
+        <div class="mono">${esc(t.prompt).slice(0,90)}</div>
+        <div class="mono">${t.enabled?'enabled':'paused'} · ${t.run_count} run(s) · ${esc(t.last_status||'never run')}</div></div>
+      <button class="x" onclick="rmTask('${t.id}')">remove</button></div>`).join('')
+    :'<p class="empty">No scheduled tasks. Add one below — it runs when <code>itsbob serve</code> is running.</p>';
+}
+async function addTask(){
+  try{
+    await api('/api/task',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:$('tn').value,prompt:$('tp').value,schedule:$('ts').value})});
+    $('tn').value=$('tp').value=$('ts').value=''; loadTasks(); status();
+  }catch(e){alert(e.message);}
+}
+async function rmTask(id){await api('/api/task/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadTasks();status();}
 
-  if (data.error && !data.decision) {
-    div.innerHTML = `<div class="head">error</div><dl><dt>message</dt><dd>${data.error}</dd></dl>`;
-    tlog.prepend(div);
-    return;
-  }
-
-  const d = data.decision || {};
-  const tier = data.tier || (d.tier);
-  const tierLabel = data.tier_label || d.tier_label;
-  let head = tierBadge(tier, tierLabel);
-  if (data.escalated_from) head += ` <span class="pill">escalated from ${data.escalated_from}</span>`;
-  if (data.cache_hit) head += ` <span class="pill">cache hit</span>`;
-  if (data.classify_only) head += ` <span class="pill">classify only</span>`;
-
-  const rows = [];
-  rows.push(`<dt>Fingerprint</dt><dd>${d.fingerprint || ''}</dd>`);
-  rows.push(`<dt>Gatekeeper</dt><dd>${d.source || ''} — ${d.reasoning || ''} (${d.latency_ms ?? 0}ms)</dd>`);
-  if (!data.classify_only) {
-    const scripts = (data.script_results || []).map(r => `<span class="pill">${r.action}${r.ok ? '' : ' ✗'}</span>`).join(' ') || '<span class="empty" style="padding:0;">none</span>';
-    rows.push(`<dt>Actions</dt><dd>${scripts}</dd>`);
-    rows.push(`<dt>Model called</dt><dd>${data.provider ? data.provider + (data.model ? ' / ' + data.model : '') : '— (script/local/none)'}</dd>`);
-    const budget = data.within_budget === false ? ' ⚠ over 1.8s budget' : '';
-    rows.push(`<dt>Latency</dt><dd>${data.total_latency_ms ?? 0}ms${budget}</dd>`);
-    if (data.cache_stats) rows.push(`<dt>Cache</dt><dd>hit rate ${(data.cache_stats.hit_rate * 100).toFixed(0)}% (${data.cache_stats.hits}/${data.cache_stats.hits + data.cache_stats.misses}), size ${data.cache_stats.size}</dd>`);
-  }
-
-  div.innerHTML = `<div class="head">${head}</div><dl>${rows.join('')}</dl>
-    <details class="raw"><summary>raw JSON</summary><pre class="raw">${JSON.stringify(data, null, 2)}</pre></details>`;
-  tlog.prepend(div);
+async function loadAudit(){
+  const {entries}=await api('/api/audit');
+  $('right').innerHTML = entries.length?entries.slice().reverse().map(e=>`<div class="row">
+      <div><div class="tool">${esc(e.tool)}</div><div class="mono">${esc(e.iso)} · ${e.denied?'DENIED':(e.ok?'ok':'failed')}</div>
+      ${e.error?`<div class="obs bad">${esc(e.error)}</div>`:''}</div></div>`).join('')
+    :'<p class="empty">No tools have run yet.</p>';
 }
 
-async function send() {
-  const msgEl = document.getElementById('msg');
-  const ctxEl = document.getElementById('ctx');
-  const text = msgEl.value.trim();
-  const context = ctxEl.value.trim();
-  if (!text && !context) return;
-  const goal = document.getElementById('goal').value;
-  const classifyOnly = document.getElementById('classify-only').checked;
+async function resetChat(){await api('/api/reset',{method:'POST'});$('chat').innerHTML='<p class="empty">New conversation. It still remembers everything long-term.</p>';}
 
-  addBubble('user', context ? `[context] ${context}\n[message] ${text}` : text);
-  msgEl.value = '';
-  const thinking = addBubble('bot', 'thinking…');
-
-  try {
-    const r = await fetch('/api/chat', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message: text, context, goal, classify_only: classifyOnly })
-    });
-    const data = await r.json();
-    thinking.remove();
-    if (data.error) {
-      addBubble('bot', 'error: ' + data.error);
-      return;
-    }
-    const tier = data.trace && (data.trace.tier || (data.trace.decision && data.trace.decision.tier));
-    const bubble = addBubble('bot', data.reply, tier === 'S' ? 'S' : null);
-    if (data.trace && (data.trace.provider || data.trace.decision)) {
-      const meta = document.createElement('span');
-      meta.className = 'meta';
-      const d = data.trace.decision || {};
-      meta.innerHTML = tierBadge(data.trace.tier || d.tier, data.trace.tier_label || d.tier_label);
-      bubble.appendChild(meta);
-    }
-    addTrace(data.trace, classifyOnly ? 'classify' : 'route');
-  } catch (e) {
-    thinking.remove();
-    addBubble('bot', 'request failed: ' + e);
-  }
-}
-
-document.getElementById('msg').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+document.querySelectorAll('.tab[data-panel]').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tab[data-panel]').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on'); panel=b.dataset.panel; render();
 });
 
-renderExamples();
-refreshStatus();
-</script>
-</body>
-</html>
+$('msg').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('form').requestSubmit();}});
+$('form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const text=$('msg').value.trim(); if(!text)return;
+  $('msg').value=''; $('send').disabled=true;
+  bubble('you',text,'you');
+  const pending=bubble('bob','…'); pending.querySelector('.bub').innerHTML='<span class="spin"></span>';
+  try{
+    const data=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text})});
+    pending.querySelector('.bub').textContent=data.reply;
+    traces.unshift(traceCard(data.turn,data.events));
+    if(panel==='trace')render();
+    status();
+  }catch(err){
+    pending.querySelector('.bub').textContent='Error: '+err.message;
+    pending.querySelector('.bub').style.borderColor='var(--bad)';
+  }finally{$('send').disabled=false;$('msg').focus();}
+});
+
+status(); render(); $('msg').focus();
+</script></body></html>
 """

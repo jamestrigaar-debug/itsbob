@@ -90,7 +90,7 @@ class MemoryWriter:
             return []
 
         known_lines = "\n".join(
-            f"- {getattr(k, 'record', k).content}" for k in list(known)[:12]
+            f"- {getattr(getattr(k, 'record', k), 'content', str(k))}" for k in list(known)[:12]
         )
         prompt = (
             f"User said:\n{message.strip()[:3000]}\n\n"
