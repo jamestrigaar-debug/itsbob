@@ -570,6 +570,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         else:
             print(f"  -- Tier {tier_value} ({info['label']:<15}) nothing configured")
 
+    print("\nkeys as stored (compare these against the provider's console):")
+    from .setup_wizard import DEFAULT_KEYS, fingerprint, key_looks_wrong
+
+    any_key = False
+    for name, *_rest in DEFAULT_KEYS:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            print(f"  --  {name:<20} not set")
+            continue
+        any_key = True
+        warning = key_looks_wrong(name, value)
+        # The fingerprint is the point: input is hidden when a key is pasted,
+        # so a character lost in the paste is otherwise invisible and shows up
+        # only as an unexplained rejection.
+        print(f"  {'!!' if warning else 'ok '} {name:<20} {fingerprint(value)}")
+        if warning:
+            print(f"      {warning}")
+    if not any_key:
+        print("      none — run `itsbob setup`")
+
     if not args.probe:
         print("\n  ? means a key is present but has not been used. A key can be set and\n"
               "    still be rejected — run `itsbob doctor --probe` to actually find out.")

@@ -22,6 +22,13 @@ from itsbob.router.tiers import Tier
 from itsbob.store import Database
 from itsbob.tools.base import Risk
 
+#: Shaped like real keys so the format checks are meaningfully exercised, and
+#: obviously not real so they can never trip a secret scanner. A live
+#: credential in a fixture gets the push blocked by GitHub — which is the good
+#: outcome; the bad one is the push that quietly succeeds.
+EXAMPLE_GOOGLE_KEY = "AQ.ExampleNotARealKey00000000000000000000000000000000"
+EXAMPLE_AIZA_KEY = "AIzaSyExampleNotARealKey0000000000000"
+
 
 # -- 1. concurrent writes silently lost rows -------------------------------
 
@@ -508,10 +515,11 @@ def test_the_vendors_own_message_is_extracted():
 @pytest.mark.parametrize(
     "key,wrong",
     [
-        ("AQ.Ab8RN6IZ5YmwV0v9wgkQQckhCgESjBQ1qX-TXRf", True),   # an OAuth token
-        ("ya29.a0AfH6SMBx1234567890", True),
+        ("ya29.a0AfH6SMBx1234567890abcdefghij", True),   # a short-lived OAuth token
+        ("nonsense", True),
         ("AIzaSyA123456789012345678901234567890", False),
-        ("", False),                                            # nothing to judge
+        ("AQ.ExampleNotARealKey00000000000000000000000000000000", False),  # newer format
+        ("", False),                                     # nothing to judge
     ],
 )
 def test_a_google_key_of_the_wrong_shape_is_flagged_before_the_api_call(key, wrong):
@@ -555,3 +563,117 @@ def test_listing_models_never_raises_when_unreachable():
         name="g", base_url="https://127.0.0.1:1/v1", api_key_env="K", default_model="m"
     )
     assert list_models(config, {"K": "key"}, timeout=0.2) == ()
+
+
+# -- a hidden paste made a mangled key invisible ---------------------------
+
+
+@pytest.mark.parametrize(
+    "key,ok",
+    [
+        ("AQ.ExampleNotARealKey00000000000000000000000000000000", True),   # newer format
+        ("AIzaSyA123456789012345678901234567890", True),                   # long-standing
+        ("ya29.a0AfH6SMBx1234567890abcdefghij", False),                    # OAuth token
+        ("nonsense", False),
+    ],
+)
+def test_both_real_google_key_formats_are_accepted(key, ok):
+    """`AQ.…` is a genuine project-scoped API key, not an OAuth token — an
+    earlier check rejected it and would have told users to throw away a
+    perfectly good key."""
+    from itsbob.setup_wizard import key_looks_wrong
+
+    assert (key_looks_wrong("GOOGLE_API_KEY", key) is None) is ok
+
+
+@pytest.mark.parametrize(
+    "raw,cleaned",
+    [
+        ("  AQ.ExampleN  ", "AQ.ExampleN"),
+        ('"AQ.ExampleN"', "AQ.ExampleN"),
+        ("'AQ.ExampleN'", "AQ.ExampleN"),
+        ("GOOGLE_API_KEY=AQ.ExampleN", "AQ.ExampleN"),
+        ("export GOOGLE_API_KEY=AQ.ExampleN", "AQ.ExampleN"),
+        ('export GOOGLE_API_KEY="AQ.ExampleN"', "AQ.ExampleN"),
+        ("AQ.Exam\n pleN", "AQ.ExampleN"),   # a wrapped paste
+        ("AQ.ExampleN", "AQ.ExampleN"),
+    ],
+)
+def test_paste_damage_is_cleaned_before_the_key_is_used(raw, cleaned):
+    """Each of these is a real thing a terminal paste produces, and each
+    produces a rejected key that looks perfectly fine to the person who
+    pasted it."""
+    from itsbob.setup_wizard import _clean_key
+
+    assert _clean_key(raw) == cleaned
+
+
+def test_a_fingerprint_reveals_a_dropped_character():
+    """The whole point: input is hidden, so a short paste is otherwise
+    invisible and shows up only as an unexplained rejection."""
+    from itsbob.setup_wizard import fingerprint
+
+    full = "AQ.ExampleNotARealKey00000000000000000000000000000000"
+    assert fingerprint(full) != fingerprint(full[:-1])
+    assert "53 chars" in fingerprint(full)
+
+
+def test_a_fingerprint_does_not_leak_the_key():
+    from itsbob.setup_wizard import fingerprint
+
+    full = "AQ.ExampleNotARealKey00000000000000000000000000000000"
+    shown = fingerprint(full)
+    assert full not in shown
+    assert len(shown) < 30
+    # A short value must not be printed nearly whole either.
+    assert "secret" not in fingerprint("secret")
+
+
+# -- a live credential reached a fixture ------------------------------------
+
+
+def test_no_tracked_file_contains_a_real_looking_credential():
+    """A live key in a test fixture got a push blocked by GitHub's secret
+    scanning. That was the good outcome — the bad one is the push that quietly
+    succeeds — so this checks locally instead of relying on the remote.
+
+    Placeholders are allowed, and must announce themselves: anything shaped
+    like a credential has to carry an obvious marker.
+    """
+    import re
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    shapes = re.compile(
+        r"AQ\.[A-Za-z0-9_\-]{40,}"          # Google, newer project-scoped
+        r"|AIza[A-Za-z0-9_\-]{30,}"          # Google, long-standing
+        r"|gsk_[A-Za-z0-9]{40,}"             # Groq
+        r"|sk-or-v1-[a-f0-9]{40,}"           # OpenRouter
+        r"|sk-[A-Za-z0-9]{45,}"              # OpenAI-style
+    )
+    # Anything matching a shape must look deliberately fake.
+    placeholder = re.compile(r"example|notareal|placeholder|dummy|0{6}|123456|xxxx", re.I)
+
+    listing = subprocess.run(
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=False
+    )
+    if listing.returncode != 0:  # pragma: no cover - not a git checkout
+        pytest.skip("not a git checkout")
+
+    offenders: list[str] = []
+    for name in listing.stdout.split():
+        path = root / name
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for match in shapes.findall(content):
+            if not placeholder.search(match):
+                offenders.append(f"{name}: {match[:12]}…")
+
+    assert not offenders, (
+        "real-looking credentials in tracked files: "
+        + "; ".join(sorted(set(offenders)))
+        + " — use an obviously-fake placeholder instead"
+    )

@@ -44,10 +44,13 @@ _TICK, _CROSS, _DOT, _WARN = "✓", "✗", "·", "!"
 #: anyone out of their own working key.
 _KEY_SHAPES = {
     "GOOGLE_API_KEY": (
-        lambda k: k.startswith("AIza") and len(k) >= 35,
-        "Google AI Studio keys start with `AIza` and are about 39 characters. "
-        "A value starting `AQ.` or `ya29.` is an OAuth token, not an API key — "
-        "those are rejected with \"Please pass a valid API key\".",
+        # Google issues two API key formats: the long-standing `AIza…` (39
+        # chars) and a newer project-scoped `AQ.…` (~53). Both are real keys.
+        # `ya29.…` is an OAuth2 access token — a genuinely different thing,
+        # short-lived, and rejected.
+        lambda k: (k.startswith("AIza") and len(k) >= 35) or (k.startswith("AQ.") and len(k) >= 40),
+        "Google API keys look like `AIza…` (39 characters) or `AQ.…` (about 53). "
+        "A value starting `ya29.` is a short-lived OAuth access token, not an API key.",
     ),
     "GROQ_API_KEY": (
         lambda k: k.startswith("gsk_"),
@@ -80,11 +83,43 @@ def _ask(prompt: str, *, secret: bool = False, default: str = "") -> str:
         if secret:
             import getpass
 
-            return getpass.getpass(prompt).strip()
+            return _clean_key(getpass.getpass(prompt))
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         _say()
         return default
+
+
+def _clean_key(raw: str) -> str:
+    """Undo the damage a terminal paste does before it reaches the API.
+
+    Copying from a web console routinely brings along a trailing newline, a
+    stray space, wrapping quotes, or a `KEY=` prefix from a copied env line.
+    Each of those produces a rejected key that looks perfectly fine, so they
+    are stripped here rather than sent and puzzled over.
+    """
+    key = raw.strip().strip("\"'").strip()
+    prefixes = ("export ", "GOOGLE_API_KEY=", "GROQ_API_KEY=", "OPENROUTER_API_KEY=")
+    # Repeat until nothing matches: `export GOOGLE_API_KEY=…` needs two passes,
+    # and a single pass silently left half the prefix attached.
+    for _ in range(4):
+        stripped = key
+        for prefix in prefixes:
+            if stripped.lower().startswith(prefix.lower()):
+                stripped = stripped[len(prefix):].strip().strip("\"'").strip()
+        if stripped == key:
+            break
+        key = stripped
+    # Internal whitespace is never part of a key; it is a wrapped paste.
+    return "".join(key.split())
+
+
+def fingerprint(key: str) -> str:
+    """Enough of a key to check it against the console, not enough to leak it."""
+    key = key.strip()
+    if len(key) < 12:
+        return f"{key[:2]}… ({len(key)} chars)"
+    return f"{key[:6]}…{key[-4:]} ({len(key)} chars)"
 
 
 def _confirm(prompt: str, *, default: bool = True) -> bool:
@@ -210,6 +245,10 @@ def run_setup(
             _say(f"     Get one at {url}")
             value = _ask(f"     Paste your {name} (or press Enter to skip): ", secret=True)
             if value:
+                # Echo a fingerprint. The input is hidden, so a paste that lost
+                # a character or gained one is otherwise invisible — and that
+                # produces a key the API rejects for no visible reason.
+                _say(f"     {_DOT} got {fingerprint(value)} — check that against the console")
                 warning = key_looks_wrong(name, value)
                 if warning:
                     _say(f"     {_WARN} That does not look like a {label} key.")
@@ -244,17 +283,37 @@ def run_setup(
         _say()
         _say("  Checking each key against the real API…")
         for name in configured:
-            key = os.environ[name]
-            shape_warning = key_looks_wrong(name, key)
-            ok, detail = verify_key(name, key)
-            mark = _TICK if ok else _CROSS
-            _say(f"  {mark} {name:<20} {detail}")
-            if ok:
-                working += 1
-            else:
-                rejected.append(name)
-                if shape_warning:
-                    _say(f"    {_WARN} {shape_warning}")
+            for attempt in range(3):
+                key = os.environ[name]
+                ok, detail = verify_key(name, key)
+                _say(f"  {_TICK if ok else _CROSS} {name:<20} {detail}")
+                if ok:
+                    working += 1
+                    break
+
+                _say(f"    the key it tried was {fingerprint(key)}")
+                warning = key_looks_wrong(name, key)
+                if warning:
+                    _say(f"    {_WARN} {warning}")
+                elif "auth" in detail.lower() or "valid" in detail.lower():
+                    _say(
+                        "    The format is right, so this is the key itself: a character lost\n"
+                        "    in the paste, a revoked key, or one from a project without the\n"
+                        "    Generative Language API enabled."
+                    )
+                if not (interactive and attempt < 2):
+                    rejected.append(name)
+                    break
+                if not _confirm("    Paste it again?", default=True):
+                    rejected.append(name)
+                    break
+                retyped = _ask(f"     {name}: ", secret=True)
+                if not retyped:
+                    rejected.append(name)
+                    break
+                _say(f"     {_DOT} got {fingerprint(retyped)}")
+                os.environ[name] = retyped
+                write_env({name: retyped})
     elif not configured:
         _say()
         _say(f"  {_DOT} No keys configured. itsbob will run, but it cannot think:")
