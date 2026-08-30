@@ -236,10 +236,10 @@ def test_the_tier_never_drops_within_a_turn(tmp_path):
     assert ranks == sorted(ranks)
 
 
-def test_a_destructive_request_starts_premium(tmp_path):
+def test_a_destructive_request_starts_at_the_strongest_tier(tmp_path):
     agent = _agent(tmp_path, [{"final": "no"}])
     agent.chat("delete all the backups in /var")
-    assert agent.brain.tiers[0] is Tier.A
+    assert agent.brain.tiers[0] is Tier.S
 
 
 def test_small_talk_starts_cheap(tmp_path):

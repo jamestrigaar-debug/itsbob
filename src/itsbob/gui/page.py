@@ -54,6 +54,15 @@ header{display:flex;align-items:center;gap:10px;padding:9px 14px;
 .chip.bad{border-color:color-mix(in srgb,var(--bad) 45%,var(--line));color:var(--bad)}
 .chip.act{cursor:pointer}
 .chip.act:hover{border-color:var(--accent);color:var(--text)}
+.auto{display:inline-flex;align-items:center;gap:7px;font-size:12px;padding:4px 11px;
+  border-radius:99px;border:1px solid var(--line);color:var(--dim)}
+.auto:hover{border-color:var(--faint);color:var(--text)}
+.auto .led{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.auto.on{border-color:var(--ok);color:var(--ok)}
+.auto.on .led{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent);
+  animation:pulse 2.2s ease-in-out infinite}
+.msg.task .bub{border-left:3px solid var(--C)}
+.msg.task .who::before{content:"⟳ ";color:var(--C)}
 
 main{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);height:calc(100vh - 46px)}
 section{display:flex;flex-direction:column;min-width:0;min-height:0}
@@ -77,6 +86,8 @@ section.left{border-right:1px solid var(--line)}
   white-space:pre-wrap;overflow-wrap:anywhere}
 .msg.you .bub{background:color-mix(in srgb,var(--accent) 13%,var(--panel));
   border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
+.msg.pending .bub{opacity:.55;border-style:dashed}
+.msg.pending .who::after{content:" · waiting";color:var(--warn)}
 .bub.err{border-color:var(--bad);color:var(--bad)}
 .bub code{font-family:var(--mono);font-size:.9em;background:var(--raise);padding:1px 4px;border-radius:4px}
 .typing{display:inline-flex;gap:4px;align-items:center;color:var(--dim);font-size:13px}
@@ -156,6 +167,9 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
 
 <header>
   <div class="brand"><span class="dot" id="dot"></span> itsbob</div>
+  <button class="auto" id="auto" onclick="toggleAuto()" title="Run scheduled work continuously">
+    <span class="led"></span><span id="auto-label">manual</span>
+  </button>
   <div class="chips" id="chips"><span class="chip">connecting…</span></div>
 </header>
 
@@ -168,7 +182,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
     </div>
     <div class="scroll" id="chat">
       <p class="empty">Ask it something, or tell it something worth remembering.<br>
-        <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a newline · <kbd>/</kbd> to focus</p>
+        <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a newline · <kbd>/</kbd> to focus<br>
+        Keep typing while it works — messages queue and run in order.</p>
     </div>
     <form id="form">
       <textarea id="msg" rows="1" placeholder="Message itsbob…"></textarea>
@@ -182,6 +197,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
         <button class="tab on" data-panel="activity">activity</button>
         <button class="tab" data-panel="memory">memory <span class="badge" id="nmem"></span></button>
         <button class="tab" data-panel="tasks">tasks <span class="badge" id="ntask"></span></button>
+        <button class="tab" data-panel="scripts">scripts</button>
         <button class="tab" data-panel="audit">audit</button>
       </div>
     </div>
@@ -195,7 +211,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const TIERVAR = {D:"--D",C:"--C",B:"--B",A:"--A",S:"--S"};
-const state = {panel:"activity", cards:[], live:null, status:null, pending:new Map(), busy:false};
+const state = {panel:"activity", cards:[], live:null, status:null, pending:new Map(),
+               busy:false, queue:[]};
 
 async function api(url, opts){
   const r = await fetch(url, opts);
@@ -230,12 +247,21 @@ async function refresh(){
     bits.push(`<span class="chip ${m.semantic_recall?"ok":""}" title="${m.semantic_recall
         ? "Semantic recall is live" : "Keyword-only recall"}"><b>${m.records ?? 0}</b> memories</span>`);
     bits.push(`<span class="chip" title="Workspace: ${esc(s.policy.workspace)}">${esc(s.policy.mode)}</span>`);
+    if(s.queued?.length)
+      bits.push(`<span class="chip act" onclick="clearQueue()"
+        title="Click to drop everything waiting">${s.queued.length} queued ✕</span>`);
+    if(s.autonomous?.deferrals)
+      bits.push(`<span class="chip" title="${esc(s.autonomous.last_reason || "")}"
+        >${s.autonomous.deferrals} deferred</span>`);
     if(s.auto_allowed?.length)
       bits.push(`<span class="chip act" onclick="alert('Allowed for this session without asking:\\n\\n'+${
         JSON.stringify(JSON.stringify(s.auto_allowed.join("\\n")))})">${s.auto_allowed.length} auto-allowed</span>`);
     $("chips").innerHTML = bits.join("");
     $("nmem").textContent = m.records ?? "";
     $("ntask").textContent = s.tasks?.length || "";
+    state.queue = s.queued || [];
+    renderQueue();
+    paintAuto(s.autonomous);
     if(!state.busy) setDot("live");
   }catch(e){
     $("chips").innerHTML = `<span class="chip bad">${esc(e.message)}</span>`;
@@ -245,6 +271,42 @@ async function refresh(){
 function setDot(cls){ $("dot").className = "dot " + cls; }
 
 /* ---------------- chat ---------------- */
+function renderQueue(){
+  document.querySelectorAll(".msg.pending").forEach(n => n.remove());
+  const chat = $("chat");
+  for(const item of state.queue){
+    const task = item.source === "task";
+    const el = document.createElement("div");
+    el.className = "msg pending " + (task ? "task" : "you");
+    el.innerHTML = `<div class="who">${task ? esc(item.label || "scheduled") : "you"}</div>
+      <div class="bub">${esc(item.text)}</div>`;
+    chat.appendChild(el);
+  }
+  if(state.queue.length) chat.scrollTop = chat.scrollHeight;
+}
+
+async function toggleAuto(){
+  const want = !(state.status?.autonomous?.running);
+  try{
+    const status = await post("/api/autonomous", {enabled: want});
+    paintAuto(status);
+    bubble("itsbob", want
+      ? "Continuous mode on — I'll run my scheduled work as it comes due. Keep talking; your messages go ahead of anything queued."
+      : "Continuous mode off. Scheduled work will wait until you turn it back on, or until `itsbob serve` is running.");
+  }catch(e){ alert(e.message); }
+  refresh();
+}
+function paintAuto(status){
+  const on = !!status?.running;
+  $("auto").className = "auto" + (on ? " on" : "");
+  $("auto-label").textContent = on
+    ? (status.runs ? `continuous · ${status.runs} run${status.runs === 1 ? "" : "s"}` : "continuous")
+    : "manual";
+  $("auto").title = on
+    ? "Running scheduled work. Click to stop."
+    : "Scheduled work is not running. Click to start.";
+}
+
 function bubble(who, text, cls){
   const chat = $("chat"); chat.querySelector(".empty")?.remove();
   const el = document.createElement("div");
@@ -355,10 +417,36 @@ function connect(){
 function handle(e){
   const d = e;
   switch(e.kind){
-    case "turn_start":
+    case "turn_start": {
       state.busy = true; setDot("busy");
+      // This message was waiting; promote it from greyed to a real bubble.
+      const waiting = state.queue.findIndex(q => q.text === d.message);
+      if(waiting !== -1) state.queue.splice(waiting, 1);
+      renderQueue();
+      bubble(d.source === "task" ? (d.label || "scheduled") : "you", d.message,
+             d.source === "task" ? "task" : "you");
+      thinking();
       state.live = newCard(d.message);
       if(state.panel === "activity") drawActivity();
+      break;
+    }
+    case "queued":
+      if(!state.queue.some(q => q.text === d.message)){
+        state.queue.push({text: d.message, source: d.source || "user", label: d.label || ""});
+        renderQueue();
+      }
+      refresh();
+      break;
+    case "autonomous":       refresh(); break;
+    case "task_finished":    refresh(); break;
+    case "deferred":
+      bubble("itsbob", `Holding back "${d.task}" — ${d.reason}. Retrying in ${Math.round(d.retry_in_s/60)} min.`);
+      break;
+    case "notified":
+      bubble("itsbob", `🔔 ${d.title}\n${d.body}`);
+      break;
+    case "queue_cleared":
+      state.queue = []; renderQueue();
       break;
     case "classified":
       if(state.live){ state.live.tier = d.tier; state.live.reason = d.decision?.reasoning || ""; }
@@ -400,14 +488,14 @@ function handle(e){
         state.cards.unshift(state.live); state.live = null;
       }
       if(state.panel === "activity") drawActivity();
-      $("send").disabled = false; refresh();
+      refresh();
       break;
     }
     case "turn_error":
       state.busy = false; setDot("live");
       document.querySelectorAll(".msg .typing").forEach(n => n.closest(".msg").remove());
       bubble("itsbob", d.error, "").querySelector(".bub").classList.add("err");
-      state.live = null; $("send").disabled = false;
+      state.live = null;
       if(state.panel === "activity") drawActivity();
       break;
   }
@@ -461,6 +549,22 @@ async function addTask(){
   await refresh(); drawTasks();
 }
 
+const RISK_COLOR = {read:"--C", write:"--B", network:"--B", execute:"--A", destructive:"--S"};
+async function drawScripts(){
+  const {scripts} = await api("/api/scripts");
+  $("right").innerHTML = scripts.map(s => `<div class="card">
+      <div class="top"><span class="q"><b>${esc(s.name)}</b></span>
+        <span class="meta">${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}</span></div>
+      <div class="body"><div class="note">${esc(s.summary)}</div>
+        ${s.tools.map(t => `<div class="step">
+          <div class="call">${esc(t.name)}
+            <span class="pill" style="border-color:var(${RISK_COLOR[t.risk] || "--line"});
+                  color:var(${RISK_COLOR[t.risk] || "--dim"})">${esc(t.risk)}</span></div>
+          <div class="thought">${esc(t.description)}</div></div>`).join("")}
+      </div></div>`).join("")
+    || `<p class="empty">No scripts registered.</p>`;
+}
+
 async function drawAudit(){
   const {entries} = await api("/api/audit");
   $("right").innerHTML = entries.length ? entries.slice().reverse().map(e => `<div class="row">
@@ -472,7 +576,8 @@ async function drawAudit(){
 
 function render(){
   const mini = $("mini");
-  $("rt").textContent = {activity:"activity", memory:"memory", tasks:"scheduled tasks", audit:"tool activity"}[state.panel];
+  $("rt").textContent = {activity:"activity", memory:"memory", tasks:"scheduled tasks",
+                         scripts:"what it can do", audit:"tool activity"}[state.panel];
   if(state.panel === "activity"){ mini.hidden = true; drawActivity(); }
   else if(state.panel === "memory"){
     mini.hidden = false;
@@ -490,6 +595,7 @@ function render(){
       <button class="btn" onclick="addTask()">Add</button>`;
     drawTasks();
   }
+  else if(state.panel === "scripts"){ mini.hidden = true; drawScripts(); }
   else { mini.hidden = true; drawAudit(); }
 }
 function syncTabs(){
@@ -516,16 +622,26 @@ document.addEventListener("keydown", e => {
 });
 $("form").addEventListener("submit", async e => {
   e.preventDefault();
-  const text = box.value.trim(); if(!text || state.busy) return;
-  box.value = ""; box.style.height = "auto"; $("send").disabled = true;
-  bubble("you", text, "you"); thinking();
-  try{ await post("/api/chat", {message: text}); }
-  catch(err){
-    document.querySelectorAll(".msg .typing").forEach(n => n.closest(".msg").remove());
+  const text = box.value.trim(); if(!text) return;
+  box.value = ""; box.style.height = "auto";
+  try{
+    const result = await post("/api/chat", {message: text});
+    if(result.started_now){
+      bubble("you", text, "you"); thinking();
+    } else {
+      // Queued behind work in flight: show it greyed until its turn comes.
+      state.queue.push(text); renderQueue();
+    }
+  }catch(err){
     bubble("itsbob", err.message).querySelector(".bub").classList.add("err");
-    $("send").disabled = false;
   }
 });
+
+async function clearQueue(){
+  const {dropped} = await post("/api/queue/clear");
+  state.queue = []; renderQueue(); refresh();
+  if(dropped) bubble("itsbob", `Dropped ${dropped} queued message${dropped === 1 ? "" : "s"}.`);
+}
 async function resetChat(){
   await post("/api/reset");
   $("chat").innerHTML = `<p class="empty">New conversation.<br>It still remembers everything long-term.</p>`;

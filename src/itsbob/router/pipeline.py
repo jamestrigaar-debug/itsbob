@@ -302,13 +302,13 @@ class ComplexityRouter:
 
     def _tier_s(self, state: GameState, decision: GateDecision, *, reason: str) -> RouteResult:
         return RouteResult(
-            tier=Tier.S,
+            tier=Tier.H,
             decision=decision,
             ok=False,
             note="Unrecognized state. Manual override required.",
             needs_user=True,
             error=reason,
-            escalated_from=decision.tier if decision.tier is not Tier.S else None,
+            escalated_from=decision.tier if decision.tier is not Tier.H else None,
         )
 
     # -- shared -----------------------------------------------------------------

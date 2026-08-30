@@ -63,8 +63,19 @@ __all__ = [
 
 def default_registry(*, catalog: ApiCatalog | None = None, extra: Sequence[Tool] = ()) -> ToolRegistry:
     """Files, execution, network and memory. The full default surface."""
+    from ..scripts import script_tools
+
     registry = ToolRegistry()
-    for tool in (*file_tools(), *sandbox_tools(), *http_tools(catalog), *memory_tools()):
+    for tool in (
+        *file_tools(),
+        *sandbox_tools(),
+        *http_tools(catalog),
+        *memory_tools(),
+        # The foundation scripts: machine health, processes, network, cleanup,
+        # and itsbob's own schedule. Imported here rather than at module level
+        # because they reach back into config and the daemon's task store.
+        *script_tools(),
+    ):
         registry.register(tool)
     for tool in extra:
         registry.register(tool)

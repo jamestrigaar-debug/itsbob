@@ -200,9 +200,9 @@ def test_the_offline_provider_answers_in_the_agents_shape():
 
 
 def test_tier_orders_by_cost_not_alphabetically():
-    assert Tier.A > Tier.B > Tier.C > Tier.D
+    assert Tier.S > Tier.A > Tier.B > Tier.C > Tier.D
     assert max([Tier.C, Tier.A, Tier.B]) is Tier.A
-    assert [t.value for t in sorted([Tier.A, Tier.D, Tier.S, Tier.B, Tier.C])] == list("DCBAS")
+    assert [t.value for t in sorted([Tier.A, Tier.D, Tier.S, Tier.B, Tier.C, Tier.H])] == list("DCBASH")
 
 
 def test_risk_orders_by_severity_in_both_directions():

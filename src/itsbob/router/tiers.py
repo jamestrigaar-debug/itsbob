@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-__all__ = ["Tier", "GateDecision"]
+__all__ = ["Tier", "GateDecision", "GATEKEEPER_TAGS", "LEGACY_TAGS"]
 
 
 class Tier(str, Enum):
@@ -35,10 +35,11 @@ class Tier(str, Enum):
     """
 
     D = "D"  #: Direct — a registered routine, no model at all
-    C = "C"  #: Cheapest — the local model if one is running, else the cheapest cloud one
-    B = "B"  #: Standard — the everyday workhorse
-    A = "A"  #: Premium — judgement, ambiguity, anything hard to undo
-    S = "S"  #: Halt — nothing could answer; a person has to
+    C = "C"  #: Cheapest — greetings, recall, one obvious step
+    B = "B"  #: Light — short reasoning, a couple of clear steps
+    A = "A"  #: Standard — real multi-step work, most tool use
+    S = "S"  #: Strongest — judgement, ambiguity, anything hard to undo
+    H = "H"  #: Halt — nothing could answer; a person has to
 
     @property
     def label(self) -> str:
@@ -48,9 +49,10 @@ class Tier(str, Enum):
         return {
             Tier.D: "Direct routine",
             Tier.C: "Cheapest model",
-            Tier.B: "Standard model",
-            Tier.A: "Premium model",
-            Tier.S: "Halt — ask a person",
+            Tier.B: "Light model",
+            Tier.A: "Standard model",
+            Tier.S: "Strongest model",
+            Tier.H: "Halt — ask a person",
         }[self]
 
     def __lt__(self, other: object) -> bool:  # type: ignore[override]
@@ -86,23 +88,47 @@ class Tier(str, Enum):
         """Cost/capability order, cheapest first. S sits above A: reaching it
         means nothing else could answer, which is the most expensive outcome
         there is — a person now has to."""
-        return {Tier.D: 0, Tier.C: 1, Tier.B: 2, Tier.A: 3, Tier.S: 4}[self]
+        return {Tier.D: 0, Tier.C: 1, Tier.B: 2, Tier.A: 3, Tier.S: 4, Tier.H: 5}[self]
 
     @property
     def uses_llm(self) -> bool:
-        return self is not Tier.D
+        return self not in (Tier.D, Tier.H)
+
+    @property
+    def is_model(self) -> bool:
+        """Answered by a language model, as opposed to a routine or a halt."""
+        return self in (Tier.C, Tier.B, Tier.A, Tier.S)
 
     @property
     def is_cloud(self) -> bool:
-        return self in (Tier.B, Tier.A)
+        return self in (Tier.C, Tier.B, Tier.A, Tier.S)
 
 
 #: The tags the Gatekeeper prompt is instructed to output, and their tier.
+#:
+#: Named for the *difficulty of the work* rather than for where it runs. The
+#: previous names (LOCAL_SUM, CLOUD_B, CLOUD_A) described the plumbing, which
+#: made them both harder for a small classifier to map onto a request and wrong
+#: the moment the plumbing changed — LOCAL_SUM had long since stopped implying
+#: anything local.
 GATEKEEPER_TAGS: dict[str, Tier] = {
-    "SCRIPT": Tier.D,
-    "LOCAL_SUM": Tier.C,
-    "CLOUD_B": Tier.B,
-    "CLOUD_A": Tier.A,
+    "ROUTINE": Tier.D,
+    "TRIVIAL": Tier.C,
+    "SIMPLE": Tier.B,
+    "STANDARD": Tier.A,
+    "COMPLEX": Tier.S,
+}
+
+#: Older tag names, still accepted so a local model prompted from a cached
+#: system prompt does not fall through to the heuristic.
+LEGACY_TAGS: dict[str, str] = {
+    "SCRIPT": "ROUTINE",
+    "LOCAL_SUM": "TRIVIAL",
+    "CLOUD_B": "STANDARD",
+    "CLOUD_A": "COMPLEX",
+    "PREMIUM": "COMPLEX",
+    "CHEAP": "TRIVIAL",
+    "LIGHT": "SIMPLE",
 }
 
 

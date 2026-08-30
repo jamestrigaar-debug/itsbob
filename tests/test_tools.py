@@ -299,8 +299,14 @@ def test_forget_needs_a_real_id(box):
     assert "no memory with id" in box.call("forget", id="nope").error
 
 
-def test_remember_rejects_an_invented_kind(box):
-    assert "unknown kind" in box.call("remember", content="x", kind="vibes").error
+def test_a_near_miss_kind_is_coerced_not_rejected(box):
+    """Real logs show `kind="preference"` rejected twice in one conversation,
+    each rejection costing a step and a model call before it settled."""
+    assert box.call("remember", content="likes dark roast", kind="preference").ok
+    assert "[preference]" in box.call("remember", content="likes tea", kind="preferences").output
+    # Something with no sensible mapping still stores, as a plain fact.
+    result = box.call("remember", content="x", kind="vibes")
+    assert result.ok and "[fact]" in result.output
 
 
 # -- API catalog -----------------------------------------------------------

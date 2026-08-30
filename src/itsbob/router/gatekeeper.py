@@ -44,20 +44,15 @@ from typing import Any, Sequence
 
 from ..llm.base import LLMRequest, Provider, system, user
 from .ingestion import Snapshot
-from .tiers import GATEKEEPER_TAGS, GateDecision, Tier
+from .tiers import GATEKEEPER_TAGS, LEGACY_TAGS, GateDecision, Tier
 
 __all__ = ["Gatekeeper", "classify_heuristically"]
 
-_TAG_RE = re.compile(r"\[?(SCRIPT|ROUTINE|LOCAL_SUM|TRIVIAL|CLOUD_B|STANDARD|CLOUD_A|PREMIUM)\]?", re.I)
-
-#: Tag synonyms, because a small model will produce the word that means the
-#: thing rather than the token the prompt asked for often enough to matter.
-_TAG_ALIASES = {
-    "ROUTINE": "SCRIPT",
-    "TRIVIAL": "LOCAL_SUM",
-    "STANDARD": "CLOUD_B",
-    "PREMIUM": "CLOUD_A",
-}
+_TAG_RE = re.compile(
+    r"\[?(ROUTINE|SCRIPT|TRIVIAL|CHEAP|SIMPLE|LIGHT|STANDARD|CLOUD_B|COMPLEX|CLOUD_A|"
+    r"PREMIUM|LOCAL_SUM)\]?",
+    re.I,
+)
 
 # Hard to undo, or visible to other people. Floors at Tier A.
 #
@@ -152,21 +147,23 @@ def classify_heuristically(snapshot: Snapshot, *, routines: Sequence[str] = ()) 
 
     hit = _mentions(text, _JUDGEMENT)
     if hit:
-        # Ordered above recall so "should I delete the backups?" stays premium:
-        # it is a question, but the thing being asked is a judgement call.
-        tag, why = "CLOUD_A", f"asks for judgement ({hit!r})"
+        # Ordered above recall so "should I delete the backups?" stays at the
+        # top: it is a question, but the thing being asked is a judgement call.
+        tag, why = "COMPLEX", f"asks for judgement ({hit!r})"
     elif (hit := _mentions(text, _RECALL)) and size < 400:
-        tag, why = "LOCAL_SUM", f"asking about something, not doing it ({hit!r})"
+        tag, why = "TRIVIAL", f"asking about something, not doing it ({hit!r})"
     elif (hit := _mentions(text, _IRREVERSIBLE)) or (hit := _mentions(text, _IRREVERSIBLE_PHRASES)):
-        tag, why = "CLOUD_A", f"mentions {hit!r} — hard to undo, so judgement before action"
+        tag, why = "COMPLEX", f"mentions {hit!r} — hard to undo, so judgement before action"
     elif (hit := _mentions(text, _TRIVIAL)) and size < 400:
-        tag, why = "LOCAL_SUM", f"small talk or text manipulation ({hit!r})"
+        tag, why = "TRIVIAL", f"small talk or text manipulation ({hit!r})"
     elif (hit := _mentions(text, _TOOL_WORK)):
-        tag, why = "CLOUD_B", f"needs tools ({hit!r})"
+        tag, why = "STANDARD", f"needs tools ({hit!r})"
     elif size < 200:
-        tag, why = "LOCAL_SUM", f"short and unremarkable ({size} chars)"
+        tag, why = "TRIVIAL", f"short and unremarkable ({size} chars)"
+    elif size < 600:
+        tag, why = "SIMPLE", f"moderate ({size} chars), no tool or judgement signal"
     else:
-        tag, why = "CLOUD_B", f"no strong signal, {size} chars — standard tier"
+        tag, why = "STANDARD", f"no strong signal, {size} chars"
 
     return GateDecision(
         tier=GATEKEEPER_TAGS[tag],
@@ -180,23 +177,26 @@ def classify_heuristically(snapshot: Snapshot, *, routines: Sequence[str] = ()) 
 
 def _build_system_prompt(routines: Sequence[str]) -> str:
     routine_line = (
-        f"[SCRIPT] — one of these saved routines does exactly this, no thinking needed: "
+        f"[ROUTINE] — one of these saved routines does exactly this, no thinking needed: "
         f"{', '.join(routines)}. Name it in \"routine\".\n"
         if routines
         else ""
     )
     return (
         "You are the Gatekeeper. You do NOT answer the request. You decide which "
-        "tier of intelligence should handle it, and nothing else.\n\n"
+        "tier of intelligence should handle it, and nothing else. Each tier up "
+        "costs several times more, so pick the cheapest that can do the job.\n\n"
         f"{routine_line}"
-        "[LOCAL_SUM] — trivial: greetings, thanks, recalling something the user "
-        "already told you, rephrasing, summarising text you were given.\n"
-        "[CLOUD_B] — standard: uses tools, reads or writes files, runs commands, "
-        "calls an API, multi-step but the steps are clear.\n"
-        "[CLOUD_A] — premium: genuine judgement, several defensible options, "
-        "ambiguous instructions, OR anything hard to undo (deleting, sending, "
-        "deploying, paying, publishing). When in doubt between B and A on "
-        "something irreversible, choose A.\n\n"
+        "[TRIVIAL] — greetings, thanks, chit-chat, recalling something the user "
+        "already told you, rephrasing or shortening text you were given.\n"
+        "[SIMPLE] — a short factual answer, a recommendation, one obvious tool "
+        "call (read a file, check the time, look something up in memory).\n"
+        "[STANDARD] — real work: several tool calls, reading and writing files, "
+        "running commands, calling an API. Multi-step, but the steps are clear.\n"
+        "[COMPLEX] — genuine judgement: several defensible options, ambiguous "
+        "instructions, planning, OR anything hard to undo (deleting, sending, "
+        "deploying, paying, publishing). When in doubt between STANDARD and "
+        "COMPLEX on something irreversible, choose COMPLEX.\n\n"
         "Also output a 5-word lowercase fingerprint capturing the *kind* of "
         "request, for caching — not its specific details.\n"
         'Reply as strict JSON and nothing else: {"tag": "<TAG>", '
@@ -307,7 +307,7 @@ class Gatekeeper:
         reasoning = f"{source} model tagged [{tag}]"
         tier = GATEKEEPER_TAGS[tag]
 
-        if tag == "SCRIPT":
+        if tag == "ROUTINE":
             if routine and routine in self.routines:
                 metadata["routine"] = routine
                 reasoning += f" -> {routine}"
@@ -336,7 +336,7 @@ def _parse_reply(text: str) -> tuple[str | None, str | None, str | None]:
     if match is None:
         return None, None, None
     tag = match.group(1).upper()
-    tag = _TAG_ALIASES.get(tag, tag)
+    tag = LEGACY_TAGS.get(tag, tag)
     if tag not in GATEKEEPER_TAGS:
         return None, None, None
     fingerprint = str(parsed.get("fingerprint", "")).strip() or None

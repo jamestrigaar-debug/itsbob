@@ -93,7 +93,7 @@ def test_asking_about_a_thing_is_not_doing_it(text):
      "search the logs for timeouts", "fetch the latest release notes"],
 )
 def test_tool_work_is_standard(text):
-    assert _tier(text) is Tier.B
+    assert _tier(text) is Tier.A
 
 
 @pytest.mark.parametrize(
@@ -101,8 +101,8 @@ def test_tool_work_is_standard(text):
     ["delete the old backups", "deploy to production", "email the team the notes",
      "pay the invoice", "force push the branch", "migrate the database"],
 )
-def test_irreversible_work_is_premium(text):
-    assert _tier(text) is Tier.A
+def test_irreversible_work_is_the_strongest_tier(text):
+    assert _tier(text) is Tier.S
 
 
 @pytest.mark.parametrize(
@@ -111,22 +111,22 @@ def test_irreversible_work_is_premium(text):
      "what's the best way to structure the module", "is it safe to remove this class",
      "why does the build fail intermittently"],
 )
-def test_judgement_is_premium(text):
-    assert _tier(text) is Tier.A
+def test_judgement_is_the_strongest_tier(text):
+    assert _tier(text) is Tier.S
 
 
 def test_judgement_outranks_recall():
     """'should I delete X?' is a question, but it is asking for a decision."""
-    assert _tier("should I delete the backups?") is Tier.A
+    assert _tier("should I delete the backups?") is Tier.S
 
 
 @pytest.mark.parametrize(
     "text,not_tier",
     [
-        ("merge these two CSV files", Tier.A),      # "merge the" is a prefix of "merge these"
-        ("fetch the latest release notes", Tier.A),  # "release" as a noun
-        ("post theory notes somewhere", Tier.A),     # "post the" inside "post theory"
-        ("what are the release notes", Tier.A),
+        ("merge these two CSV files", Tier.S),      # "merge the" is a prefix of "merge these"
+        ("fetch the latest release notes", Tier.S),  # "release" as a noun
+        ("post theory notes somewhere", Tier.S),     # "post the" inside "post theory"
+        ("what are the release notes", Tier.S),
     ],
 )
 def test_vocabulary_matches_on_word_boundaries(text, not_tier):
@@ -135,13 +135,14 @@ def test_vocabulary_matches_on_word_boundaries(text, not_tier):
 
 
 def test_boundary_matching_still_catches_the_real_verb():
-    assert _tier("merge the branch into main") is Tier.A
-    assert _tier("release the build to production") is Tier.A
+    assert _tier("merge the branch into main") is Tier.S
+    assert _tier("release the build to production") is Tier.S
 
 
 def test_length_is_only_the_last_resort():
     assert _tier("mm") is Tier.C
-    assert _tier("lorem ipsum dolor " * 40) is Tier.B
+    assert _tier("lorem ipsum dolor " * 15) is Tier.B   # moderate (285 chars)
+    assert _tier("lorem ipsum dolor " * 40) is Tier.A   # long
 
 
 def test_the_classifier_never_raises_on_odd_input():
@@ -163,17 +164,20 @@ class _Model:
 
 
 def test_a_model_tag_is_used_when_it_parses():
-    gate = Gatekeeper(local_provider=_Model('{"tag": "CLOUD_A", "fingerprint": "a b c d e"}'))
+    gate = Gatekeeper(local_provider=_Model('{"tag": "COMPLEX", "fingerprint": "a b c d e"}'))
     decision = gate.classify(compress("hello"))
-    assert decision.tier is Tier.A and decision.fingerprint == "a b c d e"
+    assert decision.tier is Tier.S and decision.fingerprint == "a b c d e"
 
 
 def test_tag_synonyms_are_accepted():
     """Small models produce the word that means the thing, not always the token."""
     for reply, expected in (
-        ('{"tag": "PREMIUM"}', Tier.A),
-        ('{"tag": "STANDARD"}', Tier.B),
+        ('{"tag": "COMPLEX"}', Tier.S),
+        ('{"tag": "STANDARD"}', Tier.A),
+        ('{"tag": "SIMPLE"}', Tier.B),
         ('{"tag": "TRIVIAL"}', Tier.C),
+        ('{"tag": "CLOUD_A"}', Tier.S),      # legacy name
+        ('{"tag": "LOCAL_SUM"}', Tier.C),    # legacy name
     ):
         assert Gatekeeper(local_provider=_Model(reply)).classify(compress("x")).tier is expected
 
@@ -181,7 +185,7 @@ def test_tag_synonyms_are_accepted():
 def test_an_unparseable_reply_falls_back_to_the_heuristic():
     gate = Gatekeeper(local_provider=_Model("I think this is probably fine?"))
     decision = gate.classify(compress("delete the backups"))
-    assert decision.source == "heuristic" and decision.tier is Tier.A
+    assert decision.source == "heuristic" and decision.tier is Tier.S
 
 
 def test_a_failing_model_falls_back_to_the_heuristic():
@@ -193,14 +197,14 @@ def test_a_failing_model_falls_back_to_the_heuristic():
 
 
 def test_an_unknown_routine_name_routes_as_standard_not_as_a_halt():
-    gate = Gatekeeper(routines=("BACKUP",), local_provider=_Model('{"tag": "SCRIPT", "routine": "INVENTED"}'))
+    gate = Gatekeeper(routines=("BACKUP",), local_provider=_Model('{"tag": "ROUTINE", "routine": "INVENTED"}'))
     decision = gate.classify(compress("x"))
     assert decision.tier is Tier.B
     assert "named no known routine" in decision.reasoning
 
 
 def test_a_known_routine_is_tier_d():
-    gate = Gatekeeper(routines=("BACKUP",), local_provider=_Model('{"tag": "SCRIPT", "routine": "BACKUP"}'))
+    gate = Gatekeeper(routines=("BACKUP",), local_provider=_Model('{"tag": "ROUTINE", "routine": "BACKUP"}'))
     decision = gate.classify(compress("x"))
     assert decision.tier is Tier.D and decision.metadata["routine"] == "BACKUP"
 
@@ -210,7 +214,7 @@ def test_a_deterministic_trigger_skips_the_model_entirely():
         def first_triggered(self, snapshot):
             return "NIGHTLY"
 
-    gate = Gatekeeper(registry=Registry(), local_provider=_Model('{"tag": "CLOUD_A"}'))
+    gate = Gatekeeper(registry=Registry(), local_provider=_Model('{"tag": "COMPLEX"}'))
     decision = gate.classify(compress("anything"))
     assert decision.tier is Tier.D and decision.source == "trigger"
 
@@ -224,4 +228,9 @@ def test_a_broken_trigger_does_not_block_routing():
 
 
 def test_tier_rank_is_ordered_cheapest_first():
-    assert [t.rank for t in (Tier.D, Tier.C, Tier.B, Tier.A, Tier.S)] == [0, 1, 2, 3, 4]
+    assert [t.rank for t in (Tier.D, Tier.C, Tier.B, Tier.A, Tier.S, Tier.H)] == [0, 1, 2, 3, 4, 5]
+
+
+def test_only_model_tiers_are_answered_by_a_model():
+    assert [t for t in Tier if t.is_model] == [Tier.C, Tier.B, Tier.A, Tier.S]
+    assert not Tier.D.is_model and not Tier.H.is_model

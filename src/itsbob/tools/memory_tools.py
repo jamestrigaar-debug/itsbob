@@ -30,13 +30,9 @@ def _store(ctx: ToolContext):
 
 def _remember(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     store = _store(ctx)
-    kind_raw = str(params.get("kind", "fact")).lower()
-    try:
-        kind = MemoryKind(kind_raw)
-    except ValueError:
-        raise ToolError(
-            f"unknown kind {kind_raw!r}. Use one of: {', '.join(k.value for k in MemoryKind)}"
-        ) from None
+    # Coerced, not rejected. A wrong category is a rounding error; a rejected
+    # call costs a step and a model call to discover that.
+    kind = MemoryKind.coerce(params.get("kind"))
     record = MemoryRecord(
         content=params["content"].strip(),
         kind=kind,
@@ -129,7 +125,7 @@ def memory_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "One self-contained sentence."},
-                    "kind": {"type": "string", "description": f"One of: {kinds}. Default fact."},
+                    "kind": {"type": "string", "description": f"One of: {kinds}. Default fact. Near-misses are accepted."},
                     "importance": {"type": "number", "description": "0-1. Default 0.6."},
                     "tags": {"type": "array", "description": "Short lowercase labels."},
                 },

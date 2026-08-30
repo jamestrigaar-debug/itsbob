@@ -129,13 +129,68 @@ def test_pending_approvals_are_denied_when_a_turn_ends():
 # -- turns -----------------------------------------------------------------
 
 
-def test_only_one_turn_runs_at_a_time():
-    session = Session(lambda confirm: _Agent(delay=0.6))
-    assert session.start_turn("first") is True
+def test_turns_run_one_at_a_time_in_order():
+    """Two at once would interleave into each other's conversation history."""
+    agent = _Agent(delay=0.25)
+    session = Session(lambda confirm: agent)
+    for message in ("first", "second", "third"):
+        assert session.submit(message)["accepted"] is True
+    time.sleep(1.6)
+    assert agent.seen == ["first", "second", "third"]
+
+
+def test_a_message_sent_while_busy_is_queued_not_refused():
+    session = Session(lambda confirm: _Agent(delay=0.4))
+    assert session.submit("first")["started_now"] is True
     time.sleep(0.1)
-    assert session.start_turn("second") is False, "conversation state would interleave"
+    second = session.submit("second")
+    assert second["accepted"] is True and second["started_now"] is False
+    assert [q["text"] for q in session.queued_messages()] == ["second"]
+    time.sleep(1.2)
+    assert session.queued_messages() == []
+
+
+def test_the_queue_has_a_ceiling():
+    session = Session(lambda confirm: _Agent(delay=5.0))
+    results = [session.submit(f"m{i}") for i in range(25)]
+    assert results[-1]["accepted"] is False
+    assert "already waiting" in results[-1]["error"]
+
+
+def test_a_typed_message_goes_ahead_of_queued_scheduled_work():
+    """Autonomous work is not urgent; making a person wait behind a nightly
+    backup summary to ask a question is the wrong way round."""
+    agent = _Agent(delay=0.4)
+    session = Session(lambda confirm: agent)
+    session.submit("running", source="task", label="nightly")
+    time.sleep(0.05)
+    session.submit("task A", source="task", label="backup")
+    session.submit("task B", source="task", label="tidy")
+    session.submit("my question", source="user")
+    assert [q["text"] for q in session.queued_messages()] == ["my question", "task A", "task B"]
+
+
+def test_a_running_turn_is_never_preempted():
+    """Interrupting mid-tool-call would leave the work half done."""
+    agent = _Agent(delay=0.4)
+    session = Session(lambda confirm: agent)
+    session.submit("already running", source="task")
+    time.sleep(0.1)
+    session.submit("urgent", source="user")
+    time.sleep(1.2)
+    assert agent.seen[0] == "already running"
+
+
+def test_clearing_the_queue_leaves_the_running_turn_alone():
+    agent = _Agent(delay=0.4)
+    session = Session(lambda confirm: agent)
+    session.submit("running")
+    time.sleep(0.1)
+    session.submit("queued-1")
+    session.submit("queued-2")
+    assert session.clear_queue() == 2
     time.sleep(0.8)
-    assert session.start_turn("third") is True
+    assert agent.seen == ["running"]
 
 
 def test_a_failing_turn_becomes_an_event_not_a_crash():

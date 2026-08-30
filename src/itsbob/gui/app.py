@@ -39,7 +39,9 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     from ..agent import build_agent, default_home
     from ..daemon import TaskStore, parse_schedule
+    from ..daemon.notify import NoticeGate, default_sink
     from ..tools import Mode
+    from .autonomous import Autonomous
     from .session import Session
 
     root = Path(home) if home else default_home()
@@ -53,14 +55,25 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
             home=root, mode=Mode(mode) if mode else None, confirm=confirm
         )
     )
-    tasks_holder: dict[str, Any] = {}
-    tasks_lock = threading.Lock()
+    holder: dict[str, Any] = {}
+    holder_lock = threading.Lock()
 
     def tasks() -> Any:
-        with tasks_lock:
-            if "store" not in tasks_holder:
-                tasks_holder["store"] = TaskStore(root / "tasks.sqlite")
-            return tasks_holder["store"]
+        with holder_lock:
+            if "store" not in holder:
+                holder["store"] = TaskStore(root / "tasks.sqlite")
+            return holder["store"]
+
+    def autonomous() -> Autonomous:
+        with holder_lock:
+            if "autonomous" not in holder:
+                holder["autonomous"] = Autonomous(
+                    session,
+                    tasks(),
+                    sink=default_sink(root, console=False),
+                    gate=NoticeGate(brain=session.agent.brain),
+                )
+            return holder["autonomous"]
 
     def fail(message: str, status: int = 400):
         return jsonify({"error": message}), status
@@ -104,9 +117,12 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         message = str(payload.get("message", "")).strip()
         if not message:
             return fail("message is empty")
-        if not session.start_turn(message, context=payload.get("context") or None):
-            return fail("a turn is already running", 409)
-        return jsonify({"started": True})
+        # Always accepted unless the queue is full: a message sent while it is
+        # working is queued, not refused.
+        result = session.submit(message, context=payload.get("context") or None)
+        if not result["accepted"]:
+            return fail(result["error"], 429)
+        return jsonify(result)
 
     @app.post("/api/approve")
     def approve():
@@ -125,6 +141,29 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         session.reset_conversation()
         return jsonify({"ok": True})
 
+    @app.post("/api/queue/clear")
+    def queue_clear():
+        return jsonify({"dropped": session.clear_queue()})
+
+    @app.post("/api/autonomous")
+    def set_autonomous():
+        """Turn continuous mode on or off.
+
+        On, itsbob runs its scheduled work by itself and you can still talk to
+        it — everything goes through one queue, so nothing overlaps.
+        """
+        payload = request.get_json(force=True, silent=True) or {}
+        runner = autonomous()
+        if bool(payload.get("enabled")):
+            runner.start()
+        else:
+            runner.stop()
+        return jsonify(runner.status())
+
+    @app.get("/api/autonomous")
+    def get_autonomous():
+        return jsonify(autonomous().status())
+
     # -- state -------------------------------------------------------------
 
     @app.get("/api/status")
@@ -135,6 +174,8 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
             {
                 "home": str(root),
                 "busy": session.busy,
+                "current": session.current,
+                "queued": session.queued_messages(),
                 "policy": agent.toolbox.policy.describe(),
                 "auto_allowed": sorted(session.auto_allow),
                 "tools": [
@@ -160,6 +201,8 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                 "memory": agent.memory.stats() if agent.memory is not None else {},
                 "apis": agent.toolbox.catalog.describe() if agent.toolbox.catalog else [],
                 "tasks": [t.as_dict() for t in tasks().all()],
+                "autonomous": holder["autonomous"].status() if "autonomous" in holder
+                              else {"running": False},
                 "turns": len(agent.conversation),
                 "usage": brain.get("usage", {}),
             }
@@ -207,6 +250,19 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
     @app.get("/api/audit")
     def audit():
         return jsonify({"entries": session.agent.toolbox.audit.recent(60)})
+
+    @app.get("/api/scripts")
+    def scripts():
+        """The foundation scripts and the tools each provides."""
+        from ..scripts import describe_scripts
+
+        allowed = set(session.agent.toolbox.registry.names())
+        rows = []
+        for row in describe_scripts():
+            row = dict(row)
+            row["tools"] = [t for t in row["tools"] if t["name"] in allowed]
+            rows.append(row)
+        return jsonify({"scripts": rows})
 
     # -- tasks -------------------------------------------------------------
 
