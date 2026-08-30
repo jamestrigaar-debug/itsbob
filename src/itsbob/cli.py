@@ -667,7 +667,6 @@ def _cmd_models(args: argparse.Namespace) -> int:
     """What each provider actually serves today, versus what itsbob asks for."""
     from .llm.catalog import default_provider_configs, list_models
 
-    settings = Settings.from_env(load_env_files=False)
     configs = {c.name: c for c in default_provider_configs()}
     any_key = False
 
