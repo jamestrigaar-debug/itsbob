@@ -13,6 +13,12 @@ confirmation handler, so the policy correctly failed closed and every
 one place a person actually *is*, and it was the one place that could not say
 yes.
 
+**A message sent while it was working was rejected.** Turns run one at a time —
+they have to, since the agent carries conversation state and two at once would
+interleave into each other's history — but refusing the message put that
+constraint on the person rather than on the software. Messages are now queued
+and run in order, so you can keep typing while it works and it catches up.
+
 Both are solved by running the turn on a worker thread and streaming events to
 the page. When the agent reaches a tool that needs consent, the callback parks
 on an :class:`threading.Event` and the page renders an approve/deny card; the
@@ -28,6 +34,7 @@ import queue
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
@@ -41,6 +48,27 @@ APPROVAL_TIMEOUT = 180.0
 #: Cap on queued events per listener. A browser that stops reading (a
 #: backgrounded tab, a dead connection) must not grow the queue without bound.
 MAX_QUEUED_EVENTS = 500
+
+#: Cap on unsent messages. Deep enough that nobody types into it by accident,
+#: shallow enough that a stuck agent does not accumulate an evening of work to
+#: replay when it recovers.
+MAX_QUEUED_MESSAGES = 20
+
+
+@dataclass
+class QueuedMessage:
+    """One thing waiting to be run, and where it came from."""
+
+    text: str
+    source: str = "user"  #: "user" | "task"
+    context: Any = None
+    label: str = ""
+    #: Called with the finished Turn (or None on failure). Used by autonomous
+    #: mode to record the run and decide whether to interrupt.
+    on_done: Any = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"text": self.text, "source": self.source, "label": self.label}
 
 
 @dataclass
@@ -85,7 +113,12 @@ class Session:
         self.pending: dict[str, PendingApproval] = {}
         self.auto_allow: set[str] = set()
         self.busy = False
+        self.current_source: str | None = None
         self.last_error: str | None = None
+        #: Messages waiting their turn, oldest first.
+        self._queue: deque[QueuedMessage] = deque()
+        self._queue_lock = threading.Lock()
+        self.current: str | None = None
 
     # -- the agent ---------------------------------------------------------
 
@@ -193,30 +226,135 @@ class Session:
 
     # -- turns -------------------------------------------------------------
 
-    def start_turn(self, message: str, *, context: Any = None) -> bool:
-        """Run one turn on a worker thread. False if one is already running."""
+    def submit(
+        self,
+        message: str,
+        *,
+        context: Any = None,
+        source: str = "user",
+        label: str = "",
+        on_done: Any = None,
+    ) -> dict[str, Any]:
+        """Accept a message. Runs it now if idle, queues it if not.
+
+        Always accepts — refusing while busy made the one-turn-at-a-time
+        constraint the person's problem rather than the software's.
+
+        A typed message goes ahead of anything scheduled that is still waiting.
+        Autonomous work is by definition not urgent, and making a person wait
+        behind a nightly backup summary to ask a question is the wrong way
+        round. It does not preempt whatever is already *running*: interrupting
+        a turn mid-tool-call would leave the work half done.
+        """
+        item = QueuedMessage(
+            text=message, source=source, context=context, label=label, on_done=on_done
+        )
+        with self._queue_lock:
+            if len(self._queue) >= MAX_QUEUED_MESSAGES:
+                return {
+                    "accepted": False,
+                    "queued": len(self._queue),
+                    "error": (
+                        f"{len(self._queue)} messages are already waiting. "
+                        "Let it catch up, or clear the queue."
+                    ),
+                }
+            if source == "user":
+                # After the last queued user message, before the first task.
+                position = len(self._queue)
+                for index, queued in enumerate(self._queue):
+                    if queued.source != "user":
+                        position = index
+                        break
+                self._queue.insert(position, item)
+            else:
+                self._queue.append(item)
+            depth = len(self._queue)
+
+        started_now = self._ensure_worker()
+        if not started_now:
+            self.emit("queued", message=message, source=source, label=label, queued=depth)
+        return {"accepted": True, "queued": depth, "started_now": started_now}
+
+    def _ensure_worker(self) -> bool:
+        """Start the drain thread if one is not already running. True if started."""
         if not self._turn_lock.acquire(blocking=False):
             return False
-
-        def run() -> None:
-            self.busy = True
-            self.last_error = None
-            self.emit("turn_start", message=message)
-            try:
-                turn = self.agent.chat(
-                    message, context=context, on_event=self._forward
-                )
-                self.emit("turn_end", turn=turn.as_dict(), reply=turn.final)
-            except Exception as exc:  # noqa: BLE001 - surface it, never 500 the stream
-                self.last_error = f"{type(exc).__name__}: {exc}"
-                self.emit("turn_error", error=self.last_error)
-            finally:
-                self.busy = False
-                self.cancel_pending()
-                self._turn_lock.release()
-
-        threading.Thread(target=run, name="itsbob-gui-turn", daemon=True).start()
+        threading.Thread(target=self._drain, name="itsbob-gui-turns", daemon=True).start()
         return True
+
+    def _drain(self) -> None:
+        """Run queued messages in order until there are none left.
+
+        One thread for the whole queue rather than one per message: the lock is
+        held for the entire drain, so a message submitted mid-run joins the
+        queue instead of racing to start a second turn.
+        """
+        try:
+            while True:
+                with self._queue_lock:
+                    if not self._queue:
+                        return
+                    item = self._queue.popleft()
+                    remaining = len(self._queue)
+                self._run_one(item, remaining)
+        finally:
+            self.busy = False
+            self.current = None
+            self.current_source = None
+            self._turn_lock.release()
+            # Anything submitted between the queue emptying and the lock being
+            # released would otherwise sit there until the next message.
+            with self._queue_lock:
+                orphaned = bool(self._queue)
+            if orphaned:
+                self._ensure_worker()
+
+    def _run_one(self, item: QueuedMessage, remaining: int) -> None:
+        self.busy = True
+        self.current = item.label or item.text
+        self.current_source = item.source
+        self.last_error = None
+        turn = None
+        self.emit(
+            "turn_start", message=item.text, source=item.source,
+            label=item.label, queued=remaining,
+        )
+        try:
+            turn = self.agent.chat(item.text, context=item.context, on_event=self._forward)
+            self.emit(
+                "turn_end", turn=turn.as_dict(), reply=turn.final,
+                source=item.source, label=item.label, queued=remaining,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface it, never 500 the stream
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.emit("turn_error", error=self.last_error, source=item.source, queued=remaining)
+        finally:
+            # Denied here rather than at drain time: an approval left waiting by
+            # a failed turn must not outlive it into the next one.
+            self.cancel_pending()
+            if item.on_done is not None:
+                try:
+                    item.on_done(turn, self.last_error)
+                except Exception:  # noqa: BLE001 - a callback must not break the queue
+                    pass
+
+    def start_turn(self, message: str, *, context: Any = None) -> bool:
+        """Backwards-compatible shim. Prefer :meth:`submit`."""
+        return bool(self.submit(message, context=context)["accepted"])
+
+    def queued_messages(self) -> list[dict[str, Any]]:
+        with self._queue_lock:
+            return [item.as_dict() for item in self._queue]
+
+    def clear_queue(self) -> int:
+        """Drop everything waiting. Does not touch the turn already running."""
+        with self._queue_lock:
+            dropped = len(self._queue)
+            self._queue.clear()
+        if dropped:
+            self.emit("queue_cleared", dropped=dropped)
+        return dropped
 
     def _forward(self, event: Any) -> None:
         self.emit(event.kind, **event.data)

@@ -121,10 +121,7 @@ class MemoryWriter:
             content = str(item.get("content", "")).strip()
             if not content:
                 continue
-            try:
-                kind = MemoryKind(str(item.get("kind", "fact")).lower())
-            except ValueError:
-                kind = MemoryKind.FACT
+            kind = MemoryKind.coerce(item.get("kind"))
             out.append(
                 ExtractedMemory(
                     content=content,

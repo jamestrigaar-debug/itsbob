@@ -75,7 +75,8 @@ class AgentEvent:
 EventFn = Callable[[AgentEvent], None]
 
 #: Raising within a turn only. A turn never gets cheaper than it started.
-_RAISE = {Tier.C: Tier.B, Tier.B: Tier.A, Tier.A: Tier.A, Tier.D: Tier.B, Tier.S: Tier.A}
+_RAISE = {Tier.C: Tier.B, Tier.B: Tier.A, Tier.A: Tier.S, Tier.S: Tier.S,
+          Tier.D: Tier.B, Tier.H: Tier.A}
 
 #: How many invented tool names to tolerate before giving up on the turn.
 MAX_UNKNOWN_TOOLS = 3
@@ -179,7 +180,7 @@ class Agent:
 
         snapshot = self._snapshot(message, context)
         decision = self.gatekeeper.classify(snapshot)
-        tier = decision.tier if decision.tier not in (Tier.D, Tier.S) else Tier.B
+        tier = decision.tier if decision.tier.is_model else Tier.B
         turn.tier = tier.value
         emit("classified", tier=tier.value, decision=decision.as_dict())
 

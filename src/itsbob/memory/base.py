@@ -23,11 +23,59 @@ __all__ = [
 
 class MemoryKind(str, Enum):
     OBSERVATION = "observation"  # something the world did
-    ACTION = "action"  # something the character did
-    DECISION = "decision"  # why the character did it
+    ACTION = "action"  # something the agent did
+    DECISION = "decision"  # why it did it
     REFLECTION = "reflection"  # a conclusion drawn from other memories
-    FACT = "fact"  # knowledge, often from an LLM
+    FACT = "fact"  # knowledge about the world
+    PREFERENCE = "preference"  # what the user likes, wants, or always does
     DIALOGUE = "dialogue"  # something said or heard
+
+    @classmethod
+    def coerce(cls, value: "str | MemoryKind | None") -> "MemoryKind":
+        """Accept the word a model reaches for, not only the exact token.
+
+        Models pick the *meaning* over the enum member: real logs show
+        `kind="preference"` rejected twice in one conversation, each rejection
+        costing a step and a model call before it settled on "fact". Adding
+        preference as a real kind fixes the common case — an assistant that
+        cannot distinguish "likes dark roast coffee" from "Paris is in France"
+        is missing a category it needs — and the aliases below absorb the rest.
+        """
+        if isinstance(value, cls):
+            return value
+        text = str(value or "fact").strip().lower()
+        try:
+            return cls(text)
+        except ValueError:
+            pass
+        return _KIND_ALIASES.get(text, cls.FACT)
+
+
+#: Near-misses seen in practice, mapped to the nearest real kind. Unknown words
+#: fall back to FACT rather than raising: losing the *category* of a memory is a
+#: much smaller loss than losing the memory.
+_KIND_ALIASES: dict[str, MemoryKind] = {
+    "preferences": MemoryKind.PREFERENCE,
+    "like": MemoryKind.PREFERENCE,
+    "likes": MemoryKind.PREFERENCE,
+    "opinion": MemoryKind.PREFERENCE,
+    "taste": MemoryKind.PREFERENCE,
+    "habit": MemoryKind.PREFERENCE,
+    "event": MemoryKind.OBSERVATION,
+    "observations": MemoryKind.OBSERVATION,
+    "note": MemoryKind.FACT,
+    "knowledge": MemoryKind.FACT,
+    "info": MemoryKind.FACT,
+    "information": MemoryKind.FACT,
+    "facts": MemoryKind.FACT,
+    "task": MemoryKind.ACTION,
+    "activity": MemoryKind.ACTION,
+    "conclusion": MemoryKind.REFLECTION,
+    "insight": MemoryKind.REFLECTION,
+    "conversation": MemoryKind.DIALOGUE,
+    "message": MemoryKind.DIALOGUE,
+    "choice": MemoryKind.DECISION,
+}
 
 
 @dataclass

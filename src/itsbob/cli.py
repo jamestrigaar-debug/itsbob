@@ -683,6 +683,21 @@ def _tier(value: str):
     return Tier(value)
 
 
+def _cmd_scripts(args: argparse.Namespace) -> int:
+    """The foundation scripts and the tools each one provides."""
+    from .scripts import describe_scripts
+
+    for row in describe_scripts():
+        print(f"\n{row['name']}  —  {row['summary']}")
+        print(f"  run directly:  python -m {row['module']} --help")
+        for tool in row["tools"]:
+            print(f"  {tool['risk']:<12} {tool['name']:<22} {tool['description'][:78]}")
+    print("\nRisk decides what the policy asks about: in guarded mode (the default)")
+    print("execute and destructive need a person to say yes, and are refused outright")
+    print("when nobody is there to ask.")
+    return 0
+
+
 def _cmd_models(args: argparse.Namespace) -> int:
     """What each provider actually serves today, versus what itsbob asks for."""
     from .llm.catalog import default_provider_configs, list_models
@@ -972,6 +987,10 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = with_mode(add("doctor", "What is actually configured, and what works."))
     doctor.add_argument("--probe", action="store_true", help="send one real request per model")
     doctor.set_defaults(handler=_cmd_doctor)
+
+    add("scripts", "The foundation scripts itsbob can run, and what each may do.").set_defaults(
+        handler=_cmd_scripts
+    )
 
     models = add("models", "What each provider actually serves, versus what itsbob asks for.")
     models.add_argument("--provider", choices=["google", "groq", "openrouter"])

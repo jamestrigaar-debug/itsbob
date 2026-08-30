@@ -31,6 +31,15 @@ still much better than blocking the daemon.
 **Ctrl-C and SIGTERM stop it cleanly.** A service manager stopping the daemon
 mid-task would otherwise lose the run record entirely.
 
+**It does not start heavy work on a machine that cannot take it.** Before each
+run the daemon reads :func:`~itsbob.scripts.system_monitor.read_system`, and if
+the laptop is on a nearly-flat battery, thermally throttled, or out of disk, the
+task is *deferred* rather than run or failed — deferred, because "the battery
+was low at 8:30" is not a failure of the task and should not count toward
+disabling it. After an hour of being held back it says so once, since silently
+never running is its own kind of broken. A task can opt out with
+``metadata={"ignore_health": True}`` when it is light enough not to care.
+
 Each run gets a fresh conversation and the shared long-term memory, so a task
 starts clean but can still notice "third morning in a row".
 """
@@ -84,6 +93,9 @@ class Daemon:
         remember_runs: bool = True,
         task_timeout: float = 600.0,
         handle_signals: bool = True,
+        health_gate: bool = True,
+        defer_seconds: float = 600.0,
+        max_defers: int = 6,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -102,8 +114,16 @@ class Daemon:
         #: everything).
         self.task_timeout = task_timeout
         self.handle_signals = handle_signals
+        #: Hold work back when the machine is in no state for it.
+        self.health_gate = health_gate
+        self.defer_seconds = defer_seconds
+        #: After this many consecutive deferrals (about an hour at the default
+        #: interval) say so once — work that is never run is also a failure.
+        self.max_defers = max_defers
         self._stop = threading.Event()
         self._abandoned = 0
+        self._defers: dict[str, int] = {}
+        self._defer_notified: set[str] = set()
         self.started_at: float | None = None
         self.runs_completed = 0
         self.notifications_sent = 0
@@ -161,7 +181,58 @@ class Daemon:
         if not due:
             self._emit("waiting", next_due=self.tasks.next_due_at())
             return []
-        return [self.run_task(task, now=now) for task in due]
+
+        runs: list[TaskRun] = []
+        for task in due:
+            held = self._health_hold(task)
+            if held is not None:
+                self._defer(task, held, now=now)
+                continue
+            self._defers.pop(task.id, None)
+            self._defer_notified.discard(task.id)
+            runs.append(self.run_task(task, now=now))
+        return runs
+
+    def _health_hold(self, task: Task) -> str | None:
+        """Why this task should wait, or None to go ahead."""
+        if not self.health_gate or task.metadata.get("ignore_health"):
+            return None
+        try:
+            from ..scripts.system_monitor import read_system
+
+            state = read_system()
+        except Exception:  # noqa: BLE001 - a broken monitor must not stop the work
+            return None
+        return "; ".join(state.concerns) if state.concerns else None
+
+    def _defer(self, task: Task, reason: str, *, now: float) -> None:
+        """Push a task back rather than running or failing it.
+
+        Deferred, not failed: "the battery was flat at 08:30" says nothing about
+        whether the task works, and counting it as a failure would disable a
+        perfectly good task after five bad mornings.
+        """
+        count = self._defers.get(task.id, 0) + 1
+        self._defers[task.id] = count
+        task.next_run = (now or time.time()) + self.defer_seconds
+        self.tasks.add(task)
+        self._emit("deferred", task=task.name, reason=reason, count=count,
+                   retry_in_s=self.defer_seconds)
+
+        if count >= self.max_defers and task.id not in self._defer_notified:
+            self._defer_notified.add(task.id)
+            held_for = count * self.defer_seconds / 60
+            self._deliver(
+                Notification(
+                    title=f"'{task.name}' is being held back",
+                    body=(
+                        f"Not run for about {held_for:.0f} minutes because: {reason}. "
+                        "It will start on its own once the machine is in better shape."
+                    ),
+                    task=task.name,
+                    urgency="low",
+                )
+            )
 
     def run_task(self, task: Task, *, now: float | None = None) -> TaskRun:
         """One task, start to finish, never raising."""
@@ -319,6 +390,8 @@ class Daemon:
             "notifications_sent": self.notifications_sent,
             "abandoned_runs": self._abandoned,
             "task_timeout_s": self.task_timeout,
+            "health_gate": self.health_gate,
+            "deferred_now": {name: count for name, count in self._defers.items() if count},
             "policy_mode": policy.mode.value,
             "can_run_commands": (
                 policy.mode.value == "trusted" or "run_shell" in policy.auto_allow

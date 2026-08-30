@@ -9,10 +9,22 @@ second is the entire point of the ladder.
 ::
 
     Tier D   no model at all — a registered routine fires
-    Tier C   cheapest — chat, formatting, an obvious single tool call
-    Tier B   standard — real multi-step work, most tool use
-    Tier A   premium — ambiguity, judgement, anything hard to undo
-    Tier S   nothing could answer; stop and ask
+    Tier C   cheapest — greetings, recall, one obvious step
+    Tier B   light    — short reasoning, a couple of clear steps
+    Tier A   standard — real multi-step work, most tool use
+    Tier S   strongest — ambiguity, judgement, anything hard to undo
+    Tier H   nothing could answer; stop and ask
+
+Four model tiers rather than three, because the gap between "say hello" and
+"decide whether this migration is safe" was being spanned by one step. Each
+rung is a real price and latency difference, measured rather than assumed:
+``gemini-3.5-flash-lite`` answers a classification in ~540ms where
+``gemini-pro-latest`` takes ~3s and costs far more.
+
+Gemma models were tried for the bottom rung, since they are free. They are not
+usable here: 17-22s per call, and they ignore ``response_format`` entirely,
+emitting a ``<thought>`` preamble instead of the JSON object the loop parses.
+Free is not cheap if every turn fails.
 
 Escalation is up first, then down. A Tier B call whose providers are all
 failing tries A before it tries C: the expensive model is more likely to
@@ -42,19 +54,26 @@ __all__ = ["TIER_MODELS", "TierResult", "TieredBrain", "build_brain"]
 #: against the models listing — see :mod:`itsbob.llm.catalog` on why these are
 #: defaults rather than constants.
 TIER_MODELS: dict[Tier, tuple[str, ...]] = {
-    Tier.C: ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite"),
-    Tier.B: ("gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"),
-    Tier.A: ("gemini-pro-latest", "gemini-3.6-flash", "gemini-3.5-flash"),
+    Tier.C: ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"),
+    Tier.B: ("gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"),
+    Tier.A: ("gemini-3.5-flash", "gemini-3.6-flash", "gemini-flash-lite-latest"),
+    Tier.S: ("gemini-pro-latest", "gemini-3.6-flash", "gemini-3.5-flash"),
 }
 
 #: Where a tier goes when every provider on it fails. Up before down.
 _ESCALATION: dict[Tier, tuple[Tier, ...]] = {
-    Tier.C: (Tier.B, Tier.A),
-    Tier.B: (Tier.A, Tier.C),
-    Tier.A: (Tier.B, Tier.C),
+    Tier.C: (Tier.B, Tier.A, Tier.S),
+    Tier.B: (Tier.A, Tier.S, Tier.C),
+    Tier.A: (Tier.S, Tier.B, Tier.C),
+    Tier.S: (Tier.A, Tier.B, Tier.C),
 }
 
-_TIER_ENV = {Tier.C: "ITSBOB_TIER_C_MODEL", Tier.B: "ITSBOB_TIER_B_MODEL", Tier.A: "ITSBOB_TIER_A_MODEL"}
+_TIER_ENV = {
+    Tier.C: "ITSBOB_TIER_C_MODEL",
+    Tier.B: "ITSBOB_TIER_B_MODEL",
+    Tier.A: "ITSBOB_TIER_A_MODEL",
+    Tier.S: "ITSBOB_TIER_S_MODEL",
+}
 
 
 @dataclass
