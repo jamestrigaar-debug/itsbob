@@ -18,7 +18,9 @@ as you.
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -39,9 +41,13 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     from ..agent import build_agent, default_home
     from ..daemon import TaskStore, parse_schedule
-    from ..daemon.notify import NoticeGate, default_sink
+    from ..daemon.notify import MultiSink, NoticeGate, default_sink
+    from ..integrations.discord import DiscordBridge, DiscordClient, DiscordSink
     from ..tools import Mode
     from .autonomous import Autonomous
+    from ..tools.vision import pillow_available
+    from ..tools.websearch import available_backend
+    from .messages import MESSAGES_PAGE, MessageLog
     from .session import Session
 
     root = Path(home) if home else default_home()
@@ -64,13 +70,47 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                 holder["store"] = TaskStore(root / "tasks.sqlite")
             return holder["store"]
 
+    def messages() -> MessageLog:
+        with holder_lock:
+            if "messages" not in holder:
+                holder["messages"] = MessageLog(root / "notifications.jsonl")
+            return holder["messages"]
+
+    def discord() -> DiscordBridge | None:
+        """The Discord bridge, built once if a token and channel are configured."""
+        with holder_lock:
+            if "discord" not in holder:
+                client = DiscordClient.from_env()
+                holder["discord"] = (
+                    None
+                    if client is None
+                    else DiscordBridge(client=client, submit=session.submit)
+                )
+            return holder["discord"]
+
+    def sink() -> Any:
+        """Where proactive messages go: the usual sinks, plus Discord when set up.
+
+        Discord is appended rather than substituted. The file log is what
+        `/messages` reads, and losing it because a channel was configured would
+        empty the messages window for no reason.
+        """
+        with holder_lock:
+            if "sink" not in holder:
+                base = default_sink(root, console=False)
+                bridge = DiscordClient.from_env()
+                if bridge is not None:
+                    base = MultiSink(sinks=[*base.sinks, DiscordSink(client=bridge)])
+                holder["sink"] = base
+            return holder["sink"]
+
     def autonomous() -> Autonomous:
         with holder_lock:
             if "autonomous" not in holder:
                 holder["autonomous"] = Autonomous(
                     session,
                     tasks(),
-                    sink=default_sink(root, console=False),
+                    sink=sink(),
                     gate=NoticeGate(brain=session.agent.brain),
                 )
             return holder["autonomous"]
@@ -83,6 +123,102 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
     @app.get("/")
     def index():
         return Response(PAGE, mimetype="text/html")
+
+    @app.get("/messages")
+    def messages_page():
+        """The standalone messages window — everything Bob said unprompted.
+
+        A separate page rather than a panel: proactive notices and a
+        conversation are different kinds of thing, and interleaving them makes
+        both harder to read. It shares the server, the log and the SSE
+        machinery, so this is three routes rather than a second application.
+        """
+        return Response(MESSAGES_PAGE, mimetype="text/html")
+
+    @app.get("/api/messages")
+    def messages_list():
+        limit = max(1, min(500, int(request.args.get("limit", 100) or 100)))
+        log = messages()
+        return jsonify(
+            {
+                "messages": log.recent(
+                    limit=limit,
+                    after=request.args.get("after") or None,
+                    unread_only=request.args.get("unread") == "1",
+                ),
+                "unread": log.unread_count(),
+            }
+        )
+
+    @app.get("/api/messages/stream")
+    def messages_stream():
+        log = messages()
+        after = request.args.get("after") or log.latest_id()
+
+        def events():
+            # An immediate frame so the page can tell "connected" from "hung",
+            # which an SSE stream cannot otherwise show until something happens.
+            yield 'data: {"kind": "keepalive"}\n\n'
+            last = time.time()
+            for message in log.follow(after=after):
+                if message is None:
+                    # Idle. A comment frame every 20s keeps browsers and proxies
+                    # from closing a connection that is working perfectly.
+                    if time.time() - last > 20:
+                        last = time.time()
+                        yield ": keepalive\n\n"
+                    continue
+                last = time.time()
+                yield f"data: {json.dumps(message, default=str)}\n\n"
+
+        return Response(
+            stream_with_context(events()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    @app.post("/api/messages/read")
+    def messages_read():
+        payload = request.get_json(force=True, silent=True) or {}
+        log = messages()
+        marked = (
+            log.mark_all_read()
+            if payload.get("all")
+            else log.mark_read([str(i) for i in (payload.get("ids") or [])])
+        )
+        return jsonify({"marked": marked, "unread": log.unread_count()})
+
+    # -- discord -----------------------------------------------------------
+
+    @app.get("/api/discord")
+    def discord_status():
+        bridge = discord()
+        if bridge is None:
+            return jsonify(
+                {
+                    "configured": False,
+                    "hint": "set DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID in .env",
+                }
+            )
+        return jsonify({"configured": True, **bridge.status()})
+
+    @app.post("/api/discord")
+    def discord_toggle():
+        payload = request.get_json(force=True, silent=True) or {}
+        bridge = discord()
+        if bridge is None:
+            return fail("Discord is not configured — set DISCORD_BOT_TOKEN and "
+                        "DISCORD_CHANNEL_ID in .env and restart", 409)
+        if bool(payload.get("enabled")):
+            if not bridge.start():
+                return fail(bridge.last_error or "already running", 409)
+        else:
+            bridge.stop()
+        return jsonify({"configured": True, **bridge.status()})
 
     @app.get("/favicon.ico")
     def favicon():
@@ -205,6 +341,18 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                               else {"running": False},
                 "turns": len(agent.conversation),
                 "usage": brain.get("usage", {}),
+                "unread": messages().unread_count(),
+                "discord": (
+                    {"configured": False}
+                    if discord() is None
+                    else {"configured": True, **discord().status()}
+                ),
+                "budget": agent.guard.as_dict(),
+                "feasibility": agent.feasibility.as_dict()
+                if agent.feasibility is not None
+                else {},
+                "search_backend": available_backend(),
+                "vision": {"pillow": pillow_available()},
             }
         )
 
@@ -253,8 +401,8 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     @app.get("/api/scripts")
     def scripts():
-        """The foundation scripts and the tools each provides."""
-        from ..scripts import describe_scripts
+        """Every discovered script and the tools each provides."""
+        from ..scripts import describe_scripts, user_scripts_dir
 
         allowed = set(session.agent.toolbox.registry.names())
         rows = []
@@ -262,7 +410,7 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
             row = dict(row)
             row["tools"] = [t for t in row["tools"] if t["name"] in allowed]
             rows.append(row)
-        return jsonify({"scripts": rows})
+        return jsonify({"scripts": rows, "drop_in": str(user_scripts_dir())})
 
     # -- tasks -------------------------------------------------------------
 

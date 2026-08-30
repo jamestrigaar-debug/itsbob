@@ -19,6 +19,7 @@ from ..config import Settings
 from ..llm.embeddings import default_embedder
 from ..memory.long_term import LongTermMemory
 from ..tools import Mode, Policy, Tool, Toolbox, build_toolbox
+from ..router.tiers import Tier
 from .brain import TIER_MODELS, TierResult, TieredBrain, build_brain
 from .context import Conversation, Step, Turn
 from .loop import Agent, AgentEvent
@@ -53,6 +54,51 @@ def default_home(env: Mapping[str, str] | None = None) -> Path:
     """
     env = os.environ if env is None else env
     return Path(env.get("ITSBOB_HOME", "").strip() or Path.home() / ".itsbob").expanduser()
+
+
+def _condenser(brain: TieredBrain):
+    """Turns a list of headlines into prose, on the cheapest thing available.
+
+    Given to the briefing tool rather than imported by it, so the news module
+    never reaches back into the model ladder — and so the report degrades to a
+    plain list rather than failing when nothing can condense it.
+    """
+
+    def condense(headlines) -> str:
+        from ..llm.base import LLMRequest, system, user
+
+        lines = "\n".join(
+            f"- {h.title} ({h.source}): {h.summary}" for h in list(headlines)[:20]
+        )
+        try:
+            result = brain.complete(
+                Tier.C,
+                LLMRequest(
+                    messages=[
+                        system(
+                            "Condense these headlines into a short briefing for one "
+                            "person. Group by what is actually happening, not by "
+                            "outlet. Lead with anything geopolitically significant or "
+                            "large in scale. Three to six sentences, plain prose, no "
+                            "preamble, no bullet points, no speculation beyond what "
+                            "the headlines say. If nothing is significant, say so in "
+                            "one sentence."
+                        ),
+                        user(lines),
+                    ],
+                    temperature=0.2,
+                    max_tokens=500,
+                    # Free when Ollama is up. A daily chore is exactly the work
+                    # that should never reach a paid model if it does not have to.
+                    metadata={"local_ok": True},
+                ),
+                purpose="briefing.condense",
+            )
+        except Exception:  # noqa: BLE001 - the raw list is a fine fallback
+            return ""
+        return result.text.strip()
+
+    return condense
 
 
 def build_agent(
@@ -96,6 +142,7 @@ def build_agent(
             confirm=confirm,
             audit_path=root / "audit.jsonl",
             extra_tools=extra_tools,
+            summarize=_condenser(brain),
             env=env,
         )
 

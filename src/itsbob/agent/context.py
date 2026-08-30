@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ..llm.base import Message, assistant, system, user
-from ..memory.base import MemoryRecord
+from ..memory.base import Horizon, MemoryRecord, Subject
 from .persona import Persona
 
 __all__ = ["Turn", "Step", "Conversation", "build_messages"]
@@ -37,6 +37,7 @@ class Step:
     tier: str = ""
     model: str = ""
     latency_ms: float = 0.0
+    tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class Step:
             "tier": self.tier,
             "model": self.model,
             "latency_ms": round(self.latency_ms, 1),
+            "tokens": self.tokens,
         }
 
 
@@ -65,6 +67,12 @@ class Turn:
     tokens: int = 0
     error: str | None = None
     remembered: list[str] = field(default_factory=list)
+    #: Set when the feasibility check stopped the turn before any work.
+    refused: str | None = None
+    #: How many times the step budget extended itself.
+    extensions: int = 0
+    #: Why the turn ended, when it was not the model choosing to answer.
+    stopped_because: str | None = None
 
     @property
     def tools_used(self) -> list[str]:
@@ -81,6 +89,9 @@ class Turn:
             "tokens": self.tokens,
             "error": self.error,
             "remembered": self.remembered,
+            "refused": self.refused,
+            "extensions": self.extensions,
+            "stopped_because": self.stopped_because,
         }
 
 
@@ -126,19 +137,42 @@ class Conversation:
 
 
 def render_memories(records: Sequence[Any], *, limit: int = 6) -> str:
-    """Recalled memory, as compact lines the model can cite back.
+    """Recalled memory, grouped by who it is about.
+
+    The grouping is the point. A flat list of sentences invites the model to
+    read every one of them as a fact about the user, which is how "my favourite
+    film is Blade Runner" — said by the assistant — comes back a week later as
+    something the user supposedly said. Separate headings make the attribution
+    impossible to skim past.
 
     Ids are included so ``forget`` and ``update_memory`` are usable without a
     second lookup — the agent can only correct a memory it can name.
     """
     if not records:
         return ""
-    lines = []
+    groups: dict[Subject, list[str]] = {}
     for item in records[:limit]:
         record: MemoryRecord = getattr(item, "record", item)
-        age = _ago(record.created_at)
-        lines.append(f"- [{record.kind.value}] {record.content}  (id={record.id[:8]}, {age})")
-    return "What you remember that may be relevant:\n" + "\n".join(lines)
+        subject = getattr(record, "subject", Subject.USER)
+        horizon = getattr(record, "horizon", None)
+        span = "" if horizon is None or horizon is Horizon.LONG else ", short-term"
+        groups.setdefault(subject, []).append(
+            f"- [{record.kind.value}] {record.content}  "
+            f"(id={record.id[:8]}, {_ago(record.created_at)}{span})"
+        )
+
+    headings = {
+        Subject.USER: "About the user:",
+        Subject.SELF: "About yourself (your own views — do not attribute these to the user):",
+        Subject.WORLD: "About the world, this machine, and your work:",
+    }
+    blocks = ["What you remember that may be relevant:"]
+    for subject in (Subject.USER, Subject.SELF, Subject.WORLD):
+        lines = groups.get(subject)
+        if lines:
+            blocks.append(headings[subject])
+            blocks.extend(lines)
+    return "\n".join(blocks)
 
 
 def build_messages(
@@ -154,10 +188,13 @@ def build_messages(
     policy_note: str = "",
     memory_limit: int = 6,
     tool_names: Sequence[str] = (),
+    brief: bool = False,
+    full_observations: int = 3,
+    observation_chars: int = 3000,
 ) -> list[Message]:
     """The full message list for one step of one turn.
 
-    Two shapes here are load-bearing.
+    Three shapes here are load-bearing.
 
     **Everything static is one system message.** Providers disagree about
     system messages that are not the first — Gemini's OpenAI-compatible shim
@@ -171,6 +208,13 @@ def build_messages(
     every step, each time thinking it was starting fresh. Encoding an action as
     an assistant message and its result as the user's reply is the shape models
     are actually trained on, and it fixed the loop outright.
+
+    **Only the last few observations are kept in full.** The scratchpad is the
+    fastest-growing part of the prompt and the most repetitive: by step eight, a
+    turn is re-sending seven tool outputs it has already acted on, every step,
+    at full price. Older steps collapse to one line naming the call and whether
+    it worked — which is what the model actually uses them for — while the
+    recent ones, the only ones it is still reasoning about, stay verbatim.
     """
     background = "\n\n".join(
         block
@@ -189,6 +233,7 @@ def build_messages(
                 policy_note=policy_note,
                 tool_names=tuple(tool_names),
                 background=background,
+                brief=brief,
             )
         )
     ]
@@ -196,9 +241,17 @@ def build_messages(
     messages.extend(conversation.as_messages())
     messages.append(user(snapshot_text))
 
-    for step in steps:
+    steps = list(steps)
+    cutoff = max(0, len(steps) - max(1, full_observations))
+    for index, step in enumerate(steps):
         messages.append(assistant(_render_action(step)))
-        messages.append(user(_render_observation(step)))
+        messages.append(
+            user(
+                _render_observation(step, limit=observation_chars)
+                if index >= cutoff
+                else _render_digest(step)
+            )
+        )
     return messages
 
 
@@ -217,10 +270,26 @@ def _render_action(step: Step) -> str:
     )
 
 
-def _render_observation(step: Step) -> str:
+def _render_observation(step: Step, *, limit: int = 3000) -> str:
     return (
-        f"Result of {step.tool}:\n{_clip(step.observation, 3000)}\n\n"
+        f"Result of {step.tool}:\n{_clip(step.observation, limit)}\n\n"
         "Continue: next JSON object, or `final` if the request is now satisfied."
+    )
+
+
+def _render_digest(step: Step) -> str:
+    """An older step, collapsed to the part still worth paying for.
+
+    What a model needs from step 2 while working on step 9 is whether it
+    succeeded and roughly what came back — not four kilobytes of directory
+    listing it already read once.
+    """
+    verdict = "ok" if step.ok else "FAILED"
+    head = _clip(" ".join(step.observation.split()), 160)
+    return (
+        f"Result of {step.tool}: [{verdict}, summarized] {head}\n"
+        "(Full output omitted — it was already acted on. Ask again only if you "
+        "actually need it.)"
     )
 
 

@@ -25,6 +25,7 @@ import platform
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -44,12 +45,19 @@ class Notification:
     task: str = ""
     urgency: str = "normal"  # low | normal | high
     at: float = field(default_factory=time.time)
+    #: Stable identity, so the messages window can mark one read without
+    #: rewriting an append-only log.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    #: Where it came from: a scheduled task, the agent itself, an alert.
+    source: str = "task"
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "title": self.title,
             "body": self.body,
             "task": self.task,
+            "source": self.source,
             "urgency": self.urgency,
             "at": self.at,
             "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.at)),

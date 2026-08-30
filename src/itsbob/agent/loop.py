@@ -23,9 +23,24 @@ to the user or find a permitted route. The one exception is a user saying no
 at a confirm prompt: that is a decision, not an obstacle, and the loop stops
 rather than looking for a way around it.
 
-**The step budget always produces an answer.** Running out of steps forces one
-final call with the tools removed, so a hard turn ends with "here is what I
-found and where I got stuck" instead of silence.
+**The step budget extends itself while there is progress.** A fixed budget was
+ending real work mid-task: the agent would be four files into a six-file job,
+hit step eight, and stop to explain where it got to. So the budget is now a
+*checkpoint*, not a wall. When it runs out, the loop asks whether the last
+stretch actually achieved anything — successful tool calls, no repeats, no
+invented names — and if so extends itself, up to a hard ceiling and inside the
+time and token limits. A turn that is going nowhere still stops at the first
+checkpoint, which is the case the budget was there for.
+
+**The budget always produces an answer.** Whatever ends a turn — the ceiling,
+the clock, the token guard — forces one final call with the tools removed, so a
+hard turn ends with "here is what I found and where I got stuck" instead of
+silence.
+
+**A turn it cannot finish should not start.** Before expensive work, one cheap
+call checks the request against the tools that actually exist (see
+:mod:`itsbob.agent.budget`). Discovering "there is no API key for that" in one
+small call beats discovering it eight premium steps later.
 
 **An identical call never runs twice in a turn.** :class:`TurnGuard` caches
 each (tool, arguments) pair and replays the first result instead of executing
@@ -53,6 +68,7 @@ from ..router.ingestion import Snapshot, compress
 from ..router.tiers import Tier
 from ..tools import ToolCall, Toolbox
 from .brain import TieredBrain
+from .budget import FeasibilityCheck, SpendGuard, Verdict
 from .context import Conversation, Step, Turn, build_messages
 from .persona import Persona
 from .writer import MemoryWriter
@@ -82,6 +98,9 @@ _RAISE = {Tier.C: Tier.B, Tier.B: Tier.A, Tier.A: Tier.S, Tier.S: Tier.S,
 MAX_UNKNOWN_TOOLS = 3
 #: How many consecutive failing tool calls before giving up on the turn.
 MAX_CONSECUTIVE_FAILURES = 3
+
+#: Tiers cheap enough that the full system prompt costs more than it earns.
+_BRIEF_TIERS = frozenset({Tier.C, Tier.B})
 
 
 class TurnGuard:
@@ -144,9 +163,13 @@ class Agent:
         gatekeeper: Gatekeeper | None = None,
         writer: MemoryWriter | None = None,
         conversation: Conversation | None = None,
-        max_steps: int = 8,
-        max_seconds: float = 180.0,
+        max_steps: int = 10,
+        max_seconds: float = 600.0,
         recall_limit: int = 6,
+        hard_max_steps: int = 60,
+        extend_by: int = 6,
+        guard: SpendGuard | None = None,
+        feasibility: FeasibilityCheck | None = None,
     ) -> None:
         self.brain = brain
         self.toolbox = toolbox
@@ -154,8 +177,17 @@ class Agent:
         self.persona = persona or Persona()
         self.conversation = conversation or Conversation()
         self.max_steps = max(1, max_steps)
+        #: The wall the budget may never extend past, however well it is going.
+        #: Something has to be finite, and this is it.
+        self.hard_max_steps = max(self.max_steps, hard_max_steps)
+        #: How many steps a productive turn earns at each checkpoint.
+        self.extend_by = max(1, extend_by)
         self.max_seconds = max_seconds
         self.recall_limit = recall_limit
+        self.guard = guard if guard is not None else SpendGuard()
+        self.feasibility = (
+            feasibility if feasibility is not None else FeasibilityCheck(brain=brain)
+        )
         self.gatekeeper = gatekeeper or Gatekeeper(
             local_provider=brain.local, cloud_classifier=self._cheap_classify
         )
@@ -178,11 +210,22 @@ class Agent:
                 except Exception:  # noqa: BLE001 - a broken listener must not fail the turn
                     pass
 
+        self.guard.start_turn()
         snapshot = self._snapshot(message, context)
         decision = self.gatekeeper.classify(snapshot)
         tier = decision.tier if decision.tier.is_model else Tier.B
         turn.tier = tier.value
         emit("classified", tier=tier.value, decision=decision.as_dict())
+
+        verdict = self._feasible(message, tier, emit)
+        if not verdict.feasible:
+            turn.final = verdict.explain()
+            turn.tier = tier.value
+            turn.refused = verdict.reason
+            turn.duration_ms = (time.perf_counter() - started) * 1000
+            self.conversation.add(turn)
+            emit("final", text=turn.final, tier=tier.value, steps=0, refused=True)
+            return turn
 
         memories = self._recall(message)
         if memories:
@@ -214,9 +257,48 @@ class Agent:
             known = [*memories, *_written_this_turn(turn)]
             for record in self.writer.write(message=message, answer=answer, known=known):
                 turn.remembered.append(record.content)
-                emit("memory", wrote=record.content, id=record.id)
+                emit(
+                    "memory",
+                    wrote=record.content,
+                    id=record.id,
+                    subject=record.subject.value,
+                    horizon=record.horizon.value,
+                )
 
+        self._tidy_memory(emit)
         return turn
+
+    def _feasible(self, message: str, tier: Tier, emit: Callable[..., None]) -> Verdict:
+        """Screen an expensive turn before paying for it."""
+        if self.feasibility is None or not self.feasibility.should_check(message, tier):
+            return Verdict()
+        verdict = self.feasibility.check(
+            message=message,
+            tools=self.toolbox.registry.names(),
+            apis=self.toolbox.catalog.names() if self.toolbox.catalog is not None else (),
+        )
+        if verdict.checked:
+            emit("feasibility", **verdict.as_dict())
+        return verdict
+
+    def _tidy_memory(self, emit: Callable[..., None]) -> None:
+        """Expire the short-term working set once per turn.
+
+        Here rather than on a timer because "a few replies" is measured in
+        replies: pruning when a turn ends is the only moment that reliably
+        happens once per reply, whether the agent is being chatted to or is
+        working through its own schedule.
+        """
+        store = self.memory
+        if store is None:
+            return
+        try:
+            expired = store.expire() if hasattr(store, "expire") else 0
+            dropped = store.prune_short_term() if hasattr(store, "prune_short_term") else 0
+        except Exception:  # noqa: BLE001 - housekeeping must never fail a turn
+            return
+        if expired or dropped:
+            emit("memory", expired=expired, pruned=dropped)
 
     def _run_steps(
         self,
@@ -229,10 +311,17 @@ class Agent:
         emit: Callable[..., None],
     ) -> tuple[str, Tier]:
         guard = TurnGuard()
-        for index in range(1, self.max_steps + 1):
+        budget = self.max_steps
+        index = 0
+        while index < budget:
+            index += 1
             if time.perf_counter() > deadline:
                 return self._forced_answer(snapshot, turn, tier, "the time budget ran out"), tier
+            overspent = self.guard.exceeded()
+            if overspent:
+                return self._forced_answer(snapshot, turn, tier, overspent), tier
 
+            brief = tier in _BRIEF_TIERS
             messages = build_messages(
                 persona=self.persona,
                 tools=self.toolbox.render_for_prompt(),
@@ -240,12 +329,20 @@ class Agent:
                 conversation=self.conversation,
                 memories=memories,
                 steps=turn.steps,
-                apis=self.toolbox.catalog.render_for_prompt(self.toolbox.env)
-                if self.toolbox.catalog is not None and len(self.toolbox.catalog)
-                else "",
+                # The API block is a fixed cost paid on every step; a cheap tier
+                # doing one obvious thing does not need the catalogue.
+                apis=""
+                if brief
+                else (
+                    self.toolbox.catalog.render_for_prompt(self.toolbox.env)
+                    if self.toolbox.catalog is not None and len(self.toolbox.catalog)
+                    else ""
+                ),
                 workspace=self.toolbox.policy.workspace,
-                policy_note=_policy_note(self.toolbox),
+                policy_note="" if brief else _policy_note(self.toolbox),
                 tool_names=self.toolbox.registry.names(),
+                brief=brief,
+                observation_chars=_observation_budget(len(turn.steps)),
             )
 
             step = Step(index=index, tier=tier.value)
@@ -269,6 +366,11 @@ class Agent:
             step.model = f"{result.response.provider}/{result.response.model}"
             step.latency_ms = result.response.latency_ms
             turn.tokens += result.response.usage.total_tokens
+            step.tokens = result.response.usage.total_tokens
+            if result.response.provider != "ollama":
+                # Local calls are free; counting them against a spend ceiling
+                # would penalise the thing the ceiling exists to encourage.
+                self.guard.add(result.response.usage.total_tokens)
             step.thought = str(payload.get("thought") or "").strip()
 
             final = payload.get("final")
@@ -339,7 +441,44 @@ class Agent:
                 # cheaper one pattern-matched to a plausible-sounding name.
                 tier = _RAISE[tier]
 
-        return self._forced_answer(snapshot, turn, tier, "the step budget ran out"), tier
+            if index >= budget:
+                extended = self._extend(budget, turn, guard, deadline)
+                if extended is None:
+                    break
+                emit(
+                    "budget_extended",
+                    steps=extended,
+                    was=budget,
+                    ceiling=self.hard_max_steps,
+                )
+                budget = extended
+
+        return self._forced_answer(snapshot, turn, tier, _stop_reason(budget, self.hard_max_steps)), tier
+
+    def _extend(
+        self, budget: int, turn: Turn, guard: TurnGuard, deadline: float
+    ) -> int | None:
+        """More steps, if the last stretch earned them. ``None`` to stop.
+
+        "Earned" is deliberately mechanical rather than a judgement call — no
+        extra model call decides this, since paying to ask whether to keep
+        paying is its own kind of waste. A turn continues when it is doing
+        things that work and is not repeating itself, and stops otherwise.
+        """
+        if budget >= self.hard_max_steps:
+            return None
+        if time.perf_counter() > deadline or self.guard.exceeded():
+            return None
+        if guard.give_up_reason or guard.repeats:
+            return None
+        # Progress means work that landed: a successful tool call somewhere in
+        # the stretch just finished. A run of pure thinking with nothing to show
+        # for it is exactly the turn the checkpoint is meant to catch.
+        recent = turn.steps[-self.max_steps :]
+        if not any(step.tool and step.ok for step in recent):
+            return None
+        turn.extensions += 1
+        return min(self.hard_max_steps, budget + self.extend_by)
 
     # -- helpers -----------------------------------------------------------
 
@@ -371,12 +510,17 @@ class Agent:
 
     def _forced_answer(self, snapshot: Snapshot, turn: Turn, tier: Tier, why: str) -> str:
         """Last call of a turn, with tools removed, so it always ends in words."""
+        turn.stopped_because = why
         messages = build_messages(
             persona=self.persona,
             tools="(no tools available for this final step)",
             snapshot_text=snapshot.render(),
             conversation=self.conversation,
             steps=turn.steps,
+            # The final call summarizes what happened, so it needs more of the
+            # scratchpad than a working step does.
+            full_observations=5,
+            observation_chars=1500,
         )
         messages[-1] = system(
             f"Stop working: {why}. Answer the user now with what you have. "
@@ -423,6 +567,23 @@ def _written_this_turn(turn: Turn) -> list[_Known]:
 
 def _user_refused(result: Any) -> bool:
     return bool(result.error and "declined by user" in result.error)
+
+
+#: Observation clipping, tightened as a turn goes on. Early steps get room to
+#: show a full file or a long listing; by step twelve the scratchpad is the
+#: dominant cost and the model is working from its own notes anyway.
+def _observation_budget(steps_so_far: int) -> int:
+    if steps_so_far < 4:
+        return 3000
+    if steps_so_far < 10:
+        return 1800
+    return 900
+
+
+def _stop_reason(budget: int, ceiling: int) -> str:
+    if budget >= ceiling:
+        return f"the hard step ceiling ({ceiling}) was reached"
+    return "the step budget ran out with no progress to show for the last stretch"
 
 
 def _policy_note(toolbox: Toolbox) -> str:

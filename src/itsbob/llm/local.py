@@ -56,7 +56,13 @@ def default_ollama_config(env: Mapping[str, str] | None = None) -> ProviderConfi
         default_model=default_model,
         fallback_models=fallbacks,
         requests_per_minute=10_000,  # local, no vendor quota
-        timeout=5.0,  # Tier C must stay under ~800ms; don't let a hung server block the pipeline
+        # Classification must stay fast, but *answering* on a 1.5B model on a
+        # cold cache genuinely takes ten to twenty seconds, and a 5s ceiling
+        # meant every local answer timed out and fell through to a paid API
+        # call — the exact opposite of the point. Callers that need the tight
+        # budget pass `metadata={"timeout": 5}` on the request; the gatekeeper
+        # does.
+        timeout=float(env.get("ITSBOB_OLLAMA_TIMEOUT", "").strip() or 45.0),
     )
 
 
@@ -116,6 +122,15 @@ class OllamaProvider(Provider):
         return is_ollama_running(self.config.base_url)
 
     def _complete(self, request: LLMRequest, model: str) -> LLMResponse:
+        # A per-request override, so one provider serves both the gatekeeper's
+        # sub-second budget and a full local answer.
+        timeout = self.config.timeout
+        requested = request.metadata.get("timeout")
+        if requested:
+            try:
+                timeout = max(0.5, float(requested))
+            except (TypeError, ValueError):
+                pass
         payload = {
             "model": model,
             "messages": request.payload(),
@@ -135,7 +150,7 @@ class OllamaProvider(Provider):
         )
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(http_request, timeout=self.config.timeout) as resp:
+            with urllib.request.urlopen(http_request, timeout=timeout) as resp:
                 data: dict[str, Any] = json.load(resp)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -149,7 +164,7 @@ class OllamaProvider(Provider):
         except urllib.error.URLError as exc:
             raise ProviderUnavailable(f"ollama: {exc}") from exc
         except TimeoutError as exc:  # pragma: no cover - platform dependent
-            raise ProviderUnavailable(f"ollama: timed out after {self.config.timeout}s") from exc
+            raise ProviderUnavailable(f"ollama: timed out after {timeout}s") from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
         text = (data.get("message") or {}).get("content", "")

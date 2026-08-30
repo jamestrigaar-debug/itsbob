@@ -44,6 +44,29 @@ a muted assistant is worth nothing.
 
 ---
 
+## What it costs, and how that is kept down
+
+Every turn is billed, so five things work to keep the bill honest:
+
+- **The local model gets first refusal on everything cheap.** With Ollama
+  running, Tier C answers *and* every bookkeeping chore — classification,
+  memory extraction, the feasibility check, condensing the briefing — run
+  locally and cost nothing. `itsbob doctor` makes a real call and reports what
+  came back, because "reachable" and "answering" are different claims and only
+  the second one saves money.
+- **A turn it cannot finish does not start.** One cheap call reads the request
+  against the tools that actually exist. Discovering "there is no key for that"
+  in one small call beats discovering it eight premium steps later. It is
+  biased toward yes: a false refusal is worse than a wasted turn.
+- **The prompt is on a diet.** Cheap tiers get a short system prompt (754
+  characters against 3002) with no API catalogue; older scratchpad steps
+  collapse to one line naming the call and whether it worked; observation
+  clipping tightens as a turn goes on; tool output is condensed at the source
+  rather than dumped raw.
+- **A spend ceiling per turn and per day.** Hitting it does not kill the turn —
+  it tells it to stop and answer with what it has.
+- **Durable facts go in memory rather than into every prompt.**
+
 ## The tier ladder
 
 ```
@@ -122,6 +145,26 @@ Every vector is tagged with the model that produced it, and recall only ever
 compares within one tag. Vectors from different models are not comparable, and
 comparing them anyway returns plausible nonsense rather than an error.
 
+### Whose memory is it
+
+Every memory records its **subject**: `user`, `bob`, or `world`. This is not a
+nicety. Asked for its own favourite films, it listed five and the extractor
+wrote all five down as *the user's* favourites; recall then served them back as
+facts about a person who had never mentioned any of them. A store that cannot
+say whose opinion it is holding will, given enough turns, replace you with the
+assistant. Recalled memories are shown grouped by subject, and a sentence that
+gives itself away ("I liked …") overrides a wrong label — a model that writes
+that and files it under `user` has contradicted itself in one line.
+
+### Short term and long term
+
+Memories also carry a **horizon**. Short-horizon rows are the working set —
+what is being worked on today, a state the machine is in, a thread still open.
+They are capped by count *and* by clock and pruned at the end of every turn, so
+a busy hour cannot quietly become the corpus and a row from last Tuesday cannot
+sit there forever. Long-horizon rows are what should still be true in a year.
+`keep_memory` promotes one that turned out to matter after all.
+
 Memory lives in `~/.itsbob/memory.sqlite`. Set `ITSBOB_EMBED_OFFLINE=true` to
 keep every memory on the machine — recall degrades to keyword plus a
 dependency-free hashing embedder rather than failing.
@@ -195,6 +238,45 @@ Adding an API is a config entry, not a code change. The model names the API and
 the path; the catalog attaches the base URL and the credential. **The key never
 enters the prompt, the model's output, or the audit log** — a model that cannot
 see a secret cannot leak one.
+
+### The ones that ship configured
+
+Four services have their base URL, auth style and header name built in, so a
+key in `.env` is the whole setup — nothing to write out, nothing to get subtly
+wrong:
+
+| Put this in `.env` | Gives you |
+|---|---|
+| `OPENWEATHER_API_KEY=…` | `weather` — conditions and today's outlook for your location |
+| `NEWSAPI_KEY=…` | `news` — headlines, merged and deduplicated |
+| `GNEWS_API_KEY=…` | a second news source, and the fallback when NewsAPI rate-limits |
+| `FOOTBALL_DATA_KEY=…` | `football` via `call_api` — fixtures, standings, scorers |
+
+With a weather key and either news key, `daily_briefing` becomes one tool: the
+day's weather, then the day's significant news condensed into prose with its
+sources listed. It is built to be a morning task:
+
+```bash
+itsbob task add briefing "Run daily_briefing and send me the result" "daily at 07:00"
+itsbob task add pl "Use the football API (competitions/PL/matches) for today's \
+  Premier League fixtures and kickoff times" "daily at 07:00"
+```
+
+The weather location defaults to Hull, UK and moves with
+`ITSBOB_WEATHER_PLACE`, `ITSBOB_WEATHER_LAT` and `ITSBOB_WEATHER_LON`.
+
+**Web search needs no key at all.** `web_search` uses `ddgr` or `googler` if
+either is installed (`sudo apt install ddgr`), and falls back to DuckDuckGo's
+HTML endpoint otherwise. It is a separate tool rather than a `run_shell`
+instruction on purpose: search is a read-only fetch, and routing it through the
+broadest capability in the system would mean either approving `run_shell`
+permanently or answering a prompt every time you want to look something up.
+
+The **apis** panel in the browser shows which are live and which are missing a
+key, with a *schedule…* button that starts a task against one — so you find out
+a key is missing before you write the task, not at 07:00 tomorrow.
+
+### Anything else
 
 `apis.json` in the working directory (or `ITSBOB_API_CONFIG`):
 
@@ -280,8 +362,31 @@ server-sent events, not delivered in one lump when the turn ends. You watch the
 tier get chosen, each tool call go out, and each result come back, which is the
 difference between an assistant you can supervise and one you have to trust.
 
-Four panels: activity, memory (with *why* each hit surfaced), scheduled tasks,
-and the audit log.
+Six panels: activity, memory (with *why* each hit surfaced), scheduled tasks,
+scripts, APIs (which are live, which need a key), and the audit log.
+
+### The messages window
+
+`/messages` is a **separate page** for everything itsbob said without being
+asked: task results, alerts, the morning briefing. Proactive notices and a
+conversation are different kinds of thing — interleaving them gives the
+conversation interruptions and the notices a context they do not have. It reads
+the same `notifications.jsonl` the daemon already writes, updates live over its
+own SSE stream, and tracks read/unread separately so marking one read never
+rewrites a log another process is appending to. The header of the main page
+carries the unread count and opens it in its own window.
+
+### Discord
+
+Set `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` and the channel becomes a
+two-way workspace. Outbound: anything the notice gate passes is posted there,
+including messages itsbob starts himself. Inbound: what you type in the channel
+becomes an ordinary turn, queued alongside anything typed in the browser — one
+agent, one queue, so nothing interleaves. Built on the REST API with `urllib`
+rather than the gateway, so there is no websocket, no async runtime and no new
+dependency; it polls every few seconds, which is how often a person looks at a
+channel anyway. Long messages are split on paragraph breaks, rate limits are
+waited out per Discord's own `retry_after`, and the bot never answers itself.
 
 **You can approve tools from the page.** When the agent reaches something
 `guarded` mode gates, a card appears showing the exact command and why it wants
@@ -446,11 +551,12 @@ src/itsbob/
     brain.py        the tier ladder and escalation between tiers
     loop.py         classify → recall → step → act → observe, and the turn guard
     context.py      prompt assembly (one system message; steps as ReAct turns)
-    persona.py      the system prompt
-    writer.py       post-turn extraction of durable facts
+    persona.py      the system prompt, full and dieted
+    writer.py       post-turn extraction, with attribution and horizon
+    budget.py       the spend ceiling and the can-it-be-done check
   memory/         hybrid recall
     long_term.py    SQLite + FTS5 + vectors, score fusion, migration
-    base.py         MemoryRecord and scoring
+    base.py         MemoryRecord, Subject, Horizon, and scoring
     short_term.py   the simulation's decaying working set
     bank.py         two-tier facade over both
   tools/          capability and consent
@@ -459,8 +565,17 @@ src/itsbob/
     sandbox.py      run_shell / run_python, fenced four ways
     files.py        path-jailed filesystem tools
     http.py         http_request, call_api, the API catalog
-    memory_tools.py remember / recall / forget / update
+    memory_tools.py remember / recall / forget / update / keep
+    websearch.py    ddgr, googler, or DuckDuckGo — no key needed
+    vision.py       describe_image / image_info
     audit.py        append-only JSONL, credentials redacted
+  integrations/   the outside world
+    apis.py         built-in specs: weather, news, gnews, football
+    briefing.py     weather + news + the condensed daily report
+    discord.py      the channel as a two-way workspace
+  scripts/        what it can do to this machine — drop a file in to add one
+    system_monitor.py, network_checker.py, process_manager.py,
+    file_cleaner.py, screenshot.py, scheduler.py
   daemon/         the always-on half
     schedule.py     schedules in words
     tasks.py        SQLite task store and run history
@@ -482,13 +597,15 @@ src/itsbob/
     app.py          Flask routes and the SSE stream
     session.py      one running agent: event fan-out and the approval gate
     page.py         the single-page interface, inline (no build step)
+    messages.py     the standalone /messages window and its log reader
+    autonomous.py   continuous mode: scheduled work through the chat queue
   store.py        locked SQLite: one lock per file, WAL, busy timeout
   logfile.py      append-only JSONL with rotation
   setup_wizard.py `itsbob setup` — keys, directories, and a live check
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            356 tests, none of which touch the network
+tests/            437 tests, none of which touch the network
 ```
 
 ## The original simulation

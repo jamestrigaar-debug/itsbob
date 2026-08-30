@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..integrations.apis import register_builtins
 from .audit import AuditLog
 from .base import (
     InvalidParams,
@@ -35,6 +36,8 @@ from .http import ApiCatalog, ApiSpec, http_tools
 from .memory_tools import memory_tools
 from .policy import DENY_PATTERNS, Mode, Policy, Verdict
 from .sandbox import run_command, sandbox_tools
+from .vision import vision_tools
+from .websearch import web_search_tools
 
 __all__ = [
     "ApiCatalog",
@@ -58,11 +61,21 @@ __all__ = [
     "build_toolbox",
     "default_registry",
     "run_command",
+    "vision_tools",
+    "web_search_tools",
 ]
 
 
-def default_registry(*, catalog: ApiCatalog | None = None, extra: Sequence[Tool] = ()) -> ToolRegistry:
-    """Files, execution, network and memory. The full default surface."""
+def default_registry(
+    *,
+    catalog: ApiCatalog | None = None,
+    extra: Sequence[Tool] = (),
+    summarize: Any = None,
+    env: Mapping[str, str] | None = None,
+) -> ToolRegistry:
+    """Files, execution, network, memory, vision, search and the day's briefing."""
+    from ..integrations.briefing import briefing_tools
+    from ..integrations.discord import discord_tools, is_configured
     from ..scripts import script_tools
 
     registry = ToolRegistry()
@@ -71,12 +84,24 @@ def default_registry(*, catalog: ApiCatalog | None = None, extra: Sequence[Tool]
         *sandbox_tools(),
         *http_tools(catalog),
         *memory_tools(),
+        *web_search_tools(),
+        *vision_tools(),
+        # Weather, news and the combined daily report. Registered whether or
+        # not the keys are set: a tool that says "OPENWEATHER_API_KEY is not
+        # set" is a better answer than one the model cannot see to ask about.
+        *briefing_tools(summarize),
         # The foundation scripts: machine health, processes, network, cleanup,
         # and itsbob's own schedule. Imported here rather than at module level
         # because they reach back into config and the daemon's task store.
         *script_tools(),
     ):
         registry.register(tool)
+    # Discord is the exception: with no channel configured, `discord_post` is
+    # an offer to do something impossible, and every step is billed for reading
+    # the tool list.
+    if is_configured(env):
+        for tool in discord_tools():
+            registry.register(tool)
     for tool in extra:
         registry.register(tool)
     return registry
@@ -141,6 +166,7 @@ def build_toolbox(
     catalog: ApiCatalog | None = None,
     audit_path: str | Path | None = None,
     extra_tools: Sequence[Tool] = (),
+    summarize: Any = None,
     env: Mapping[str, str] | None = None,
 ) -> Toolbox:
     """Assemble the default toolbox, honouring ``ITSBOB_*`` environment settings.
@@ -149,7 +175,12 @@ def build_toolbox(
     allowed to write before its first turn, not after its first failure.
     """
     env = os.environ if env is None else env
-    catalog = catalog if catalog is not None else ApiCatalog.from_env(env)
+    if catalog is None:
+        catalog = ApiCatalog.from_env(env)
+        # Weather, news, GNews and football-data ship with their base URLs and
+        # auth already right, so a key in `.env` is the whole setup. Anything
+        # the user configured by hand is left exactly as they wrote it.
+        register_builtins(catalog, env)
 
     if policy is None:
         policy = Policy.from_env(env, confirm=confirm, workspace=workspace)
@@ -165,7 +196,9 @@ def build_toolbox(
         audit_path = env.get("ITSBOB_AUDIT_LOG", "").strip() or policy.workspace / ".itsbob" / "audit.jsonl"
 
     return Toolbox(
-        registry=default_registry(catalog=catalog, extra=extra_tools),
+        registry=default_registry(
+            catalog=catalog, extra=extra_tools, summarize=summarize, env=env
+        ),
         policy=policy,
         audit=AuditLog(path=Path(audit_path)),
         memory=memory,

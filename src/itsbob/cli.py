@@ -498,6 +498,33 @@ def _probe_provider(provider, model: str) -> ProbeResult:
     return ProbeResult(True, (response.text or "").strip()[:24], response.latency_ms, "ok")
 
 
+def _probe_local(config: Any) -> tuple[bool, str]:
+    """Make one real call to Ollama and report what came back.
+
+    "Reachable" and "answering" are different claims, and only the second one
+    means cheap turns are free. A model that is pulled but wedged, or one whose
+    first load takes ninety seconds, both pass a liveness probe and both send
+    every turn to a paid API — silently, which is the problem.
+    """
+    from .llm.base import LLMRequest, user
+    from .llm.local import OllamaProvider
+
+    request = LLMRequest(
+        messages=[user("Reply with the single word: ready")],
+        max_tokens=16,
+        temperature=0.0,
+        metadata={"timeout": 30.0},
+    )
+    try:
+        response = OllamaProvider(config).complete_with_fallback(request)
+    except Exception as exc:  # noqa: BLE001 - the message is the diagnosis
+        return False, f"{type(exc).__name__}: {exc}"[:200]
+    text = response.text.strip().replace("\n", " ")[:60]
+    if not text:
+        return False, f"{response.model} returned an empty reply"
+    return True, f"{response.model} in {response.latency_ms:.0f}ms — {text!r}"
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from .agent.brain import build_brain
     from .llm.embeddings import default_embedder
@@ -594,7 +621,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print("\n  ? means a key is present but has not been used. A key can be set and\n"
               "    still be rejected — run `itsbob doctor --probe` to actually find out.")
 
-    print("\nlocal model (free, private, preferred for Tier C):")
+    print("\nlocal model (free, private, first refusal on all cheap work):")
     if ollama_up:
         config = default_ollama_config()
         pulled = list_ollama_models()
@@ -604,8 +631,17 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"      pulled: {pulled or '(none)'}")
         if missing == wanted:
             print(f"      !! none of {wanted} pulled — run: ollama pull {wanted[0]}")
+        else:
+            # Reachable is not the same as answering. This is the check that
+            # decides whether cheap turns actually cost nothing, so it makes a
+            # real call rather than trusting the liveness probe.
+            answer, detail = _probe_local(config)
+            mark = "ok " if answer else "!! "
+            print(f"  {mark}answered a real request: {detail}")
     else:
-        print("  --  not reachable — Tier C uses the cheapest cloud model instead")
+        print("  --  not reachable — cheap work goes to the cheapest cloud model instead")
+        print("      install it to stop paying for greetings and bookkeeping:")
+        print("      https://ollama.com/download  then: ollama pull qwen2.5:1.5b")
 
     print("\nmemory:")
     store = _open_memory(args)
@@ -630,6 +666,39 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         for row in box.catalog.describe():
             mark = "ok " if row["configured"] else "-- "
             print(f"  {mark}{row['name']:<14} {row['base_url']}")
+
+    print("\nservices:")
+    from .integrations.apis import builtin_status
+    from .integrations.discord import is_configured as discord_configured
+    from .tools.vision import pillow_available
+    from .tools.websearch import available_backend
+
+    for row in builtin_status():
+        mark = "ok " if row["configured"] else "-- "
+        print(f"  {mark}{row['name']:<10} {row['description']}"
+              + ("" if row["configured"] else f"  (set {row['key_env']})"))
+    mark = "ok " if discord_configured() else "-- "
+    print(f"  {mark}{'discord':<10} proactive posting and two-way chat"
+          + ("" if discord_configured() else "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)"))
+    backend = available_backend()
+    print(f"  ok  {'search':<10} via {backend}"
+          + ("" if backend != "duckduckgo-html" else "  (install ddgr for structured results)"))
+    if pillow_available():
+        print(f"  ok  {'images':<10} pillow installed — large photos are downscaled before upload")
+    else:
+        print(f"  --  {'images':<10} no pillow — `pip install -e '.[vision]'` to resize before upload")
+
+    print("\nscripts:")
+    from .scripts import describe_scripts, load_errors, user_scripts_dir
+
+    for row in describe_scripts():
+        if row["source"] == "broken":
+            print(f"  !!  {row['name']:<18} did not load: {row.get('error', '')}")
+        else:
+            print(f"  ok  {row['name']:<18} {len(row['tools'])} tool(s)  [{row['source']}]")
+    print(f"      drop a .py file exposing tools() into {user_scripts_dir()} to add more")
+    if load_errors:
+        print(f"      {len(load_errors)} script(s) failed to load — see above")
 
     print("\ntasks:")
     tasks = _task_store(args).all()

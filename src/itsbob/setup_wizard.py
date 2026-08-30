@@ -329,6 +329,22 @@ def run_setup(
         _say(f"  {_DOT} Ollama not running (optional). Install it to keep cheap work local:")
         _say("    https://ollama.com/download  then: ollama pull qwen2.5:1.5b")
 
+    # 4b. The service keys. Not providers — itsbob thinks without them — so
+    # they are reported as capabilities that are on or off, never demanded.
+    from .integrations.apis import builtin_status
+    from .integrations.discord import is_configured as discord_configured
+
+    _say()
+    _say("  Services:")
+    for row in builtin_status():
+        mark = _TICK if row["configured"] else _DOT
+        state = "" if row["configured"] else f"  (set {row['key_env']})"
+        _say(f"  {mark} {row['name']:<10} {row['description']}{state}")
+    if discord_configured():
+        _say(f"  {_TICK} discord    Bob can post to your channel unprompted")
+    else:
+        _say(f"  {_DOT} discord    (set DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)")
+
     # 5. What to do next.
     _say()
     _say("  ───────────")
@@ -346,6 +362,7 @@ def run_setup(
     _say("  Try:")
     _say("    itsbob chat                 talk to it")
     _say("    itsbob gui                  the browser interface")
+    _say("    itsbob gui  → /messages     what it said without being asked")
     _say('    itsbob task add morning "Summarise my day" "weekdays at 08:30"')
     _say("    itsbob serve                let it work on its own")
     _say()

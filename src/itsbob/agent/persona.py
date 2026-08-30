@@ -49,7 +49,22 @@ class Persona:
         now: float | None = None,
         tool_names: tuple[str, ...] = (),
         background: str = "",
+        brief: bool = False,
     ) -> str:
+        """The system prompt for one step.
+
+        ``brief`` drops the long rule list and the API block. It is used on the
+        cheap tiers, where the prompt was routinely three times the size of the
+        question: a greeting does not need eleven rules about irreversible
+        actions, and every one of them is billed on every step. The output
+        contract, the tool list and the memory-attribution rule always survive,
+        because those are the three things that break silently when they go.
+        """
+        if brief:
+            return self._render_brief(
+                tools=tools, workspace=workspace, now=now, tool_names=tool_names,
+                background=background,
+            )
         stamp = time.strftime("%A %d %B %Y, %H:%M %Z", time.localtime(now or time.time()))
         blocks = [
             f"You are {self.name}, {self.role}.",
@@ -90,8 +105,13 @@ class Persona:
             "preference, a decision, a credential location, a recurring problem — "
             "must be written with `remember`. A memory you do not write is gone when "
             "this conversation ends.",
-            "- Do not use `remember` for things that are only true right now, or for "
-            "restating what the user just said back to them.",
+            "- Every memory says who it is about. Your own opinions, picks and "
+            "tastes are yours: write them with subject `bob`. The user's are "
+            "`user`. Never file something you said about yourself as a fact about "
+            "them — being asked what you like does not make your answer theirs.",
+            "- Use `remember` with horizon `short` for things true only for now (what "
+            "you are working on today, a state the machine is in). Those expire on "
+            "their own. Use `long` only for what should still be true in a year.",
             "- When something is genuinely ambiguous and the wrong guess would be "
             "expensive to undo, stop and ask. When it is cheap to undo, pick the "
             "sensible option and say which you picked.",
@@ -134,5 +154,50 @@ class Persona:
             "done, and repeating a call that succeeded achieves nothing.",
             "If the user asked for something to be created, changed, run, fetched or "
             "saved and no step has done it yet, `tool` must be non-null.",
+        ]
+        return "\n".join(blocks)
+
+    def _render_brief(
+        self,
+        *,
+        tools: str,
+        workspace: Path | None,
+        now: float | None,
+        tool_names: tuple[str, ...],
+        background: str,
+    ) -> str:
+        stamp = time.strftime("%A %d %B %Y, %H:%M", time.localtime(now or time.time()))
+        roster = (
+            f" `tool` must be one of: {', '.join(tool_names)}." if tool_names else ""
+        )
+        blocks = [
+            f"You are {self.name}, {self.role}.",
+            f"It is {stamp} on {platform.system()}"
+            + (f", working in {workspace}." if workspace else "."),
+            "",
+            "Work in steps: each step is exactly one tool call, or your final answer. "
+            "Never say you did something unless a tool call in this turn did it.",
+            "Anything worth keeping goes in `remember` — and your own opinions are "
+            "yours (subject `bob`), never the user's.",
+            "",
+            "## Tools",
+            tools,
+            "",
+            "## Voice",
+            self.voice,
+        ]
+        if self.pinned:
+            blocks += ["", "## Always true", *(f"- {item}" for item in self.pinned)]
+        if self.instructions.strip():
+            blocks += ["", "## Standing instructions", self.instructions.strip()]
+        if background.strip():
+            blocks += ["", background.strip()]
+        blocks += [
+            "",
+            "## Output format",
+            "Reply with a single JSON object and nothing else:",
+            '{"thought": "<one short sentence>", "tool": "<tool name or null>", '
+            '"params": {...}, "final": "<answer or null>"}',
+            "Exactly one of `tool` and `final` is non-null." + roster,
         ]
         return "\n".join(blocks)

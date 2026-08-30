@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..memory.base import MemoryKind, MemoryRecord
+from ..memory.base import Horizon, MemoryKind, MemoryRecord, Subject
 from .base import Risk, Tool, ToolContext, ToolError, ToolResult
 
 __all__ = ["memory_tools"]
@@ -28,14 +28,27 @@ def _store(ctx: ToolContext):
     return ctx.memory
 
 
+#: A short-horizon memory written by hand lasts this long unless promoted.
+SHORT_TTL_SECONDS = 6 * 3600.0
+
+
 def _remember(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    import time
+
     store = _store(ctx)
     # Coerced, not rejected. A wrong category is a rounding error; a rejected
     # call costs a step and a model call to discover that.
     kind = MemoryKind.coerce(params.get("kind"))
+    subject = Subject.coerce(params.get("subject"))
+    horizon = Horizon.coerce(params.get("horizon"))
     record = MemoryRecord(
         content=params["content"].strip(),
         kind=kind,
+        subject=subject,
+        horizon=horizon,
+        expires_at=(
+            time.time() + SHORT_TTL_SECONDS if horizon is Horizon.SHORT else None
+        ),
         importance=float(params.get("importance", 0.6)),
         tags=tuple(params.get("tags") or ()),
         metadata={"source": params.get("source", "agent")},
@@ -43,8 +56,33 @@ def _remember(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     store.add(record)
     return ToolResult(
         ok=True,
-        output=f"remembered [{kind.value}] {record.content[:120]}",
-        data={"id": record.id, "kind": kind.value},
+        output=(
+            f"remembered [{kind.value}, about {subject.value}, {horizon.value}-term] "
+            f"{record.content[:120]}"
+        ),
+        data={
+            "id": record.id,
+            "kind": kind.value,
+            "subject": subject.value,
+            "horizon": horizon.value,
+        },
+    )
+
+
+def _promote(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Move a short-term memory into long-term, when it turns out to matter."""
+    store = _store(ctx)
+    memory_id = params["id"]
+    record = store.get(memory_id)
+    if record is None:
+        raise ToolError(f"no memory with id {memory_id!r} — recall first to get ids")
+    importance = params.get("importance")
+    if not store.promote(memory_id, importance=None if importance is None else float(importance)):
+        raise ToolError(f"could not promote {memory_id!r}")
+    return ToolResult(
+        ok=True,
+        output=f"kept for good: {record.content[:120]}",
+        data={"id": memory_id},
     )
 
 
@@ -58,7 +96,8 @@ def _recall(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not hits:
         return ToolResult(ok=True, output="(nothing remembered about that)", data={"hits": []})
     lines = [
-        f"- {h.record.content}  [{h.record.kind.value}, {_ago(h.record.created_at)}, {h.reason}]"
+        f"- {h.record.content}  [{h.record.kind.value}, about {h.record.subject.value}, "
+        f"{h.record.horizon.value}-term, {_ago(h.record.created_at)}, {h.reason}]"
         for h in hits
     ]
     return ToolResult(
@@ -116,7 +155,8 @@ def memory_tools() -> list[Tool]:
             name="remember",
             description=(
                 "Store something worth recalling in a later conversation — a preference, "
-                "a decision, a durable fact. Not for things already in this conversation."
+                "a decision, a durable fact. Not for things already in this conversation. "
+                "Always set `subject`: your own opinions are yours, not the user's."
             ),
             run=_remember,
             risk=Risk.WRITE,
@@ -125,11 +165,45 @@ def memory_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "One self-contained sentence."},
+                    "subject": {
+                        "type": "string",
+                        "description": (
+                            "Who it is about: 'user' (the person), 'bob' (you — your own "
+                            "taste, opinion, habit or conclusion), or 'world' (neither). "
+                            "Default user. Getting this wrong makes your opinions look "
+                            "like theirs, so pick deliberately."
+                        ),
+                    },
+                    "horizon": {
+                        "type": "string",
+                        "description": (
+                            "'long' to keep it for good, 'short' for the current thread "
+                            "only (dropped after a few hours). Default long."
+                        ),
+                    },
                     "kind": {"type": "string", "description": f"One of: {kinds}. Default fact. Near-misses are accepted."},
                     "importance": {"type": "number", "description": "0-1. Default 0.6."},
                     "tags": {"type": "array", "description": "Short lowercase labels."},
                 },
                 "required": ["content"],
+            },
+        ),
+        Tool(
+            name="keep_memory",
+            description=(
+                "Promote a short-term memory to permanent, when it turns out to matter "
+                "after all. Recall first to get the id."
+            ),
+            run=_promote,
+            risk=Risk.WRITE,
+            mutates=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "importance": {"type": "number", "description": "Optional new 0-1 importance."},
+                },
+                "required": ["id"],
             },
         ),
         Tool(

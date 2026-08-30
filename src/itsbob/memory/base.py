@@ -11,14 +11,77 @@ from enum import Enum
 from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 
 __all__ = [
+    "Horizon",
     "MemoryKind",
     "MemoryRecord",
+    "Subject",
     "MemoryStore",
     "RetrievalWeights",
     "tokenize",
     "keyword_relevance",
     "score_record",
 ]
+
+
+class Subject(str, Enum):
+    """Who a memory is *about*.
+
+    This exists because of a real and embarrassing failure: asked for its own
+    favourite films, the assistant answered with five of them and the extractor
+    wrote every one down as "the user's favourite film is ...". Recall then fed
+    those back as facts about the person, who had never mentioned a single one.
+
+    Attribution is not a nicety. A memory store that cannot say whose opinion it
+    is holding will, given enough turns, replace the user with the assistant.
+    """
+
+    USER = "user"  # the person this assistant works for
+    SELF = "bob"  # the assistant's own tastes, habits, state, conclusions
+    WORLD = "world"  # neither: the machine, a project, a place, a fact
+
+    @classmethod
+    def coerce(cls, value: "str | Subject | None") -> "Subject":
+        if isinstance(value, cls):
+            return value
+        text = str(value or "user").strip().lower()
+        try:
+            return cls(text)
+        except ValueError:
+            return _SUBJECT_ALIASES.get(text, cls.USER)
+
+    @property
+    def label(self) -> str:
+        return {"user": "the user", "bob": "you (the assistant)", "world": "the world"}[
+            self.value
+        ]
+
+
+#: First person from the model means the model, second person means the user —
+#: which is exactly backwards from how the extraction prompt is phrased, so both
+#: readings are mapped explicitly rather than guessed at.
+_SUBJECT_ALIASES: dict[str, "Subject"] = {}
+
+
+class Horizon(str, Enum):
+    """How long a memory is meant to survive.
+
+    Short-horizon rows are the working set: what is going on right now, what was
+    just tried, what the current thread is about. They are pruned by count and by
+    clock, so a week of them cannot silently become the corpus. Long-horizon rows
+    are the ones worth having in a year.
+    """
+
+    SHORT = "short"
+    LONG = "long"
+
+    @classmethod
+    def coerce(cls, value: "str | Horizon | None") -> "Horizon":
+        if isinstance(value, cls):
+            return value
+        text = str(value or "long").strip().lower()
+        if text in ("short", "short_term", "short-term", "working", "temporary", "temp"):
+            return cls.SHORT
+        return cls.LONG
 
 
 class MemoryKind(str, Enum):
@@ -49,6 +112,32 @@ class MemoryKind(str, Enum):
         except ValueError:
             pass
         return _KIND_ALIASES.get(text, cls.FACT)
+
+
+_SUBJECT_ALIASES.update(
+    {
+        "me": Subject.SELF,
+        "myself": Subject.SELF,
+        "self": Subject.SELF,
+        "assistant": Subject.SELF,
+        "bob": Subject.SELF,
+        "agent": Subject.SELF,
+        "i": Subject.SELF,
+        "you": Subject.USER,
+        "the user": Subject.USER,
+        "owner": Subject.USER,
+        "human": Subject.USER,
+        "person": Subject.USER,
+        "environment": Subject.WORLD,
+        "machine": Subject.WORLD,
+        "laptop": Subject.WORLD,
+        "system": Subject.WORLD,
+        "project": Subject.WORLD,
+        "other": Subject.WORLD,
+        "general": Subject.WORLD,
+        "none": Subject.WORLD,
+    }
+)
 
 
 #: Near-misses seen in practice, mapped to the nearest real kind. Unknown words
@@ -92,6 +181,14 @@ class MemoryRecord:
     importance: float = 0.5
     tick: int = 0
     tags: tuple[str, ...] = ()
+    #: Who this is about. Defaults to the user because most memories are, but
+    #: the default is exactly what the extractor must not be allowed to coast
+    #: on — see :class:`Subject`.
+    subject: Subject = Subject.USER
+    #: Working set or corpus. Short-horizon rows are pruned by count and clock.
+    horizon: Horizon = Horizon.LONG
+    #: Wall-clock expiry, or ``None`` to keep until explicitly forgotten.
+    expires_at: float | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.time)
     last_access_tick: int = 0
@@ -103,6 +200,16 @@ class MemoryRecord:
 
     def __post_init__(self) -> None:
         self.importance = _clamp(self.importance)
+        self.kind = MemoryKind.coerce(self.kind)
+        self.subject = Subject.coerce(self.subject)
+        self.horizon = Horizon.coerce(self.horizon)
+        if self.expires_at is None and self.metadata.get("expires_at") is not None:
+            # Older callers put the expiry in metadata. Promote it rather than
+            # having two sources of truth that can disagree.
+            try:
+                self.expires_at = float(self.metadata["expires_at"])
+            except (TypeError, ValueError):
+                self.expires_at = None
         if self.salience is None:
             self.salience = 0.5 + 0.5 * self.importance
         self.salience = _clamp(self.salience)
@@ -120,15 +227,26 @@ class MemoryRecord:
         self.salience = _clamp(self.salience * (1.0 - rate))
         return self.salience
 
+    @property
+    def is_expired(self) -> bool:
+        return self.expires_at is not None and self.expires_at <= time.time()
+
     def render(self) -> str:
         tags = f" [{', '.join(self.tags)}]" if self.tags else ""
-        return f"(t{self.tick}, {self.kind.value}{tags}) {self.content}"
+        # The subject is rendered for everything that is not about the user,
+        # because "about the user" is the reading a model defaults to and the
+        # other two are the ones it gets wrong.
+        about = "" if self.subject is Subject.USER else f", about {self.subject.value}"
+        return f"(t{self.tick}, {self.kind.value}{about}{tags}) {self.content}"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "content": self.content,
             "kind": self.kind.value,
+            "subject": self.subject.value,
+            "horizon": self.horizon.value,
+            "expires_at": self.expires_at,
             "importance": self.importance,
             "tick": self.tick,
             "tags": list(self.tags),
@@ -143,7 +261,12 @@ class MemoryRecord:
     def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
         return cls(
             content=data["content"],
-            kind=MemoryKind(data.get("kind", "observation")),
+            kind=MemoryKind.coerce(data.get("kind", "observation")),
+            subject=Subject.coerce(data.get("subject")),
+            horizon=Horizon.coerce(data.get("horizon")),
+            expires_at=(
+                float(data["expires_at"]) if data.get("expires_at") is not None else None
+            ),
             importance=float(data.get("importance", 0.5)),
             tick=int(data.get("tick", 0)),
             tags=tuple(data.get("tags") or ()),

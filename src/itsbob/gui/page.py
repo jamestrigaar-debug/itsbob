@@ -110,6 +110,9 @@ section.left{border-right:1px solid var(--line)}
 .btn.no{background:var(--bad);border-color:var(--bad);color:#fff}
 .btn.ghost{color:var(--dim)}
 .countdown{margin-left:auto;font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+#unread{margin-left:6px;font-size:10.5px;padding:1px 6px;border-radius:9px;
+  background:var(--A);color:#fff;font-weight:600;display:none}
+#unread.on{display:inline-block}
 
 /* ---------- composer ---------- */
 form{display:flex;gap:8px;padding:11px 12px;border-top:1px solid var(--line);background:var(--panel);align-items:flex-end}
@@ -170,6 +173,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
   <button class="auto" id="auto" onclick="toggleAuto()" title="Run scheduled work continuously">
     <span class="led"></span><span id="auto-label">manual</span>
   </button>
+  <button class="auto" id="messages-link" onclick="window.open('/messages','itsbob-messages')"
+          title="Everything itsbob said without being asked — opens in its own window">
+    messages<span id="unread"></span>
+  </button>
   <div class="chips" id="chips"><span class="chip">connecting…</span></div>
 </header>
 
@@ -198,6 +205,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);border
         <button class="tab" data-panel="memory">memory <span class="badge" id="nmem"></span></button>
         <button class="tab" data-panel="tasks">tasks <span class="badge" id="ntask"></span></button>
         <button class="tab" data-panel="scripts">scripts</button>
+        <button class="tab" data-panel="apis">apis <span class="badge" id="napi"></span></button>
         <button class="tab" data-panel="audit">audit</button>
       </div>
     </div>
@@ -242,7 +250,17 @@ async function refresh(){
       bits.push(`<span class="chip ${on?"ok":"bad"}" title="${esc(info.label)}${on?": "+esc(info.model):" — nothing configured"}">
         <b>${tier}</b>${on ? esc(info.model.replace(/^gemini-/,"")) : "none"}</span>`);
     }
-    if(s.local) bits.push(`<span class="chip ok" title="Ollama is running — Tier C stays local">local</span>`);
+    if(s.local){
+      // "Configured" and "answered" are different claims. Show the second.
+      const hit = Math.round((s.local.hit_rate ?? 0) * 100);
+      const ok = (s.local.answers ?? 0) > 0 || (s.local.calls ?? 0) === 0;
+      bits.push(`<span class="chip ${ok?"ok":"bad"}" title="Ollama: ${s.local.answers ?? 0} of ${
+        s.local.calls ?? 0} calls answered locally${s.local.last_error
+        ? " — last error: "+esc(s.local.last_error) : ""}">local${
+        s.local.calls ? " "+hit+"%" : ""}</span>`);
+    }
+    if(s.discord?.running)
+      bits.push(`<span class="chip ok" title="Watching the Discord channel">discord</span>`);
     const m = s.memory || {};
     bits.push(`<span class="chip ${m.semantic_recall?"ok":""}" title="${m.semantic_recall
         ? "Semantic recall is live" : "Keyword-only recall"}"><b>${m.records ?? 0}</b> memories</span>`);
@@ -259,6 +277,11 @@ async function refresh(){
     $("chips").innerHTML = bits.join("");
     $("nmem").textContent = m.records ?? "";
     $("ntask").textContent = s.tasks?.length || "";
+    const live = (s.apis || []).filter(a => a.configured).length;
+    $("napi").textContent = s.apis?.length ? `${live}/${s.apis.length}` : "";
+    const unread = $("unread");
+    unread.textContent = s.unread || "";
+    unread.className = s.unread ? "on" : "";
     state.queue = s.queued || [];
     renderQueue();
     paintAuto(s.autonomous);
@@ -565,6 +588,46 @@ async function drawScripts(){
     || `<p class="empty">No scripts registered.</p>`;
 }
 
+async function drawApis(){
+  const s = state.status || await api("/api/status");
+  const apis = s.apis || [];
+  const live = apis.filter(a => a.configured).length;
+  // The point of this panel is answering "can I schedule a task that uses X?"
+  // before writing the task, rather than at 07:00 tomorrow when it fails.
+  const head = `<div class="card"><div class="body"><div class="note">
+      ${live} of ${apis.length} configured. A task can only use an API that is live —
+      set the missing key in <code>~/.itsbob/.env</code> and restart.
+      ${s.search_backend ? `Web search works with no key at all (via ${esc(s.search_backend)}).` : ""}
+    </div></div></div>`;
+  $("right").innerHTML = head + (apis.map(a => `<div class="row">
+      <div class="grow">
+        <div>${esc(a.name)}
+          <span class="pill" style="border-color:var(${a.configured ? "--C" : "--S"});
+                color:var(${a.configured ? "--C" : "--S"})">${a.configured ? "live" : "no key"}</span>
+        </div>
+        <div class="sub">${esc(a.description || a.base_url)}</div>
+        <div class="sub">${esc(a.base_url)}${a.key_env ? " · needs " + esc(a.key_env) : ""}</div>
+      </div>
+      ${a.configured
+        ? `<button class="x" onclick="taskFromApi('${esc(a.name)}')">schedule…</button>`
+        : ""}
+    </div>`).join("")
+    || `<p class="empty">No APIs configured.</p>`);
+}
+
+function taskFromApi(name){
+  // Drops a starting point into the task form rather than creating anything:
+  // the schedule and the wording are the person's call, not ours.
+  state.panel = "tasks"; syncTabs(); render();
+  setTimeout(() => {
+    $("tn").value = name;
+    $("tp").value = `Use the ${name} API to `;
+    $("ts").value = "daily at 08:00";
+    $("tp").focus();
+    $("tp").setSelectionRange($("tp").value.length, $("tp").value.length);
+  }, 0);
+}
+
 async function drawAudit(){
   const {entries} = await api("/api/audit");
   $("right").innerHTML = entries.length ? entries.slice().reverse().map(e => `<div class="row">
@@ -577,7 +640,8 @@ async function drawAudit(){
 function render(){
   const mini = $("mini");
   $("rt").textContent = {activity:"activity", memory:"memory", tasks:"scheduled tasks",
-                         scripts:"what it can do", audit:"tool activity"}[state.panel];
+                         scripts:"what it can do", apis:"configured APIs",
+                         audit:"tool activity"}[state.panel];
   if(state.panel === "activity"){ mini.hidden = true; drawActivity(); }
   else if(state.panel === "memory"){
     mini.hidden = false;
@@ -596,6 +660,7 @@ function render(){
     drawTasks();
   }
   else if(state.panel === "scripts"){ mini.hidden = true; drawScripts(); }
+  else if(state.panel === "apis"){ mini.hidden = true; drawApis(); }
   else { mini.hidden = true; drawAudit(); }
 }
 function syncTabs(){

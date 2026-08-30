@@ -22,7 +22,11 @@ dev = ["pytest>=8.0"]
 # `vector_scan_limit` vectors in pure Python; with numpy the whole table is
 # compared in one matrix multiply, which matters past a few thousand memories.
 speed = ["numpy>=1.24"]
-all = ["flask>=3.0", "numpy>=1.24"]
+# Pillow lets `describe_image` downscale before uploading and `image_info` read
+# dimensions locally. Both tools work without it — large images are refused
+# rather than resized, and image_info falls back to the file's own metadata.
+vision = ["pillow>=10.0"]
+all = ["flask>=3.0", "numpy>=1.24", "pillow>=10.0"]
 
 [project.scripts]
 itsbob = "itsbob.cli:main"

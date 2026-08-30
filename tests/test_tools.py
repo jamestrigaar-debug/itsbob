@@ -303,10 +303,23 @@ def test_a_near_miss_kind_is_coerced_not_rejected(box):
     """Real logs show `kind="preference"` rejected twice in one conversation,
     each rejection costing a step and a model call before it settled."""
     assert box.call("remember", content="likes dark roast", kind="preference").ok
-    assert "[preference]" in box.call("remember", content="likes tea", kind="preferences").output
+    assert box.call("remember", content="likes tea", kind="preferences").data["kind"] == "preference"
     # Something with no sensible mapping still stores, as a plain fact.
     result = box.call("remember", content="x", kind="vibes")
-    assert result.ok and "[fact]" in result.output
+    assert result.ok and result.data["kind"] == "fact"
+
+
+def test_remember_records_whose_memory_it_is(box):
+    """Bob's own opinions must not be filed as facts about the user."""
+    mine = box.call("remember", content="I liked Blade Runner", subject="bob")
+    assert mine.data["subject"] == "bob"
+    theirs = box.call("remember", content="prefers dark roast")
+    assert theirs.data["subject"] == "user"  # the default, since most are
+    # A short-horizon memory carries an expiry; a long-horizon one does not.
+    short = box.call("remember", content="working on the router today", horizon="short")
+    assert short.data["horizon"] == "short"
+    assert box.memory.get(short.data["id"]).expires_at is not None
+    assert box.memory.get(theirs.data["id"]).expires_at is None
 
 
 # -- API catalog -----------------------------------------------------------
