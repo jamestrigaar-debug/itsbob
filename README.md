@@ -481,6 +481,55 @@ and the GUI find them wherever they are started from.
 
 `make help` lists the shortcuts for working *on* itsbob rather than with it.
 
+### Everything you can put in `~/.itsbob/.env`
+
+Only the first line is needed. Everything else adds a capability, and anything
+absent is reported as absent rather than breaking something — `itsbob doctor`
+lists what is on and what each missing piece would give you.
+
+```bash
+# Thinking. One key covers all four tiers.
+GOOGLE_API_KEY=…
+GROQ_API_KEY=…                  # backups, tried only after every Gemini model fails
+OPENROUTER_API_KEY=…
+
+# Services. Base URL and auth ship built in; the key is the whole setup.
+OPENWEATHER_API_KEY=…           # the `weather` tool and half of `daily_briefing`
+NEWSAPI_KEY=…                   # the `news` tool and the other half
+GNEWS_API_KEY=…                 # second news source, and the rate-limit fallback
+FOOTBALL_DATA_KEY=…             # fixtures, standings and scorers via call_api
+
+# Discord: the channel becomes a two-way workspace.
+DISCORD_BOT_TOKEN=…
+DISCORD_CHANNEL_ID=…
+
+# Where the weather is. Defaults to Hull, UK.
+ITSBOB_WEATHER_PLACE="Hull, UK"
+ITSBOB_WEATHER_LAT=53.7767
+ITSBOB_WEATHER_LON=-0.3274
+
+# Speaking first when idle. `off` disables it; hours between attempts; waking hours.
+ITSBOB_INITIATIVE=on
+ITSBOB_INITIATIVE_HOURS=3
+ITSBOB_INITIATIVE_WAKING=8-22
+
+# The local model. Keep the default unless you have pulled something else.
+ITSBOB_OLLAMA_MODEL=qwen2.5:1.5b
+ITSBOB_OLLAMA_URL=http://127.0.0.1:11434
+
+# Safety. `guarded` (default) asks before anything outside the workspace.
+ITSBOB_TOOL_MODE=guarded
+ITSBOB_AUTO_ALLOW=                # tools to run without asking. Leave empty.
+ITSBOB_ALLOWED_HOSTS=             # empty means any host; a list narrows it
+ITSBOB_SCRIPTS_DIR=~/.itsbob/scripts
+```
+
+`ITSBOB_AUTO_ALLOW=run_shell` is worth naming, because it is the one people
+reach for. It gives the model unattended shell on your machine for the life of
+the process, and it is not needed for web search — `web_search` is its own
+NETWORK-gated tool precisely so that looking something up does not require
+opening that door.
+
 ### Running in the background
 
 ```bash
@@ -554,6 +603,7 @@ src/itsbob/
     persona.py      the system prompt, full and dieted
     writer.py       post-turn extraction, with attribution and horizon
     budget.py       the spend ceiling and the can-it-be-done check
+    initiative.py   what it does when nobody has asked it anything
   memory/         hybrid recall
     long_term.py    SQLite + FTS5 + vectors, score fusion, migration
     base.py         MemoryRecord, Subject, Horizon, and scoring
@@ -605,7 +655,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            437 tests, none of which touch the network
+tests/            454 tests, none of which touch the network
 ```
 
 ## The original simulation

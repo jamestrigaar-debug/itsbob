@@ -530,3 +530,136 @@ def test_a_broken_script_costs_only_its_own_capability(tmp_path):
     names = [t.name for t in script_tools(env)]
     assert "system_status" in names  # everything else still there
     assert "broken" in load_errors
+
+
+# -- speaking first --------------------------------------------------------
+
+
+def test_initiative_only_fires_when_it_is_idle_and_time_is_up():
+    """A restart is not a reason to talk, and neither is a busy moment."""
+    from itsbob.agent.initiative import Initiative
+
+    initiative = Initiative(min_interval=0, jitter=0, waking_hours=(0, 24))
+    assert initiative.due() is False  # the first call only arms the clock
+    assert initiative.due() is True
+    initiative.fire()
+    assert initiative.fired == 1
+
+
+def test_initiative_stays_quiet_at_night():
+    from itsbob.agent.initiative import Initiative
+
+    night = Initiative(min_interval=0, jitter=0, waking_hours=(8, 22))
+    night.next_at = 0.0  # long overdue
+    at_3am = time.mktime(time.localtime()[:3] + (3, 0, 0) + time.localtime()[6:])
+    assert night.awake(at_3am) is False
+    assert night.due(at_3am) is False
+
+
+def test_initiative_never_repeats_the_same_prompt_twice_running():
+    from itsbob.agent.initiative import Initiative
+
+    initiative = Initiative()
+    picks = [initiative.choose().name for _ in range(20)]
+    assert all(a != b for a, b in zip(picks, picks[1:], strict=False))
+
+
+def test_a_quiet_initiative_turn_reaches_nobody():
+    """Silence is the expected answer, and is what makes this safe to leave on."""
+    from itsbob.agent.initiative import Initiative, is_quiet
+
+    assert is_quiet("nothing worth saying")
+    assert is_quiet("Nothing worth saying.")
+    assert is_quiet("")
+    assert not is_quiet("The disk is 94% full — the cache under ~/.cache is 30GB of it.")
+    initiative = Initiative()
+    assert initiative.record("nothing worth saying") is False
+    assert initiative.record("the disk is nearly full") is True
+    assert initiative.spoke == 1
+
+
+def test_the_runner_delivers_only_what_was_actually_said(tmp_path):
+    from itsbob.agent.initiative import Initiative, Prompt
+    from itsbob.gui.autonomous import Autonomous
+
+    delivered = []
+
+    class Sink:
+        def send(self, notification):
+            delivered.append(notification)
+            return True
+
+    class Session:
+        busy = False
+
+        def __init__(self):
+            self.submitted = []
+
+        def emit(self, *a, **k):
+            pass
+
+        def queued_messages(self):
+            return []
+
+        def submit(self, text, **kw):
+            self.submitted.append((text, kw))
+            return {"accepted": True}
+
+    class Turn:
+        def __init__(self, final):
+            self.final = final
+
+    class Tasks:
+        def due(self, now):
+            return []
+
+        def next_due_at(self):
+            return None
+
+    session = Session()
+    initiative = Initiative(
+        min_interval=0, jitter=0, waking_hours=(0, 24),
+        prompts=(Prompt("machine", "look around"),),
+    )
+    initiative.due()  # arm
+    runner = Autonomous(session, Tasks(), sink=Sink(), initiative=initiative)
+
+    assert runner._poll() == ["(initiative)"]
+    on_done = session.submitted[0][1]["on_done"]
+
+    on_done(Turn("nothing worth saying"), None)
+    assert delivered == []  # silence reaches nobody
+
+    on_done(Turn("Your disk is 94% full."), None)
+    assert len(delivered) == 1
+    assert delivered[0].body == "Your disk is 94% full."
+    assert delivered[0].source == "initiative"
+
+
+def test_initiative_never_gets_in_front_of_a_person(tmp_path):
+    from itsbob.agent.initiative import Initiative
+    from itsbob.gui.autonomous import Autonomous
+
+    class BusySession:
+        busy = True
+
+        def emit(self, *a, **k):
+            pass
+
+        def queued_messages(self):
+            return [{"text": "a question"}]
+
+        def submit(self, *a, **k):
+            raise AssertionError("must not submit while a person is waiting")
+
+    class Tasks:
+        def due(self, now):
+            return []
+
+        def next_due_at(self):
+            return None
+
+    initiative = Initiative(min_interval=0, jitter=0, waking_hours=(0, 24))
+    initiative.due()
+    runner = Autonomous(BusySession(), Tasks(), initiative=initiative)
+    assert runner._poll() == []
