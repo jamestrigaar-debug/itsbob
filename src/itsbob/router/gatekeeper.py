@@ -26,12 +26,23 @@ from .tiers import GATEKEEPER_TAGS, GateDecision, Tier
 
 __all__ = ["Gatekeeper"]
 
-_SYSTEM_PROMPT = (
-    "You are the 'Gatekeeper'. Analyze the provided game state. Output ONLY "
-    "one of these tags: [SCRIPT], [LOCAL_SUM], [CLOUD_B], or [CLOUD_A]. Also "
-    "output a 5-word compressed 'state fingerprint' for caching. "
-    'Reply as strict JSON: {"tag": "<TAG>", "fingerprint": "<five words>"}'
-)
+def _build_system_prompt(script_names: tuple[str, ...]) -> str:
+    # The base spec's Gatekeeper prompt asks for a tag and a fingerprint only
+    # — but a [SCRIPT] tag with no script name attached is undispatchable
+    # (the pipeline has nothing to execute), so this also asks for the
+    # script itself when tagging SCRIPT, constrained to names the registry
+    # actually knows — the same "only ever *name* a pre-registered macro"
+    # contract Tier B/A cloud prompts already use, applied to Tier D too.
+    names = ", ".join(script_names) or "(none registered)"
+    return (
+        "You are the 'Gatekeeper'. Analyze the provided game state. Output ONLY "
+        "one of these tags: [SCRIPT], [LOCAL_SUM], [CLOUD_B], or [CLOUD_A]. Also "
+        "output a 5-word compressed 'state fingerprint' for caching. If — and "
+        f"only if — the tag is [SCRIPT], also name exactly one script from this "
+        f"list that applies: {names}. Never invent a script name not in that list. "
+        'Reply as strict JSON: {"tag": "<TAG>", "fingerprint": "<five words>", '
+        '"script": "<SCRIPT_NAME or omit/null if tag is not SCRIPT>"}'
+    )
 
 _TAG_RE = re.compile(r"\[?(SCRIPT|LOCAL_SUM|CLOUD_B|CLOUD_A)\]?")
 
@@ -81,8 +92,8 @@ class Gatekeeper:
 
     def _classify_with_model(self, state: GameState) -> GateDecision:
         request = LLMRequest(
-            messages=[system(_SYSTEM_PROMPT), user(state.render())],
-            max_tokens=60,
+            messages=[system(_build_system_prompt(tuple(self.registry.names()))), user(state.render())],
+            max_tokens=80,
             temperature=0.0,
             json_mode=True,
         )
@@ -92,17 +103,29 @@ class Gatekeeper:
         )
         latency_ms = (time.perf_counter() - started) * 1000
 
-        tag, fingerprint = _parse_gatekeeper_reply(response.text)
+        tag, fingerprint, script = _parse_gatekeeper_reply(response.text)
         if tag is None:
             raise ValueError(f"gatekeeper reply had no recognizable tag: {response.text!r}")
+
+        metadata: dict[str, Any] = {"raw_tag": tag, "model": response.model}
+        reasoning = f"local model tagged [{tag}]"
+        if tag == "SCRIPT":
+            if script and self.registry.has(script):
+                metadata["script"] = script
+                reasoning += f" -> {script}"
+            else:
+                reasoning += (
+                    f" but named no valid script ({script!r})" if script
+                    else " but named no script"
+                )
 
         return GateDecision(
             tier=GATEKEEPER_TAGS[tag],
             fingerprint=fingerprint or _fallback_fingerprint(state, tag),
             source="gatekeeper",
-            reasoning=f"local model tagged [{tag}]",
+            reasoning=reasoning,
             latency_ms=latency_ms,
-            metadata={"raw_tag": tag, "model": response.model},
+            metadata=metadata,
         )
 
     # -- rule-based fallback --------------------------------------------------
@@ -140,7 +163,7 @@ class Gatekeeper:
         )
 
 
-def _parse_gatekeeper_reply(text: str) -> tuple[str | None, str | None]:
+def _parse_gatekeeper_reply(text: str) -> tuple[str | None, str | None, str | None]:
     from ..llm.router import extract_json
 
     parsed = extract_json(text)
@@ -149,10 +172,11 @@ def _parse_gatekeeper_reply(text: str) -> tuple[str | None, str | None]:
         match = _TAG_RE.search(tag_raw) or _TAG_RE.search(text)
         tag = match.group(1) if match else None
         fingerprint = str(parsed.get("fingerprint", "")).strip() or None
-        return tag, fingerprint
+        script = str(parsed.get("script", "")).strip() or None
+        return tag, fingerprint, script
 
     match = _TAG_RE.search(text)
-    return (match.group(1) if match else None), None
+    return (match.group(1) if match else None), None, None
 
 
 def _fallback_fingerprint(state: GameState, tag: str) -> str:

@@ -149,7 +149,13 @@ class ComplexityRouter:
     def _run_script(self, state: GameState, decision: GateDecision) -> RouteResult:
         name = decision.metadata.get("script")
         if not name or not self.registry.has(name):
-            return self._tier_s(state, decision, reason=f"unknown script {name!r}")
+            # The Gatekeeper tagged this as trivial enough for a script but
+            # didn't (or couldn't) name a registered one — that's a
+            # classification miss, not evidence the state is unparseable.
+            # Degrade the same way an unusable cloud reply does (local safe
+            # pick -> MAINTAIN_FORMATION) rather than jumping straight to a
+            # user-facing halt for what's often just "no script fit."
+            return self._escalate_to_local(state, decision, reason=f"no valid script named ({name!r})")
         script_result = self.registry.execute(name, state)
         return RouteResult(
             tier=Tier.D,
