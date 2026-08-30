@@ -36,6 +36,13 @@ class Tier(str, Enum):
         }[self]
 
     @property
+    def rank(self) -> int:
+        """Cost/capability order, cheapest first. S sits above A: reaching it
+        means nothing else could answer, which is the most expensive outcome
+        there is — a person now has to."""
+        return {Tier.D: 0, Tier.C: 1, Tier.B: 2, Tier.A: 3, Tier.S: 4}[self]
+
+    @property
     def uses_llm(self) -> bool:
         return self is not Tier.D
 

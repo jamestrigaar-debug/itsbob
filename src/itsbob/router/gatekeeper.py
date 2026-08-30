@@ -1,186 +1,353 @@
-"""Step 2 of the handshake: the Gatekeeper classifier prompt.
+"""Step 2: the Gatekeeper — how hard is this, really?
 
-"You are the 'Gatekeeper'. Analyze the provided game state. Output ONLY one
-of these tags: [SCRIPT], [LOCAL_SUM], [CLOUD_B], or [CLOUD_A]. Also output a
-5-word compressed 'state fingerprint' for caching."
+It answers one question per step: which tier can handle this safely and most
+cheaply. It never answers the request itself, never writes prose for the user,
+and is given a tiny token budget so it cannot start trying to.
 
-The Gatekeeper never generates free text for the user — its entire job is
-one tag plus one fingerprint. It prefers the local Back Brain
-(:class:`~itsbob.llm.local.OllamaProvider`); if that is unreachable or
-answers garbage, it falls back to a fast rule-based classifier so the
-pipeline degrades gracefully rather than stalling on a missing model
-download.
+Two classifiers, same output:
+
+* the **model** classifier, run on the cheapest thing available (the local
+  Back Brain if Ollama is up, otherwise Tier C);
+* a **rule-based** fallback for when no model answers, so a missing key or a
+  stopped Ollama degrades accuracy rather than stopping the system.
+
+The rules encode three things a cheap model gets wrong often enough to be
+worth hard-coding:
+
+**Irreversibility outranks apparent simplicity.** "delete the old backups" is
+a short, clear sentence and a Tier A decision, because being wrong costs data.
+Anything matching the destructive vocabulary floors at Tier A regardless of
+how simple it reads.
+
+**Ambiguous verbs are matched as phrases.** "release" is a noun at least as
+often as it is a verb, so it is matched as "release the"/"release to" rather
+than bare — otherwise "fetch the latest release notes" buys a premium model
+for a file read.
+
+**Asking about a thing is not doing it.** "what did I say about the deploy?"
+is a memory lookup that happens to contain the word "deploy"; reading that
+noun as an instruction sends every question about past work to the premium
+tier. Recall forms are matched before the destructive vocabulary — but *after*
+the judgement vocabulary, so "should I delete the backups?" stays Tier A.
+
+**Length is a weak signal, used last.** It is the only one that survives when
+nothing else matches, not the primary axis.
 """
 
 from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
-from ..llm.base import LLMRequest, Provider, ProviderUnavailable, system, user
-from .ingestion import GameState
-from .scripts import ScriptRegistry
+from ..llm.base import LLMRequest, Provider, system, user
+from .ingestion import Snapshot
 from .tiers import GATEKEEPER_TAGS, GateDecision, Tier
 
-__all__ = ["Gatekeeper"]
+__all__ = ["Gatekeeper", "classify_heuristically"]
 
-def _build_system_prompt(script_names: tuple[str, ...]) -> str:
-    # The base spec's Gatekeeper prompt asks for a tag and a fingerprint only
-    # — but a [SCRIPT] tag with no script name attached is undispatchable
-    # (the pipeline has nothing to execute), so this also asks for the
-    # script itself when tagging SCRIPT, constrained to names the registry
-    # actually knows — the same "only ever *name* a pre-registered macro"
-    # contract Tier B/A cloud prompts already use, applied to Tier D too.
-    names = ", ".join(script_names) or "(none registered)"
-    return (
-        "You are the 'Gatekeeper'. Analyze the provided game state. Output ONLY "
-        "one of these tags: [SCRIPT], [LOCAL_SUM], [CLOUD_B], or [CLOUD_A]. Also "
-        "output a 5-word compressed 'state fingerprint' for caching. If — and "
-        f"only if — the tag is [SCRIPT], also name exactly one script from this "
-        f"list that applies: {names}. Never invent a script name not in that list. "
-        'Reply as strict JSON: {"tag": "<TAG>", "fingerprint": "<five words>", '
-        '"script": "<SCRIPT_NAME or omit/null if tag is not SCRIPT>"}'
+_TAG_RE = re.compile(r"\[?(SCRIPT|ROUTINE|LOCAL_SUM|TRIVIAL|CLOUD_B|STANDARD|CLOUD_A|PREMIUM)\]?", re.I)
+
+#: Tag synonyms, because a small model will produce the word that means the
+#: thing rather than the token the prompt asked for often enough to matter.
+_TAG_ALIASES = {
+    "ROUTINE": "SCRIPT",
+    "TRIVIAL": "LOCAL_SUM",
+    "STANDARD": "CLOUD_B",
+    "PREMIUM": "CLOUD_A",
+}
+
+# Hard to undo, or visible to other people. Floors at Tier A.
+#
+# Split by ambiguity. The first list is words that are almost always the verb
+# they look like. The second is words that are just as often nouns —
+# "the release notes", "a merge conflict", "the payment page" — and so are
+# matched only in a phrase that puts them in verb position. Matching bare
+# "release" sent "fetch the latest release notes" to the premium tier, which is
+# the cost of over-broad matching: not a wrong answer, but a bill for nothing.
+_IRREVERSIBLE = (
+    "delete", "remove", "rm -", "wipe", "erase", "destroy", "purge",
+    "uninstall", "revoke", "overwrite", "truncate", "drop table", "drop database",
+    "deploy", "publish", "force push", "force-push",
+    "pay", "buy", "purchase", "refund", "chargeback",
+    "shut down", "shutdown", "reboot",
+)
+
+_IRREVERSIBLE_PHRASES = (
+    "release the", "release to", "release it",
+    "push to", "push the", "merge the", "merge it", "merge into",
+    "send the", "send it", "send an", "send a", "email the", "email it",
+    "post to", "post the", "tweet", "reply to",
+    "transfer the", "transfer to", "invoice the",
+    "migrate the", "migrate to", "rotate the", "reset the", "reset my",
+    "revert the", "roll back", "rollback the", "restart the",
+    "format the", "format /",
+)
+
+# Genuine judgement: several options, unclear criteria, or a long horizon.
+_JUDGEMENT = (
+    "should i", "should we", "recommend", "advise", "trade-off", "tradeoff",
+    "compare", "versus", "vs", "decide", "decision", "strategy", "plan for",
+    "design", "architect", "why did", "why does", "root cause", "diagnose",
+    "risk", "safe to", "worth it", "pros and cons", "best way",
+)
+
+# Needs the world, or the machine, but not much thinking about it.
+_TOOL_WORK = (
+    "read", "open", "list", "show", "find", "search", "grep", "look up",
+    "run", "execute", "check", "fetch", "download", "call the", "api",
+    "file", "folder", "directory", "script", "log", "install", "build", "test",
+)
+
+# Asking *about* something, including about something destructive. Checked
+# before the irreversible list, because "what did I say about the deploy?" is
+# a memory lookup that happens to contain the word "deploy" — reading a noun
+# as an instruction sends every question about past work to the premium tier.
+_RECALL = (
+    "what did i", "what do i", "what did we", "did i", "did we",
+    "do you remember", "do you know", "remind me", "when did", "when is",
+    "who is", "who was", "what time", "what's my", "whats my", "what is my",
+    "tell me about", "what happened",
+)
+
+# Small talk and text manipulation on content already in hand. Cheapest tier.
+_TRIVIAL = (
+    "hello", "hi", "hey", "thanks", "thank you", "good morning", "good night",
+    "how are you", "summarize", "summarise", "rephrase", "shorten", "translate",
+    "spell", "proofread", "tidy up this",
+)
+
+
+@lru_cache(maxsize=None)
+def _phrase_re(needles: tuple[str, ...]) -> re.Pattern[str]:
+    """Word-boundary matcher for a vocabulary list.
+
+    Plain substring matching is wrong here in a way that is easy to miss:
+    "merge the" is a substring of "merge these two CSV files", so a request to
+    merge two spreadsheets was classified as a branch merge. Boundaries are
+    added only where the phrase actually ends in a word character, so entries
+    like "rm -" and "format /" still match.
+    """
+    parts = []
+    for needle in needles:
+        body = re.escape(needle.strip())
+        prefix = r"\b" if needle.strip()[:1].isalnum() else ""
+        suffix = r"\b" if needle.strip()[-1:].isalnum() else ""
+        parts.append(f"{prefix}{body}{suffix}")
+    return re.compile("|".join(parts))
+
+
+def _mentions(text: str, needles: Sequence[str]) -> str | None:
+    match = _phrase_re(tuple(needles)).search(text)
+    return match.group(0).strip() if match else None
+
+
+def classify_heuristically(snapshot: Snapshot, *, routines: Sequence[str] = ()) -> GateDecision:
+    """Rule-based tier choice. Never raises, never calls anything."""
+    started = time.perf_counter()
+    text = snapshot.render().lower()
+    size = len(text)
+
+    hit = _mentions(text, _JUDGEMENT)
+    if hit:
+        # Ordered above recall so "should I delete the backups?" stays premium:
+        # it is a question, but the thing being asked is a judgement call.
+        tag, why = "CLOUD_A", f"asks for judgement ({hit!r})"
+    elif (hit := _mentions(text, _RECALL)) and size < 400:
+        tag, why = "LOCAL_SUM", f"asking about something, not doing it ({hit!r})"
+    elif (hit := _mentions(text, _IRREVERSIBLE)) or (hit := _mentions(text, _IRREVERSIBLE_PHRASES)):
+        tag, why = "CLOUD_A", f"mentions {hit!r} — hard to undo, so judgement before action"
+    elif (hit := _mentions(text, _TRIVIAL)) and size < 400:
+        tag, why = "LOCAL_SUM", f"small talk or text manipulation ({hit!r})"
+    elif (hit := _mentions(text, _TOOL_WORK)):
+        tag, why = "CLOUD_B", f"needs tools ({hit!r})"
+    elif size < 200:
+        tag, why = "LOCAL_SUM", f"short and unremarkable ({size} chars)"
+    else:
+        tag, why = "CLOUD_B", f"no strong signal, {size} chars — standard tier"
+
+    return GateDecision(
+        tier=GATEKEEPER_TAGS[tag],
+        fingerprint=fingerprint_for(snapshot, tag),
+        source="heuristic",
+        reasoning=f"rule-based: {why}",
+        latency_ms=(time.perf_counter() - started) * 1000,
+        metadata={"raw_tag": tag, "char_count": size},
     )
 
-_TAG_RE = re.compile(r"\[?(SCRIPT|LOCAL_SUM|CLOUD_B|CLOUD_A)\]?")
 
-# Heuristic fallback thresholds, tuned to the spec's own examples.
-_HIGH_RISK_WORDS = {
-    "negotiat", "contract", "renegotiat", "release clause", "fallout", "dispute",
-}
-_WORLD_KNOWLEDGE_WORDS = {
-    "tactic", "formation", "opponent", "transfer", "valuation", "press", "wing",
-}
+def _build_system_prompt(routines: Sequence[str]) -> str:
+    routine_line = (
+        f"[SCRIPT] — one of these saved routines does exactly this, no thinking needed: "
+        f"{', '.join(routines)}. Name it in \"routine\".\n"
+        if routines
+        else ""
+    )
+    return (
+        "You are the Gatekeeper. You do NOT answer the request. You decide which "
+        "tier of intelligence should handle it, and nothing else.\n\n"
+        f"{routine_line}"
+        "[LOCAL_SUM] — trivial: greetings, thanks, recalling something the user "
+        "already told you, rephrasing, summarising text you were given.\n"
+        "[CLOUD_B] — standard: uses tools, reads or writes files, runs commands, "
+        "calls an API, multi-step but the steps are clear.\n"
+        "[CLOUD_A] — premium: genuine judgement, several defensible options, "
+        "ambiguous instructions, OR anything hard to undo (deleting, sending, "
+        "deploying, paying, publishing). When in doubt between B and A on "
+        "something irreversible, choose A.\n\n"
+        "Also output a 5-word lowercase fingerprint capturing the *kind* of "
+        "request, for caching — not its specific details.\n"
+        'Reply as strict JSON and nothing else: {"tag": "<TAG>", '
+        '"fingerprint": "<five words>", "routine": "<name, or null>"}'
+    )
 
 
 @dataclass
 class Gatekeeper:
-    """Classifies a :class:`GameState` into a :class:`~itsbob.router.tiers.Tier`."""
+    """Classifies a :class:`Snapshot` into a :class:`~itsbob.router.tiers.Tier`."""
 
-    registry: ScriptRegistry
+    #: Names the classifier may return as a Tier D routine. Anything not in
+    #: here is treated as a classification miss, never executed.
+    routines: Sequence[str] = ()
+    #: Cheapest model available. Ollama when it is running, else a Tier C router.
     local_provider: Provider | None = None
     local_model: str | None = None
-    max_local_latency_ms: float = 800.0
+    #: Called as ``fn(request) -> text`` when there is no local provider. Lets
+    #: the agent classify on Tier C without this module knowing about the brain.
+    cloud_classifier: Any = None
+    #: A registry-like object with ``.first_triggered(snapshot)`` for the
+    #: deterministic Tier D check, when one is wired up.
+    registry: Any = None
 
-    def classify(self, state: GameState) -> GateDecision:
-        # Tier D check first — a deterministic hit is always cheapest and
-        # fastest, so the model (local or otherwise) never even gets asked.
-        script_name = self.registry.first_triggered(state)
-        if script_name is not None:
+    def classify(self, snapshot: Snapshot) -> GateDecision:
+        # Tier D first: a deterministic hit is cheapest and fastest, so no
+        # model is asked at all.
+        if self.registry is not None:
+            try:
+                name = self.registry.first_triggered(snapshot)
+            except Exception:  # noqa: BLE001 - a broken trigger must not block routing
+                name = None
+            if name:
+                return GateDecision(
+                    tier=Tier.D,
+                    fingerprint=fingerprint_for(snapshot, name),
+                    source="trigger",
+                    reasoning=f"deterministic trigger matched: {name}",
+                    metadata={"routine": name},
+                )
+
+        if snapshot.is_empty:
             return GateDecision(
-                tier=Tier.D,
-                fingerprint=_fallback_fingerprint(state, script_name),
-                source="script-trigger",
-                reasoning=f"deterministic trigger matched: {script_name}",
-                latency_ms=0.0,
-                metadata={"script": script_name},
+                tier=Tier.C,
+                fingerprint="empty input",
+                source="heuristic",
+                reasoning="nothing to classify",
             )
 
-        if self.local_provider is not None:
-            try:
-                return self._classify_with_model(state)
-            except Exception as exc:  # noqa: BLE001 - any failure degrades gracefully
-                heuristic = self._classify_heuristically(state)
-                heuristic.reasoning = f"local model failed ({type(exc).__name__}); {heuristic.reasoning}"
-                return heuristic
+        for attempt in (self._classify_with_local, self._classify_with_cloud):
+            decision = attempt(snapshot)
+            if decision is not None:
+                return decision
+        return classify_heuristically(snapshot, routines=self.routines)
 
-        return self._classify_heuristically(state)
+    # -- model paths -------------------------------------------------------
 
-    # -- local model path ----------------------------------------------------
-
-    def _classify_with_model(self, state: GameState) -> GateDecision:
-        request = LLMRequest(
-            messages=[system(_build_system_prompt(tuple(self.registry.names()))), user(state.render())],
-            max_tokens=80,
+    def _request(self, snapshot: Snapshot) -> LLMRequest:
+        return LLMRequest(
+            messages=[
+                system(_build_system_prompt(tuple(self.routines))),
+                user(snapshot.render(max_chars=2000)),
+            ],
+            # Small models sometimes spend budget on hidden reasoning before
+            # the first visible token; too tight a cap yields an empty body and
+            # a pointless fall back to the heuristic.
+            max_tokens=200,
             temperature=0.0,
             json_mode=True,
         )
+
+    def _classify_with_local(self, snapshot: Snapshot) -> GateDecision | None:
+        if self.local_provider is None:
+            return None
         started = time.perf_counter()
-        response = self.local_provider.complete_with_fallback(  # type: ignore[union-attr]
-            request, preferred_model=self.local_model
+        try:
+            response = self.local_provider.complete_with_fallback(
+                self._request(snapshot), preferred_model=self.local_model
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"local: {type(exc).__name__}: {exc}"[:200]
+            return None
+        return self._decision_from(
+            snapshot, response.text, (time.perf_counter() - started) * 1000, response.model, "local"
         )
-        latency_ms = (time.perf_counter() - started) * 1000
 
-        tag, fingerprint, script = _parse_gatekeeper_reply(response.text)
+    def _classify_with_cloud(self, snapshot: Snapshot) -> GateDecision | None:
+        if self.cloud_classifier is None:
+            return None
+        started = time.perf_counter()
+        try:
+            text = self.cloud_classifier(self._request(snapshot))
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"cloud: {type(exc).__name__}: {exc}"[:200]
+            return None
+        return self._decision_from(
+            snapshot, text or "", (time.perf_counter() - started) * 1000, "cloud", "gatekeeper"
+        )
+
+    def _decision_from(
+        self, snapshot: Snapshot, text: str, latency_ms: float, model: str, source: str
+    ) -> GateDecision | None:
+        tag, fingerprint, routine = _parse_reply(text)
         if tag is None:
-            raise ValueError(f"gatekeeper reply had no recognizable tag: {response.text!r}")
+            return None  # unusable answer: let the next classifier try
 
-        metadata: dict[str, Any] = {"raw_tag": tag, "model": response.model}
-        reasoning = f"local model tagged [{tag}]"
+        metadata: dict[str, Any] = {"raw_tag": tag, "model": model}
+        reasoning = f"{source} model tagged [{tag}]"
+        tier = GATEKEEPER_TAGS[tag]
+
         if tag == "SCRIPT":
-            if script and self.registry.has(script):
-                metadata["script"] = script
-                reasoning += f" -> {script}"
+            if routine and routine in self.routines:
+                metadata["routine"] = routine
+                reasoning += f" -> {routine}"
             else:
-                reasoning += (
-                    f" but named no valid script ({script!r})" if script
-                    else " but named no script"
-                )
+                # Tagged trivial-enough-for-a-routine but named none that
+                # exists. That is a classification miss, not evidence the
+                # request is unhandleable — treat it as standard work.
+                tier = Tier.B
+                reasoning += f" but named no known routine ({routine!r}); routing as standard"
 
         return GateDecision(
-            tier=GATEKEEPER_TAGS[tag],
-            fingerprint=fingerprint or _fallback_fingerprint(state, tag),
-            source="gatekeeper",
+            tier=tier,
+            fingerprint=fingerprint or fingerprint_for(snapshot, tag),
+            source=source,
             reasoning=reasoning,
             latency_ms=latency_ms,
             metadata=metadata,
         )
 
-    # -- rule-based fallback --------------------------------------------------
 
-    def _classify_heuristically(self, state: GameState) -> GateDecision:
-        """Pure-Python stand-in for the local model's job — same tag space.
-
-        Mirrors the taxonomy's own criteria: reasoning depth (does it need
-        world knowledge / negotiation), data volume (how much text), and
-        action risk (does it look high-stakes). Nowhere near as accurate as
-        a tuned classifier, but it keeps the pipeline running end to end with
-        nothing installed.
-        """
-        started = time.perf_counter()
-        text = state.render().lower()
-        char_count = len(text)
-
-        if any(w in text for w in _HIGH_RISK_WORDS):
-            tag = "CLOUD_A"
-        elif any(w in text for w in _WORLD_KNOWLEDGE_WORDS):
-            tag = "CLOUD_B"
-        elif char_count < 500:
-            tag = "LOCAL_SUM"
-        else:
-            tag = "CLOUD_B"
-
-        latency_ms = (time.perf_counter() - started) * 1000
-        return GateDecision(
-            tier=GATEKEEPER_TAGS[tag],
-            fingerprint=_fallback_fingerprint(state, tag),
-            source="heuristic",
-            reasoning=f"rule-based classifier (no local model available): {char_count} chars -> [{tag}]",
-            latency_ms=latency_ms,
-            metadata={"raw_tag": tag, "char_count": char_count},
-        )
-
-
-def _parse_gatekeeper_reply(text: str) -> tuple[str | None, str | None, str | None]:
+def _parse_reply(text: str) -> tuple[str | None, str | None, str | None]:
     from ..llm.router import extract_json
 
-    parsed = extract_json(text)
-    if parsed:
-        tag_raw = str(parsed.get("tag", ""))
-        match = _TAG_RE.search(tag_raw) or _TAG_RE.search(text)
-        tag = match.group(1) if match else None
-        fingerprint = str(parsed.get("fingerprint", "")).strip() or None
-        script = str(parsed.get("script", "")).strip() or None
-        return tag, fingerprint, script
+    parsed = extract_json(text) or {}
+    match = _TAG_RE.search(str(parsed.get("tag", ""))) or _TAG_RE.search(text or "")
+    if match is None:
+        return None, None, None
+    tag = match.group(1).upper()
+    tag = _TAG_ALIASES.get(tag, tag)
+    if tag not in GATEKEEPER_TAGS:
+        return None, None, None
+    fingerprint = str(parsed.get("fingerprint", "")).strip() or None
+    routine = str(parsed.get("routine") or "").strip() or None
+    return tag, fingerprint, (None if routine in ("null", "none") else routine)
 
-    match = _TAG_RE.search(text)
-    return (match.group(1) if match else None), None, None
 
-
-def _fallback_fingerprint(state: GameState, tag: str) -> str:
-    """Cheap 5-ish-word fingerprint when the model didn't supply one."""
-    words = [f"{k}:{v}" for k, v in list(state.facts.items())[:4]]
+def fingerprint_for(snapshot: Snapshot, tag: str) -> str:
+    """Cheap five-ish-word fingerprint when the model did not supply one."""
+    words = [w for w in re.findall(r"[a-z0-9]+", snapshot.text.lower()) if len(w) > 2][:4]
+    if not words:
+        words = [f"{k}:{v}" for k, v in list(snapshot.facts.items())[:4]]
     words.append(tag.lower())
     return " ".join(str(w) for w in words[:5]) or tag.lower()
