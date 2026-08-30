@@ -462,7 +462,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"home: {home}  ({'exists' if home.exists() else 'will be created'})\n")
 
     print("model tiers:")
-    brain = build_brain(Settings.from_env(dotenv=None))
+    brain = build_brain(Settings.from_env(load_env_files=False))
     for tier_value, info in brain.describe()["tiers"].items():
         configured = [row for row in info["providers"] if row["configured"]]
         first = configured[0] if configured else None
@@ -596,7 +596,7 @@ def _cmd_gui(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     from .factory import build_simulation
 
-    settings = Settings.from_env(dotenv=None)
+    settings = Settings.from_env(load_env_files=False)
     if args.db:
         settings = Settings(
             providers=settings.providers,

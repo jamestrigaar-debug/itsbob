@@ -50,9 +50,10 @@ def build_router(
                 "no LLM providers configured — set OPENROUTER_API_KEY, GROQ_API_KEY "
                 "or GOOGLE_API_KEY (or allow the offline provider)"
             )
+        # Only as a stand-in for *nothing*, never as a fallback behind a real
+        # provider: a configured provider that fails must surface the failure,
+        # not be papered over with a deterministic fake answer.
         providers.append(EchoProvider())
-    elif settings.allow_offline:
-        providers.append(EchoProvider())  # last resort behind the real ones
 
     return LLMRouter(
         providers,

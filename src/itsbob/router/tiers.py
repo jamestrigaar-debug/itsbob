@@ -17,7 +17,22 @@ __all__ = ["Tier", "GateDecision"]
 
 
 class Tier(str, Enum):
-    """Cheapest first. Ordering matters for display and for escalation."""
+    """Cheapest first. Ordering matters for display and for escalation.
+
+    Comparison is by :attr:`rank`, explicitly. Inheriting from ``str`` for
+    JSON-friendliness means the default comparison is *alphabetical*, which
+    silently reverses the thing this enum exists to express: ``Tier.A <
+    Tier.B`` was True and ``max([Tier.C, Tier.A])`` returned the cheapest tier,
+    not the most capable. Any code that sorted or compared tiers got the wrong
+    answer without erroring.
+
+    All four comparisons are written out rather than derived with
+    ``functools.total_ordering``, which does nothing useful on a ``str`` mixin:
+    it only fills in operators the class does not already have, and ``str``
+    supplies every one of them. Decorating this class with it left ``>``
+    comparing alphabetically while ``<`` compared correctly — a worse state
+    than before, because the two disagreed.
+    """
 
     D = "D"  #: Direct — a registered routine, no model at all
     C = "C"  #: Cheapest — the local model if one is running, else the cheapest cloud one
@@ -37,6 +52,34 @@ class Tier(str, Enum):
             Tier.A: "Premium model",
             Tier.S: "Halt — ask a person",
         }[self]
+
+    def __lt__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Tier):
+            return self.rank < other.rank
+        return NotImplemented
+
+    def __le__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Tier):
+            return self.rank <= other.rank
+        return NotImplemented
+
+    def __gt__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Tier):
+            return self.rank > other.rank
+        return NotImplemented
+
+    def __ge__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Tier):
+            return self.rank >= other.rank
+        return NotImplemented
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Tier):
+            return self.value == other.value
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.value)
 
     @property
     def rank(self) -> int:

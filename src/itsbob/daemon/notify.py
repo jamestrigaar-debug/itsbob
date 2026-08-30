@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from ..llm.base import LLMRequest, system, user
+from ..logfile import JsonlFile
 from ..router.tiers import Tier
 
 __all__ = ["Notification", "Sink", "ConsoleSink", "FileSink", "DesktopSink", "WebhookSink",
@@ -74,16 +75,21 @@ class ConsoleSink:
 
 @dataclass
 class FileSink:
-    """Append-only JSONL. The record that survives a closed terminal."""
+    """Append-only JSONL, rotated. The record that survives a closed terminal."""
 
     path: Path
+    max_bytes: int = 2_000_000
+    backups: int = 2
+
+    def __post_init__(self) -> None:
+        self._file = JsonlFile(self.path, max_bytes=self.max_bytes, keep=self.backups)
 
     def send(self, notification: Notification) -> bool:
-        path = Path(self.path).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(notification.as_dict(), default=str) + "\n")
+        self._file.append(notification.as_dict())
         return True
+
+    def read(self, limit: int | None = None) -> list[dict[str, Any]]:
+        return self._file.read(limit)
 
 
 @dataclass

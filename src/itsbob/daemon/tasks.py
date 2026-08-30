@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..store import Database
 from .schedule import Schedule, parse_schedule
 
 __all__ = ["Task", "TaskStore", "TaskRun"]
@@ -131,19 +132,14 @@ class TaskStore:
     """SQLite-backed task list. Survives restarts, which is the point."""
 
     def __init__(self, database: str | Path = ":memory:") -> None:
-        self.database = str(database)
-        if self.database != ":memory:":
-            Path(self.database).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.database, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        self._db = Database(database, schema=_SCHEMA)
+        self.database = self._db.path
 
     def add(self, task: Task, *, now: float | None = None, first: bool = False) -> Task:
         if task.next_run is None:
             schedule = task.parsed()
             task.next_run = schedule.first_run(now) if first else schedule.next_after(now)
-        self._conn.execute(
+        self._db.execute(
             "INSERT OR REPLACE INTO tasks (id, name, prompt, schedule, enabled, created_at, "
             "next_run, last_run, last_status, last_output, run_count, fail_count, notify, "
             "max_runs, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -154,7 +150,6 @@ class TaskStore:
                 task.max_runs, json.dumps(task.metadata),
             ),
         )
-        self._conn.commit()
         return task
 
     def create(
@@ -166,7 +161,7 @@ class TaskStore:
         )
 
     def get(self, task_id: str) -> Task | None:
-        row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = self._db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         return _from_row(row) if row else None
 
     def find(self, needle: str) -> Task | None:
@@ -174,9 +169,7 @@ class TaskStore:
         task = self.get(needle)
         if task is not None:
             return task
-        row = self._conn.execute(
-            "SELECT * FROM tasks WHERE name = ? COLLATE NOCASE", (needle,)
-        ).fetchone()
+        row = self._db.one("SELECT * FROM tasks WHERE name = ? COLLATE NOCASE", (needle,))
         return _from_row(row) if row else None
 
     def all(self, *, enabled_only: bool = False) -> list[Task]:
@@ -184,11 +177,11 @@ class TaskStore:
         if enabled_only:
             sql += " WHERE enabled = 1"
         sql += " ORDER BY next_run IS NULL, next_run ASC"
-        return [_from_row(row) for row in self._conn.execute(sql)]
+        return [_from_row(row) for row in self._db.query(sql)]
 
     def due(self, now: float | None = None) -> list[Task]:
         now = time.time() if now is None else now
-        rows = self._conn.execute(
+        rows = self._db.query(
             "SELECT * FROM tasks WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= ? "
             "ORDER BY next_run ASC",
             (now,),
@@ -196,10 +189,9 @@ class TaskStore:
         return [_from_row(row) for row in rows]
 
     def next_due_at(self) -> float | None:
-        row = self._conn.execute(
-            "SELECT MIN(next_run) AS t FROM tasks WHERE enabled = 1 AND next_run IS NOT NULL"
-        ).fetchone()
-        return row["t"]
+        return self._db.scalar(
+            "SELECT MIN(next_run) FROM tasks WHERE enabled = 1 AND next_run IS NOT NULL"
+        )
 
     def set_enabled(self, task_id: str, enabled: bool, *, now: float | None = None) -> bool:
         task = self.get(task_id)
@@ -212,10 +204,10 @@ class TaskStore:
         return True
 
     def remove(self, task_id: str) -> bool:
-        cursor = self._conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        self._conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._db.transaction() as conn:
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+            return cursor.rowcount > 0
 
     def record_run(self, task: Task, run: TaskRun, *, now: float | None = None) -> Task:
         """Store the outcome and compute the next fire time."""
@@ -238,7 +230,7 @@ class TaskStore:
             if task.next_run is None:  # a spent one-shot
                 task.enabled = False
 
-        self._conn.execute(
+        self._db.execute(
             "INSERT OR REPLACE INTO task_runs (id, task_id, started_at, duration_ms, status, "
             "output, tools, notified) VALUES (?,?,?,?,?,?,?,?)",
             (
@@ -255,13 +247,13 @@ class TaskStore:
             sql += " WHERE task_id = ?"
             params = (task_id,)
         sql += " ORDER BY started_at DESC LIMIT ?"
-        return [dict(row) for row in self._conn.execute(sql, (*params, limit))]
+        return [dict(row) for row in self._db.query(sql, (*params, limit))]
 
     def __len__(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"])
+        return int(self._db.scalar("SELECT COUNT(*) FROM tasks", default=0))
 
     def close(self) -> None:
-        self._conn.close()
+        self._db.close()
 
 
 def _from_row(row: sqlite3.Row) -> Task:

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -107,6 +108,23 @@ DENY_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 _COMPILED = tuple((re.compile(pattern, re.IGNORECASE), reason) for pattern, reason in DENY_PATTERNS)
+
+
+@lru_cache(maxsize=32)
+def _compiled_extra(patterns: tuple[tuple[str, str], ...]) -> tuple[tuple[re.Pattern[str], str], ...]:
+    """Compile caller-supplied deny patterns once, not once per tool call.
+
+    A bad pattern is dropped with its reason rather than raising: a typo in one
+    extra rule must not take the whole gate down, since a gate that raises is a
+    gate that is not gating.
+    """
+    compiled = []
+    for pattern, reason in patterns:
+        try:
+            compiled.append((re.compile(pattern, re.IGNORECASE), reason))
+        except re.error:
+            continue
+    return tuple(compiled)
 
 
 @dataclass
@@ -222,7 +240,7 @@ class Policy:
         )
         if not blob.strip():
             return None
-        for pattern, reason in (*_COMPILED, *(( re.compile(p, re.I), r) for p, r in self.extra_deny)):
+        for pattern, reason in (*_COMPILED, *_compiled_extra(self.extra_deny)):
             if pattern.search(blob):
                 return reason
         return None
