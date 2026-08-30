@@ -45,6 +45,7 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
     from ..integrations.discord import DiscordBridge, DiscordClient, DiscordSink
     from ..tools import Mode
     from .autonomous import Autonomous
+    from ..integrations.apis import builtin_status
     from ..tools.vision import pillow_available
     from ..tools.websearch import available_backend
     from .messages import MESSAGES_PAGE, MessageLog
@@ -61,8 +62,20 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
             home=root, mode=Mode(mode) if mode else None, confirm=confirm
         )
     )
+    # Lazily-built subsystems, and the lock that guards building them.
+    #
+    # RLock, not Lock, and that is not a detail: `autonomous()` needs the task
+    # store and the sink, which are lazily built the same way. With a plain
+    # Lock the first request to reach it deadlocked against itself — and
+    # because the thread died holding the lock, every later request that
+    # touched any other subsystem (`/api/status` among them) blocked forever.
+    # The page sat on "connecting…" while chat and the event stream, which
+    # never take this lock, carried on working perfectly.
+    #
+    # Each accessor below also resolves its dependencies *before* taking the
+    # lock, so the reentrancy is a safety net rather than the mechanism.
     holder: dict[str, Any] = {}
-    holder_lock = threading.Lock()
+    holder_lock = threading.RLock()
 
     def tasks() -> Any:
         with holder_lock:
@@ -105,13 +118,14 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
             return holder["sink"]
 
     def autonomous() -> Autonomous:
+        if "autonomous" in holder:
+            return holder["autonomous"]
+        # Built before the lock is taken, not inside it.
+        store, notices, brain = tasks(), sink(), session.agent.brain
         with holder_lock:
             if "autonomous" not in holder:
                 holder["autonomous"] = Autonomous(
-                    session,
-                    tasks(),
-                    sink=sink(),
-                    gate=NoticeGate(brain=session.agent.brain),
+                    session, store, sink=notices, gate=NoticeGate(brain=brain)
                 )
             return holder["autonomous"]
 
@@ -304,20 +318,30 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     @app.get("/api/status")
     def status():
+        """Everything the header and the panels need, in one poll.
+
+        Every section is computed behind :func:`_safe`, so a subsystem that is
+        broken costs its own field and nothing else. Before, one raising call
+        took the whole endpoint down — and with it the header, the tier chips,
+        the tool list and the task panel, none of which had anything to do with
+        whatever failed.
+        """
         agent = session.agent
-        brain = agent.brain.describe()
+        problems: dict[str, str] = {}
+        brain = _safe(problems, "brain", agent.brain.describe, {})
+
         return jsonify(
             {
                 "home": str(root),
                 "busy": session.busy,
                 "current": session.current,
                 "queued": session.queued_messages(),
-                "policy": agent.toolbox.policy.describe(),
+                "policy": _safe(problems, "policy", lambda: agent.toolbox.policy.describe(), {}),
                 "auto_allowed": sorted(session.auto_allow),
-                "tools": [
+                "tools": _safe(problems, "tools", lambda: [
                     {"name": t.name, "risk": t.risk.value, "description": t.description}
                     for t in agent.toolbox.registry.all()
-                ],
+                ], []),
                 "tiers": {
                     tier: {
                         "label": info["label"],
@@ -331,28 +355,42 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                             None,
                         ),
                     }
-                    for tier, info in brain["tiers"].items()
+                    for tier, info in (brain.get("tiers") or {}).items()
                 },
-                "local": brain["local"],
-                "memory": agent.memory.stats() if agent.memory is not None else {},
-                "apis": agent.toolbox.catalog.describe() if agent.toolbox.catalog else [],
-                "tasks": [t.as_dict() for t in tasks().all()],
+                "local": brain.get("local"),
+                "memory": _safe(problems, "memory", lambda: (
+                    agent.memory.stats() if agent.memory is not None else {}
+                ), {}),
+                "apis": _safe(problems, "apis", lambda: (
+                    agent.toolbox.catalog.describe(agent.toolbox.env)
+                    if agent.toolbox.catalog else []
+                ), []),
+                "tasks": _safe(problems, "tasks", lambda: [t.as_dict() for t in tasks().all()], []),
                 "autonomous": holder["autonomous"].status() if "autonomous" in holder
                               else {"running": False},
                 "turns": len(agent.conversation),
                 "usage": brain.get("usage", {}),
-                "unread": messages().unread_count(),
-                "discord": (
-                    {"configured": False}
-                    if discord() is None
+                "unread": _safe(problems, "messages", lambda: messages().unread_count(), 0),
+                "discord": _safe(problems, "discord", lambda: (
+                    {"configured": False} if discord() is None
                     else {"configured": True, **discord().status()}
-                ),
-                "budget": agent.guard.as_dict(),
-                "feasibility": agent.feasibility.as_dict()
-                if agent.feasibility is not None
-                else {},
-                "search_backend": available_backend(),
-                "vision": {"pillow": pillow_available()},
+                ), {"configured": False}),
+                "budget": _safe(problems, "budget", lambda: agent.guard.as_dict(), {}),
+                "feasibility": _safe(problems, "feasibility", lambda: (
+                    agent.feasibility.as_dict() if agent.feasibility is not None else {}
+                ), {}),
+                # The catalog only holds APIs whose key is present, so on its
+                # own it cannot show what you could switch on. This is the
+                # other half: every built-in, configured or not, with the
+                # variable that would enable it.
+                "services": _safe(problems, "services", lambda: builtin_status(
+                    agent.toolbox.env
+                ), []),
+                "search_backend": _safe(problems, "search", available_backend, "unknown"),
+                "vision": {"pillow": _safe(problems, "vision", pillow_available, False)},
+                # Named rather than swallowed: a panel that is quietly empty
+                # because something threw is worse than one that says so.
+                "problems": problems,
             }
         )
 
@@ -447,6 +485,19 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         return fail(f"unknown action {action!r}", 404)
 
     return app
+
+
+def _safe(problems: dict[str, str], name: str, fn: Any, fallback: Any) -> Any:
+    """Run ``fn``, or record why it could not be run and return ``fallback``.
+
+    The status endpoint is polled every fifteen seconds and feeds the whole
+    interface. One subsystem raising must not blank the other nine.
+    """
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 - reporting is the point
+        problems[name] = f"{type(exc).__name__}: {exc}"[:200]
+        return fallback
 
 
 def _record_dict(record: Any) -> dict[str, Any]:
