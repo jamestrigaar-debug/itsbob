@@ -19,21 +19,31 @@ __all__ = ["Tier", "GateDecision"]
 class Tier(str, Enum):
     """Cheapest first. Ordering matters for display and for escalation."""
 
-    D = "D"  #: Direct Script — deterministic, no LLM at all
-    C = "C"  #: Local Back Brain — small local model
-    B = "B"  #: Standard Cloud — cheap API (Groq / Gemini Flash / OpenRouter free)
-    A = "A"  #: Premium Cloud — expensive, high-stakes API
-    S = "S"  #: Critical Fallback — halt and ask the human
+    D = "D"  #: Direct — a registered routine, no model at all
+    C = "C"  #: Cheapest — the local model if one is running, else the cheapest cloud one
+    B = "B"  #: Standard — the everyday workhorse
+    A = "A"  #: Premium — judgement, ambiguity, anything hard to undo
+    S = "S"  #: Halt — nothing could answer; a person has to
 
     @property
     def label(self) -> str:
+        # Named for what the tier *is*, not for where it runs: Tier C prefers a
+        # local model but falls back to the cheapest cloud one, and labelling
+        # that "Local Back Brain" in `doctor` output claims something untrue.
         return {
-            Tier.D: "Direct Script",
-            Tier.C: "Local Back Brain",
-            Tier.B: "Standard Cloud",
-            Tier.A: "Premium Cloud",
-            Tier.S: "Critical Fallback",
+            Tier.D: "Direct routine",
+            Tier.C: "Cheapest model",
+            Tier.B: "Standard model",
+            Tier.A: "Premium model",
+            Tier.S: "Halt — ask a person",
         }[self]
+
+    @property
+    def rank(self) -> int:
+        """Cost/capability order, cheapest first. S sits above A: reaching it
+        means nothing else could answer, which is the most expensive outcome
+        there is — a person now has to."""
+        return {Tier.D: 0, Tier.C: 1, Tier.B: 2, Tier.A: 3, Tier.S: 4}[self]
 
     @property
     def uses_llm(self) -> bool:

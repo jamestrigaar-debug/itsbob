@@ -1,60 +1,47 @@
-"""itsbob — a tick-based character simulation with a metered LLM habit.
+"""itsbob — a memory-backed assistant with a tiered LLM router.
 
-A character with two memory banks, a finite pool of energy, and access to free
-LLMs it must pay for out of that pool.
+    from itsbob import build_agent
 
-    from itsbob import build_simulation
+    bob = build_agent()
+    print(bob.chat("what did I say about the deploy?").final)
 
-    sim = build_simulation(seed=7)
-    for report in sim.stream(20):
-        print(report.line())
-    sim.finish()
+Four subsystems, each usable on its own:
 
-The pieces are independent: :mod:`itsbob.llm` is a usable failover router on its
-own, and :mod:`itsbob.memory` a usable memory store on its own.
+* :mod:`itsbob.memory` — hybrid lexical + semantic recall over SQLite.
+* :mod:`itsbob.tools` — an allow-list registry and the policy that gates it.
+* :mod:`itsbob.agent` — the loop, and the tier ladder it routes each step to.
+* :mod:`itsbob.daemon` — scheduled tasks, and the gate on interrupting you.
+
+:mod:`itsbob.character` and :mod:`itsbob.engine` are the original tick-based
+simulation this project grew out of. They still run (``itsbob run``) and share
+the LLM layer, but nothing in the assistant depends on them.
 """
 
-from .character.actions import Action, ActionRegistry, ActionResult, default_registry
-from .character.decisions import (
-    Decision,
-    HeuristicPolicy,
-    HybridPolicy,
-    LLMPolicy,
-    build_policy,
-)
-from .character.energy import EnergyLedger, InsufficientEnergy, TokenCostModel
-from .character.state import Character, Needs, Traits
+from .agent import Agent, AgentEvent, Persona, TieredBrain, Turn, build_agent, build_brain
 from .config import EnergySettings, MemorySettings, ProviderConfig, Settings, load_dotenv
-from .engine.events import Event, EventBus
-from .engine.simulation import Simulation, TickReport
-from .engine.world import World
-from .factory import build_character, build_router, build_simulation
+from .daemon import Daemon, Task, TaskStore, build_daemon, parse_schedule
 from .llm.base import LLMRequest, LLMResponse, Message, Usage
+from .llm.embeddings import EmbeddingRouter, default_embedder
 from .llm.router import LLMRouter, UsageTracker
 from .memory.bank import MemoryBank
 from .memory.base import MemoryKind, MemoryRecord
-from .memory.long_term import LongTermMemory
+from .memory.long_term import LongTermMemory, RecallHit
 from .memory.short_term import ShortTermMemory
-from .router import ComplexityRouter, RouteResult, ScriptRegistry, Tier, build_complexity_router
-from .router import default_registry as default_script_registry
+from .router.gatekeeper import Gatekeeper
+from .router.ingestion import Snapshot, compress
+from .router.tiers import GateDecision, Tier
+from .tools import Mode, Policy, Tool, ToolRegistry, ToolResult, Toolbox, build_toolbox
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
-    "Action",
-    "ActionRegistry",
-    "ActionResult",
-    "Character",
-    "ComplexityRouter",
-    "Decision",
-    "EnergyLedger",
+    "Agent",
+    "AgentEvent",
+    "Daemon",
+    "EmbeddingRouter",
     "EnergySettings",
-    "Event",
-    "EventBus",
-    "HeuristicPolicy",
-    "HybridPolicy",
-    "InsufficientEnergy",
-    "LLMPolicy",
+    "GateDecision",
+    "Gatekeeper",
     "LLMRequest",
     "LLMResponse",
     "LLMRouter",
@@ -64,27 +51,64 @@ __all__ = [
     "MemoryRecord",
     "MemorySettings",
     "Message",
-    "Needs",
+    "Mode",
+    "Persona",
+    "Policy",
     "ProviderConfig",
-    "RouteResult",
-    "ScriptRegistry",
+    "RecallHit",
     "Settings",
     "ShortTermMemory",
-    "Simulation",
+    "Snapshot",
+    "Task",
+    "TaskStore",
     "Tier",
-    "TickReport",
-    "TokenCostModel",
-    "Traits",
+    "TieredBrain",
+    "Tool",
+    "ToolRegistry",
+    "ToolResult",
+    "Toolbox",
+    "Turn",
     "Usage",
     "UsageTracker",
-    "World",
     "__version__",
-    "build_character",
-    "build_complexity_router",
-    "build_policy",
-    "build_router",
-    "build_simulation",
-    "default_registry",
-    "default_script_registry",
+    "build_agent",
+    "build_brain",
+    "build_daemon",
+    "build_toolbox",
+    "compress",
+    "default_embedder",
     "load_dotenv",
+    "parse_schedule",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily expose the character simulation.
+
+    Importing it eagerly pulled the whole tick engine into every ``import
+    itsbob``, including the daemon's, for a subsystem most callers never touch.
+    """
+    _simulation = {
+        "Action": ("character.actions", "Action"),
+        "ActionRegistry": ("character.actions", "ActionRegistry"),
+        "Character": ("character.state", "Character"),
+        "Decision": ("character.decisions", "Decision"),
+        "EnergyLedger": ("character.energy", "EnergyLedger"),
+        "HeuristicPolicy": ("character.decisions", "HeuristicPolicy"),
+        "HybridPolicy": ("character.decisions", "HybridPolicy"),
+        "LLMPolicy": ("character.decisions", "LLMPolicy"),
+        "Needs": ("character.state", "Needs"),
+        "Simulation": ("engine.simulation", "Simulation"),
+        "TickReport": ("engine.simulation", "TickReport"),
+        "Traits": ("character.state", "Traits"),
+        "World": ("engine.world", "World"),
+        "build_character": ("factory", "build_character"),
+        "build_router": ("factory", "build_router"),
+        "build_simulation": ("factory", "build_simulation"),
+    }
+    if name in _simulation:
+        import importlib
+
+        module, attribute = _simulation[name]
+        return getattr(importlib.import_module(f".{module}", __name__), attribute)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

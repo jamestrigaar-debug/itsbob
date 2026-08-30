@@ -50,6 +50,7 @@ class MemoryBank:
         short_term: ShortTermMemory | None = None,
         long_term: LongTermMemory | None = None,
         router: "LLMRouter | None" = None,
+        embedder: object | None = None,
     ) -> None:
         self.settings = settings or MemorySettings()
         self.short_term = short_term or ShortTermMemory(
@@ -57,7 +58,12 @@ class MemoryBank:
             decay_rate=self.settings.short_term_decay,
             salience_floor=self.settings.salience_floor,
         )
-        self.long_term = long_term or LongTermMemory(self.settings.database)
+        # No embedder means lexical-only recall — the historical behaviour,
+        # and still the right default for the tick simulation, which writes
+        # hundreds of low-value observations that aren't worth an API call.
+        self.long_term = long_term or LongTermMemory(
+            self.settings.database, embedder=embedder
+        )
         self.router = router
         self._last_reflection_tick = 0
 

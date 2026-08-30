@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "itsbob"
-version = "0.2.0"
-description = "A complexity-based hierarchical LLM router (Classify First, Execute Cheapest, Fallback Gracefully) with an energy-metered character simulation built on it."
+version = "0.3.0"
+description = "A memory-backed personal assistant: hybrid recall, gated tool use, a cheap-to-premium model ladder, and a task daemon."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,6 +18,11 @@ dependencies = [
 langchain = ["langchain>=0.3", "langchain-openai>=0.2"]
 gui = ["flask>=3.0"]
 dev = ["pytest>=8.0"]
+# Optional accelerator. Recall works without it by scanning the most recent
+# `vector_scan_limit` vectors in pure Python; with numpy the whole table is
+# compared in one matrix multiply, which matters past a few thousand memories.
+speed = ["numpy>=1.24"]
+all = ["flask>=3.0", "numpy>=1.24"]
 
 [project.scripts]
 itsbob = "itsbob.cli:main"

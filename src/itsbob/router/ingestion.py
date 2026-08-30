@@ -1,8 +1,16 @@
-"""Step 1 of the pipeline: Ingestion & Compression.
+"""Step 1: ingestion and compression.
 
-Truncates raw scraped state to the most recent N events so it fits the local
-model's tiny context window, and renders it into the compact text block both
-the Gatekeeper and the cloud prompts are built from.
+Whatever arrives — a typed message, a scraped state dict, a scheduled task's
+payload — becomes a :class:`Snapshot`: some free text, some flat facts, and a
+bounded event log. Everything downstream (the classifier, the cache
+fingerprint, the prompts) reads that one shape, so adding an input source is a
+converter rather than a new code path.
+
+The event window exists because the classifier runs on the cheapest model
+available, whose context is small and whose accuracy falls off a cliff when
+you fill it. Keeping the most recent N events is a better trade than keeping a
+uniform sample of all of them: what just happened is what the decision is
+about.
 """
 
 from __future__ import annotations
@@ -11,52 +19,82 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-__all__ = ["GameState", "compress"]
+__all__ = ["Snapshot", "GameState", "compress", "DEFAULT_EVENT_WINDOW"]
 
-#: "truncates this to the most recent 20 events" — the spec's number.
+#: How many trailing events survive compression.
 DEFAULT_EVENT_WINDOW = 20
 
 
 @dataclass
-class GameState:
-    """One ingested, compressed snapshot ready to classify or route.
+class Snapshot:
+    """One ingested, compressed input ready to classify or route.
 
-    ``facts`` is the flat scalar state (score, minute, formation, morale, ...);
-    ``events`` is the event log, already truncated to the window.
+    ``text`` is what a person actually said, when there was one. ``facts`` is
+    flat scalar state; ``events`` is a log, already truncated to the window.
     """
 
+    text: str = ""
     facts: dict[str, Any] = field(default_factory=dict)
     events: list[Any] = field(default_factory=list)
 
-    def render(self) -> str:
-        """Compact single block, cheap on tokens for both local and cloud prompts."""
-        lines = [f"{k}={v}" for k, v in self.facts.items()]
-        block = "; ".join(lines)
+    def render(self, *, max_chars: int = 4000) -> str:
+        """Compact block, cheap on tokens for both local and cloud prompts."""
+        blocks: list[str] = []
+        if self.text.strip():
+            blocks.append(self.text.strip())
+        if self.facts:
+            blocks.append("; ".join(f"{k}={v}" for k, v in self.facts.items()))
         if self.events:
-            tail = " | ".join(_event_text(e) for e in self.events)
-            block = f"{block}\nrecent events: {tail}" if block else f"recent events: {tail}"
-        return block or "(empty state)"
+            blocks.append("recent: " + " | ".join(_event_text(e) for e in self.events))
+        rendered = "\n".join(blocks) or "(empty)"
+        if len(rendered) > max_chars:
+            half = max_chars // 2
+            rendered = f"{rendered[:half]}\n…\n{rendered[-half:]}"
+        return rendered
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.text.strip() or self.facts or self.events)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"facts": self.facts, "events": self.events}
+        return {"text": self.text, "facts": self.facts, "events": self.events}
+
+
+#: The router's original name for this type, kept so existing callers still
+#: import cleanly. It was never game-specific in structure, only in naming.
+GameState = Snapshot
 
 
 def compress(
-    raw: Mapping[str, Any] | str,
+    raw: Mapping[str, Any] | str | None,
     *,
     event_window: int = DEFAULT_EVENT_WINDOW,
-) -> GameState:
-    """Parse + truncate raw scraper output into a :class:`GameState`.
+) -> Snapshot:
+    """Parse and truncate any supported input into a :class:`Snapshot`.
 
-    Accepts either a dict already shaped like ``{"facts": ..., "events": [...]}``,
-    a flat dict of scalars (treated entirely as facts, no events), or a raw
-    JSON string of either. Truncation always keeps the *most recent* events —
-    the tail of the list, not the head.
+    Accepts a plain string (becomes ``text``), a dict shaped like
+    ``{"text"/"message", "facts", "events"}``, a flat dict of scalars (all
+    facts), or a JSON string of either. A string that happens to parse as JSON
+    is treated as structure; one that does not is treated as what someone
+    typed, which is the common case and must never raise.
     """
-    if isinstance(raw, str):
-        raw = json.loads(raw) if raw.strip() else {}
+    if raw is None:
+        return Snapshot()
 
-    if "facts" in raw or "events" in raw:
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return Snapshot()
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return Snapshot(text=stripped)
+        if not isinstance(parsed, Mapping):
+            return Snapshot(text=stripped)
+        raw = parsed
+
+    text = str(raw.get("text") or raw.get("message") or "")
+    if "facts" in raw or "events" in raw or text:
         facts = dict(raw.get("facts") or {})
         events: Sequence[Any] = raw.get("events") or []
     else:
@@ -64,7 +102,7 @@ def compress(
         events = raw.get("events", []) if isinstance(raw.get("events"), list) else []
 
     truncated = list(events)[-event_window:] if event_window > 0 else list(events)
-    return GameState(facts=facts, events=truncated)
+    return Snapshot(text=text, facts=facts, events=truncated)
 
 
 def _event_text(event: Any) -> str:

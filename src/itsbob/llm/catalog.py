@@ -67,15 +67,19 @@ GROQ = ProviderConfig(
 
 # Gemini exposes an OpenAI-compatible shim at /v1beta/openai/, so it needs no
 # special-case client. Flash-class models are the free-tier workhorses.
+# Verified against the live /v1beta/models listing rather than recalled: the
+# previous defaults here (gemini-2.0-flash, gemini-2.5-flash) both 404 with
+# "no longer available", which is the failure mode this whole file exists to
+# absorb. Re-check with `itsbob models --probe` when they start 404ing too.
 GOOGLE = ProviderConfig(
     name="google",
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     api_key_env="GOOGLE_API_KEY",
-    default_model="gemini-3.6-flash",
+    default_model="gemini-3.5-flash",
     fallback_models=(
+        "gemini-3.6-flash",
         "gemini-3.1-flash-lite",
         "gemini-flash-latest",
-        "gemini-2.0-flash",
     ),
     requests_per_minute=15,
     rate_limit_scope="model",
