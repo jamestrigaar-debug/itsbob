@@ -118,6 +118,15 @@ class Gatekeeper:
                     f" but named no valid script ({script!r})" if script
                     else " but named no script"
                 )
+        if latency_ms > self.max_local_latency_ms:
+            # A soft budget, surfaced rather than enforced: aborting a slow
+            # but *successful* local call would just throw away a working
+            # answer over a target latency (<800ms) that assumes a
+            # quantized model on capable hardware — plain CPU inference on
+            # a modest laptop can legitimately take several seconds. This
+            # makes that visible in the trace instead of pretending it
+            # isn't happening.
+            reasoning += f" (took {latency_ms:.0f}ms, over the {self.max_local_latency_ms:.0f}ms target)"
 
         return GateDecision(
             tier=GATEKEEPER_TAGS[tag],

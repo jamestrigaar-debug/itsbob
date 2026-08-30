@@ -14,6 +14,7 @@ and ask the human.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -79,6 +80,42 @@ class RouteResult:
             "model": self.model,
             "error": self.error,
         }
+
+
+class _CallTimedOut(Exception):
+    """Raised by :func:`_call_with_timeout` when the deadline passes."""
+
+
+def _call_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
+    """Run ``fn`` on a daemon thread; raise :class:`_CallTimedOut` if it
+    hasn't finished within ``timeout`` seconds.
+
+    Deliberately a plain daemon :class:`threading.Thread`, not
+    :class:`concurrent.futures.ThreadPoolExecutor` — an executor's worker
+    threads are *not* daemons, so an abandoned call left running past its
+    timeout would make the Python interpreter's own exit hook block on it
+    (up to the provider's full network timeout, tens of seconds) the next
+    time the process tries to shut down. A daemon thread carries no such
+    obligation: the interpreter exits without waiting for it, matching
+    Phase 2's "the system does not wait" for the caller *and* for the
+    process as a whole.
+    """
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise _CallTimedOut(f"call did not finish within {timeout}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 class ComplexityRouter:
@@ -214,15 +251,22 @@ class ComplexityRouter:
             temperature=0.4,
         )
 
-        deadline = time.monotonic() + self.cloud_timeout_seconds
         try:
-            payload, response = router.complete_json(request, purpose=f"route.{decision.tier.value.lower()}")
+            payload, response = _call_with_timeout(
+                lambda: router.complete_json(request, purpose=f"route.{decision.tier.value.lower()}"),
+                timeout=self.cloud_timeout_seconds,
+            )
+        except _CallTimedOut:
+            # Phase 2's Timeout monitor, enforced for real: the caller gets
+            # control back at cloud_timeout_seconds regardless of how long
+            # the vendor actually takes to answer — "the system does not
+            # wait" — rather than blocking for the full round trip and only
+            # discarding it as late afterwards. The call keeps running on its
+            # daemon thread; its eventual result (success or error) is never
+            # awaited or acted on.
+            return self._escalate_to_local(state, decision, reason="cloud response exceeded timeout")
         except (AllProvidersFailed, ValueError) as exc:
             return self._escalate_to_local(state, decision, reason=str(exc))
-        if time.monotonic() > deadline:
-            # Answered, but too slowly to trust for a live decision — same
-            # downgrade path as an outright failure (Phase 2's Timeout monitor).
-            return self._escalate_to_local(state, decision, reason="cloud response exceeded timeout")
 
         actions = [a for a in payload.get("actions", []) if self.registry.has(a)]
         unknown = [a for a in payload.get("actions", []) if not self.registry.has(a)]

@@ -33,7 +33,8 @@ __all__ = [
 
 
 def default_ollama_config(env: Mapping[str, str] | None = None) -> ProviderConfig:
-    """The Back Brain's config, with ``ITSBOB_OLLAMA_URL`` / ``ITSBOB_OLLAMA_MODEL`` applied.
+    """The Back Brain's config, with ``ITSBOB_OLLAMA_URL`` / ``ITSBOB_OLLAMA_MODEL`` /
+    ``ITSBOB_OLLAMA_TIMEOUT`` applied.
 
     Mirrors how ``llm/catalog.py`` handles cloud model overrides: an env
     override is promoted to the default and the old default slides into the
@@ -49,6 +50,12 @@ def default_ollama_config(env: Mapping[str, str] | None = None) -> ProviderConfi
         fallbacks = (default_model, *fallbacks)
         default_model = model_override
 
+    timeout_raw = env.get("ITSBOB_OLLAMA_TIMEOUT", "").strip()
+    try:
+        timeout = float(timeout_raw) if timeout_raw else 20.0
+    except ValueError:
+        timeout = 20.0
+
     return ProviderConfig(
         name="ollama",
         base_url=base_url,
@@ -56,7 +63,15 @@ def default_ollama_config(env: Mapping[str, str] | None = None) -> ProviderConfi
         default_model=default_model,
         fallback_models=fallbacks,
         requests_per_minute=10_000,  # local, no vendor quota
-        timeout=5.0,  # Tier C must stay under ~800ms; don't let a hung server block the pipeline
+        # The spec's <800ms figure assumes a quantized 1.5-3B model with
+        # reasonable CPU/GPU throughput; plain CPU inference on a modest
+        # laptop can genuinely take several seconds per call. 20s gives that
+        # real-world range headroom without hanging forever on a truly dead
+        # server — is_ollama_running()'s own liveness probe (0.5s) is what
+        # actually detects "nothing is there" quickly. Lower via
+        # ITSBOB_OLLAMA_TIMEOUT if your hardware is fast and you'd rather
+        # fail over to the heuristic classifier sooner.
+        timeout=timeout,
     )
 
 
