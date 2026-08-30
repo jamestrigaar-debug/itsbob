@@ -43,6 +43,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interactive
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except json.JSONDecodeError as exc:
+        state_arg = getattr(args, "state", None)
+        print(f"error: '{state_arg}' is not valid JSON ({exc})", file=sys.stderr)
+        print(
+            "  hint: pass a real JSON object, e.g. "
+            '\'{"facts": {"stamina": 15, "minute": 60}}\', or @path/to/file.json '
+            "for a file. The README's `'...'` in an example command is a placeholder, "
+            "not something to paste literally.",
+            file=sys.stderr,
+        )
+        return 2
 
 
 def _build_parser() -> argparse.ArgumentParser:

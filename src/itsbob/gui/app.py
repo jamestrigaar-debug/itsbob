@@ -1,13 +1,16 @@
-"""A small browser GUI over the complexity router.
+"""A chat + live "thinking" monitor GUI over the complexity router.
 
-One page: paste (or generate an example) game state, hit Route, and see the
-tier badge, the Gatekeeper's reasoning and fingerprint, whether the semantic
-cache served it, which scripts ran, and the end-to-end latency against the
-1.8s budget. A status strip along the top shows every provider `itsbob
-doctor` would report, including the local Back Brain, refreshed on load.
+Left: a chat box — type a game state (JSON, or plain text — plain text is
+wrapped into `{"facts": {"message": "..."}}` automatically) and see itsbob's
+reply. Right: a running feed of what the pipeline actually did for each
+message — which tier answered, the Gatekeeper's reasoning and fingerprint,
+cache hit/miss, which provider/model got called, any escalation, which
+scripts ran, and latency against the 1.8s budget. That right-hand feed is
+the "monitor" — it's meant to answer "why did it do that" and "which model
+is it actually calling" without reading logs.
 
 Deliberately a single Flask file with the page template inlined as a string
-— there is exactly one route worth having a GUI for, so a build step or a
+— there is exactly one page worth having a GUI for, so a build step or a
 frontend framework would be pure overhead. Flask is an optional dependency
 (the `gui` extra); everything else in this package works without it.
 """
@@ -15,11 +18,10 @@ frontend framework would be pure overhead. Flask is an optional dependency
 from __future__ import annotations
 
 import json
+import os
 import threading
 import webbrowser
 from typing import Any
-
-import os
 
 from ..config import Settings
 from ..factory import build_router
@@ -28,20 +30,23 @@ from ..router import build_complexity_router
 
 __all__ = ["create_app", "run_gui"]
 
-EXAMPLE_STATE = {
-    "facts": {
-        "score": "1-0",
-        "minute": 78,
-        "opponent_formation": "4-4-2",
-        "morale": "low",
-        "stamina": 34,
-    },
-    "events": [
-        "68' Yellow card - opponent midfielder",
-        "74' Corner won",
-        "77' Substitution - opponent brings on fresh striker",
-    ],
-}
+EXAMPLE_MESSAGES = [
+    '{"facts": {"stamina": 15, "minute": 60}}',
+    '{"facts": {"opponent_formation": "4-3-3", "minute": 78}, "events": ["opponent playing narrow tactic"]}',
+    '{"facts": {"player": "star striker"}, "events": ["player unhappy about contract renegotiation"]}',
+]
+
+
+def _as_game_state_json(raw_text: str) -> str:
+    """Accept plain text as well as JSON: wrap non-JSON input as a fact."""
+    stripped = raw_text.strip()
+    if not stripped:
+        return "{}"
+    try:
+        json.loads(stripped)
+        return stripped
+    except json.JSONDecodeError:
+        return json.dumps({"facts": {"message": stripped}})
 
 
 def create_app():
@@ -65,7 +70,11 @@ def create_app():
 
     @app.get("/")
     def index():
-        return render_template_string(_PAGE, example=json.dumps(EXAMPLE_STATE, indent=2))
+        return render_template_string(_PAGE, examples=json.dumps(EXAMPLE_MESSAGES))
+
+    @app.get("/favicon.ico")
+    def favicon():
+        return "", 204
 
     @app.get("/api/status")
     def status():
@@ -105,6 +114,57 @@ def create_app():
             }
         )
 
+    @app.post("/api/chat")
+    def chat():
+        """One turn: freeform or JSON input in, a chat reply + full trace out."""
+        payload = request.get_json(force=True, silent=True) or {}
+        raw_text = str(payload.get("message", ""))
+        goal = payload.get("goal") or "win the league"
+        classify_only = bool(payload.get("classify_only"))
+
+        state_json = _as_game_state_json(raw_text)
+        try:
+            parsed = json.loads(state_json)
+        except json.JSONDecodeError as exc:
+            return jsonify({"error": f"invalid JSON: {exc}"}), 400
+
+        router = get_router()
+        router.goal = goal
+
+        if classify_only:
+            from ..router import compress
+
+            decision = router.gatekeeper.classify(compress(parsed))
+            trace = {"classify_only": True, "decision": decision.as_dict()}
+            reply = (
+                f"[classify only] Tier {decision.tier.value} ({decision.tier.label}) — "
+                f"{decision.reasoning}"
+            )
+            return jsonify({"reply": reply, "trace": trace})
+
+        try:
+            result = router.route(parsed)
+        except Exception as exc:  # noqa: BLE001 - surface it in chat, don't 500 blindly
+            return jsonify(
+                {
+                    "reply": f"Pipeline error: {type(exc).__name__}: {exc}",
+                    "trace": {"error": str(exc)},
+                }
+            )
+
+        trace = result.as_dict()
+        trace["cache_stats"] = router.cache.stats()
+
+        if result.needs_user:
+            reply = f"⚠ {result.note} ({result.error})"
+        elif result.actions:
+            reply = f"{result.note}".strip() or f"Ran: {', '.join(result.actions)}"
+        else:
+            reply = result.note or "(no action taken)"
+
+        return jsonify({"reply": reply, "trace": trace})
+
+    # Kept for scripting/curl use and backward compatibility with earlier GUI versions.
     @app.post("/api/route")
     def route():
         payload = request.get_json(force=True, silent=True) or {}
@@ -121,7 +181,7 @@ def create_app():
         router.goal = goal
         try:
             result = router.route(parsed)
-        except Exception as exc:  # noqa: BLE001 - surface it to the user, don't 500 blindly
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
         payload = result.as_dict()
         payload["cache_stats"] = router.cache.stats()
@@ -168,69 +228,94 @@ _PAGE = """
     --bg: #f7f7f5; --panel: #ffffff; --border: #e3e1db; --text: #1c1c1a;
     --muted: #6b6b63; --accent: #2f6f4f;
     --tier-d: #6b6b63; --tier-c: #2f6f4f; --tier-b: #1d6fa8; --tier-a: #a8631d; --tier-s: #a82f2f;
+    --bubble-user: #eaf1ee; --bubble-bot: #f3f2ee;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { padding: 20px 28px 10px; border-bottom: 1px solid var(--border); }
-  header h1 { margin: 0 0 4px; font-size: 20px; }
-  header p { margin: 0; color: var(--muted); font-size: 13px; }
-  main { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 24px 28px; max-width: 1200px; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  section.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
-  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
-  textarea { width: 100%; min-height: 220px; font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 12.5px; padding: 10px; border-radius: 8px; border: 1px solid var(--border); resize: vertical; }
-  input[type=text] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; }
-  label { font-size: 12px; color: var(--muted); display: block; margin: 10px 0 4px; }
-  .row { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
-  button { cursor: pointer; border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 600; }
-  button.primary { background: var(--accent); color: white; }
-  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
-    font-weight: 700; font-size: 13px; color: white; }
-  .badge.D { background: var(--tier-d); } .badge.C { background: var(--tier-c); }
-  .badge.B { background: var(--tier-b); } .badge.A { background: var(--tier-a); } .badge.S { background: var(--tier-s); }
-  #result { font-size: 13px; }
-  #result dl { display: grid; grid-template-columns: 120px 1fr; gap: 6px 10px; margin: 12px 0; }
-  #result dt { color: var(--muted); }
-  #result dd { margin: 0; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef0ea; font-size: 11.5px; margin-right: 6px; }
-  .empty { color: var(--muted); font-size: 13px; }
-  #status-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-  .stat { font-size: 11.5px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); }
+  body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; }
+  header { padding: 14px 20px 10px; border-bottom: 1px solid var(--border); flex: none; }
+  header h1 { margin: 0 0 4px; font-size: 18px; }
+  header p { margin: 0; color: var(--muted); font-size: 12.5px; }
+  #status-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .stat { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
   .stat.ok { color: var(--accent); border-color: var(--accent); }
   .stat.down { color: var(--muted); }
-  pre.raw { white-space: pre-wrap; font-size: 11.5px; background: #faf9f6; border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px; max-height: 220px; overflow: auto; }
-  .alert-s { border: 2px solid var(--tier-s); background: #fdf0f0; padding: 12px; border-radius: 8px; margin-top: 10px; }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    gap: 0; overflow: hidden; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } }
+
+  section.chat { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
+  #chat-log { flex: 1; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .bubble { max-width: 82%; padding: 9px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; }
+  .bubble.user { align-self: flex-end; background: var(--bubble-user); border-bottom-right-radius: 3px; }
+  .bubble.bot { align-self: flex-start; background: var(--bubble-bot); border-bottom-left-radius: 3px; }
+  .bubble.bot.tier-S { background: #fdf0f0; border: 1px solid var(--tier-s); }
+  .bubble .meta { display: block; margin-top: 5px; font-size: 10.5px; color: var(--muted); }
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px;
+    font-weight: 700; font-size: 11px; color: white; }
+  .badge.D { background: var(--tier-d); } .badge.C { background: var(--tier-c); }
+  .badge.B { background: var(--tier-b); } .badge.A { background: var(--tier-a); } .badge.S { background: var(--tier-s); }
+
+  #composer { flex: none; border-top: 1px solid var(--border); padding: 10px 14px; display: flex; flex-direction: column; gap: 8px; }
+  #composer .row1 { display: flex; gap: 8px; }
+  #msg { flex: 1; resize: none; height: 46px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    font-size: 13.5px; font-family: inherit; }
+  #composer button { cursor: pointer; border: none; border-radius: 8px; padding: 0 16px; font-size: 13px; font-weight: 600; }
+  #composer .send { background: var(--accent); color: white; }
+  .row2 { display: flex; gap: 14px; align-items: center; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
+  .row2 label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .row2 .examples span { cursor: pointer; text-decoration: underline; margin-right: 10px; }
+
+  section.monitor { display: flex; flex-direction: column; min-width: 0; }
+  section.monitor h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+    margin: 0; padding: 12px 16px 8px; flex: none; border-bottom: 1px solid var(--border); }
+  #trace-log { flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column-reverse; gap: 10px; }
+  .trace { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--panel); font-size: 12px; }
+  .trace.latest { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .trace .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .trace dl { display: grid; grid-template-columns: 84px 1fr; gap: 3px 8px; margin: 0; }
+  .trace dt { color: var(--muted); }
+  .trace dd { margin: 0; word-break: break-word; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; background: #eef0ea; font-size: 10.5px; margin-right: 4px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 16px; }
+  details.raw { margin-top: 6px; }
+  details.raw summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  pre.raw { white-space: pre-wrap; font-size: 10.5px; background: #faf9f6; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; max-height: 160px; overflow: auto; margin: 6px 0 0; }
 </style>
 </head>
 <body>
 <header>
   <h1>itsbob — Complexity-Based Hierarchical Router</h1>
-  <p>Classify First, Execute Cheapest, Fallback Gracefully. Paste a game state, route it, watch which tier answers.</p>
+  <p>Classify First, Execute Cheapest, Fallback Gracefully. Chat on the left; watch what it actually did on the right.</p>
   <div id="status-strip"></div>
 </header>
 <main>
-  <section class="panel">
-    <h2>Game state</h2>
-    <label for="state">Raw scraped state (JSON — flat facts, or {"facts": ..., "events": [...]})</label>
-    <textarea id="state">{{ example }}</textarea>
-    <label for="goal">Overarching goal (appended to cloud-tier prompts)</label>
-    <input id="goal" type="text" value="win the league">
-    <div class="row">
-      <button class="primary" onclick="doRoute()">Route (classify + execute)</button>
-      <button class="ghost" onclick="doClassify()">Classify only</button>
-      <button class="ghost" onclick="loadExample()">Reset example</button>
+  <section class="chat">
+    <div id="chat-log"></div>
+    <div id="composer">
+      <div class="row1">
+        <textarea id="msg" placeholder='Describe a situation, or paste JSON — e.g. {"facts": {"stamina": 15, "minute": 60}}'></textarea>
+        <button class="send" onclick="send()">Send</button>
+      </div>
+      <div class="row2">
+        <label><input type="checkbox" id="classify-only"> classify only (no execution)</label>
+        <span>goal:</span>
+        <input id="goal" type="text" value="win the league" style="flex:0 0 160px; padding:3px 6px; border-radius:6px; border:1px solid var(--border); font-size:11.5px;">
+        <span class="examples" id="examples"></span>
+      </div>
     </div>
   </section>
-  <section class="panel">
-    <h2>Result</h2>
-    <div id="result"><p class="empty">Nothing routed yet.</p></div>
+  <section class="monitor">
+    <h2>Live processing</h2>
+    <div id="trace-log"><p class="empty">Nothing routed yet — send a message to see the Gatekeeper's reasoning, which model gets called, cache hits, and any escalation here.</p></div>
   </section>
 </main>
 <script>
+const examples = {{ examples|safe }};
+
 async function refreshStatus() {
   const el = document.getElementById('status-strip');
   try {
@@ -251,71 +336,113 @@ async function refreshStatus() {
   } catch (e) { el.innerHTML = '<span class="stat down">status unavailable</span>'; }
 }
 
-function loadExample() {
-  document.getElementById('state').value = {{ example|tojson }};
+function renderExamples() {
+  const el = document.getElementById('examples');
+  el.innerHTML = examples.map((ex, i) => `<span onclick="useExample(${i})">example ${i + 1}</span>`).join('');
+}
+function useExample(i) {
+  document.getElementById('msg').value = examples[i];
+}
+
+function addBubble(role, text, tier) {
+  const log = document.getElementById('chat-log');
+  const empty = log.querySelector('.empty');
+  if (empty) empty.remove();
+  const b = document.createElement('div');
+  b.className = 'bubble ' + role + (tier ? ' tier-' + tier : '');
+  b.textContent = text;
+  log.appendChild(b);
+  log.scrollTop = log.scrollHeight;
+  return b;
 }
 
 function tierBadge(tier, label) {
-  return `<span class="badge ${tier}">${tier} · ${label}</span>`;
+  return tier ? `<span class="badge ${tier}">${tier} · ${label || ''}</span>` : '';
 }
 
-function renderResult(data, mode) {
-  const box = document.getElementById('result');
-  if (data.error && mode !== 'route') {
-    box.innerHTML = `<p class="empty">error: ${data.error}</p>`;
+function addTrace(data, mode) {
+  const tlog = document.getElementById('trace-log');
+  const empty = tlog.querySelector('.empty');
+  if (empty) empty.remove();
+  tlog.querySelectorAll('.trace.latest').forEach(el => el.classList.remove('latest'));
+
+  const div = document.createElement('div');
+  div.className = 'trace latest';
+
+  if (data.error && !data.decision) {
+    div.innerHTML = `<div class="head">error</div><dl><dt>message</dt><dd>${data.error}</dd></dl>`;
+    tlog.prepend(div);
     return;
   }
-  if (mode === 'classify') {
-    box.innerHTML = `
-      ${tierBadge(data.tier, data.tier_label)}
-      <dl>
-        <dt>Fingerprint</dt><dd>${data.fingerprint}</dd>
-        <dt>Source</dt><dd>${data.source}</dd>
-        <dt>Latency</dt><dd>${data.latency_ms} ms</dd>
-        <dt>Reasoning</dt><dd>${data.reasoning}</dd>
-      </dl>`;
-    return;
-  }
+
   const d = data.decision || {};
-  const scripts = (data.script_results || []).map(r => `<span class="pill">${r.action}${r.ok ? '' : ' ✗'}</span>`).join(' ') || '<span class="empty">none</span>';
-  const cache = data.cache_hit ? '<span class="pill">cache hit</span>' : '<span class="pill">cache miss</span>';
-  const budget = data.within_budget ? '<span class="pill">within 1.8s budget</span>' : '<span class="pill">⚠ over 1.8s budget</span>';
-  let alertBlock = '';
-  if (data.needs_user) {
-    alertBlock = `<div class="alert-s"><strong>Tier S — manual override required.</strong><br>${data.note}<br><small>${data.error || ''}</small></div>`;
+  const tier = data.tier || (d.tier);
+  const tierLabel = data.tier_label || d.tier_label;
+  let head = tierBadge(tier, tierLabel);
+  if (data.escalated_from) head += ` <span class="pill">escalated from ${data.escalated_from}</span>`;
+  if (data.cache_hit) head += ` <span class="pill">cache hit</span>`;
+  if (data.classify_only) head += ` <span class="pill">classify only</span>`;
+
+  const rows = [];
+  rows.push(`<dt>Fingerprint</dt><dd>${d.fingerprint || ''}</dd>`);
+  rows.push(`<dt>Gatekeeper</dt><dd>${d.source || ''} — ${d.reasoning || ''} (${d.latency_ms ?? 0}ms)</dd>`);
+  if (!data.classify_only) {
+    const scripts = (data.script_results || []).map(r => `<span class="pill">${r.action}${r.ok ? '' : ' ✗'}</span>`).join(' ') || '<span class="empty" style="padding:0;">none</span>';
+    rows.push(`<dt>Actions</dt><dd>${scripts}</dd>`);
+    rows.push(`<dt>Model called</dt><dd>${data.provider ? data.provider + (data.model ? ' / ' + data.model : '') : '— (script/local/none)'}</dd>`);
+    const budget = data.within_budget === false ? ' ⚠ over 1.8s budget' : '';
+    rows.push(`<dt>Latency</dt><dd>${data.total_latency_ms ?? 0}ms${budget}</dd>`);
+    if (data.cache_stats) rows.push(`<dt>Cache</dt><dd>hit rate ${(data.cache_stats.hit_rate * 100).toFixed(0)}% (${data.cache_stats.hits}/${data.cache_stats.hits + data.cache_stats.misses}), size ${data.cache_stats.size}</dd>`);
   }
-  box.innerHTML = `
-    ${tierBadge(data.tier, data.tier_label)} ${data.escalated_from ? `<span class="pill">escalated from ${data.escalated_from}</span>` : ''}
-    ${alertBlock}
-    <dl>
-      <dt>Fingerprint</dt><dd>${d.fingerprint || ''}</dd>
-      <dt>Gatekeeper</dt><dd>${d.source || ''} — ${d.reasoning || ''}</dd>
-      <dt>Actions</dt><dd>${scripts}</dd>
-      <dt>Note</dt><dd>${data.note || ''}</dd>
-      <dt>Cache</dt><dd>${cache} (${JSON.stringify(data.cache_stats || {})})</dd>
-      <dt>Provider</dt><dd>${data.provider || '—'} ${data.model ? '/ ' + data.model : ''}</dd>
-      <dt>Latency</dt><dd>${data.total_latency_ms} ms ${budget}</dd>
-    </dl>
-    <pre class="raw">${JSON.stringify(data, null, 2)}</pre>`;
+
+  div.innerHTML = `<div class="head">${head}</div><dl>${rows.join('')}</dl>
+    <details class="raw"><summary>raw JSON</summary><pre class="raw">${JSON.stringify(data, null, 2)}</pre></details>`;
+  tlog.prepend(div);
 }
 
-async function doRoute() {
-  const state = document.getElementById('state').value;
+async function send() {
+  const msgEl = document.getElementById('msg');
+  const text = msgEl.value.trim();
+  if (!text) return;
   const goal = document.getElementById('goal').value;
-  document.getElementById('result').innerHTML = '<p class="empty">routing…</p>';
-  const r = await fetch('/api/route', { method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ state, goal }) });
-  renderResult(await r.json(), 'route');
+  const classifyOnly = document.getElementById('classify-only').checked;
+
+  addBubble('user', text);
+  msgEl.value = '';
+  const thinking = addBubble('bot', 'thinking…');
+
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message: text, goal, classify_only: classifyOnly })
+    });
+    const data = await r.json();
+    thinking.remove();
+    if (data.error) {
+      addBubble('bot', 'error: ' + data.error);
+      return;
+    }
+    const tier = data.trace && (data.trace.tier || (data.trace.decision && data.trace.decision.tier));
+    const bubble = addBubble('bot', data.reply, tier === 'S' ? 'S' : null);
+    if (data.trace && (data.trace.provider || data.trace.decision)) {
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      const d = data.trace.decision || {};
+      meta.innerHTML = tierBadge(data.trace.tier || d.tier, data.trace.tier_label || d.tier_label);
+      bubble.appendChild(meta);
+    }
+    addTrace(data.trace, classifyOnly ? 'classify' : 'route');
+  } catch (e) {
+    thinking.remove();
+    addBubble('bot', 'request failed: ' + e);
+  }
 }
 
-async function doClassify() {
-  const state = document.getElementById('state').value;
-  document.getElementById('result').innerHTML = '<p class="empty">classifying…</p>';
-  const r = await fetch('/api/classify', { method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ state }) });
-  renderResult(await r.json(), 'classify');
-}
+document.getElementById('msg').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
 
+renderExamples();
 refreshStatus();
 </script>
 </body>

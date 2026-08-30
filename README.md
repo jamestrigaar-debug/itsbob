@@ -157,14 +157,14 @@ tried *after* Google rather than before it, use **google-tiered** mode:
 ```bash
 export ITSBOB_ROUTER_MODE=google-tiered
 itsbob doctor            # now shows Tier B and Tier A as two separate Gemini chains
-itsbob route '...'
+itsbob route '{"facts": {"stamina": 15}}'
 itsbob gui                # the status strip shows the same split
 ```
 
 or per-call, without changing the env:
 
 ```bash
-itsbob route '...' --mode google-tiered
+itsbob route '{"facts": {"stamina": 15}}' --mode google-tiered
 ```
 
 The ladder, in cheapest-to-strongest order:
@@ -254,7 +254,7 @@ itsbob classify '{"facts": {"stamina": 15, "minute": 60}}'
 # Full pipeline: classify, cache-check, route, execute
 itsbob route '{"facts": {"stamina": 15, "minute": 60}}'
 itsbob route @path/to/state.json --goal "win the league"
-itsbob route '...' --mode google-tiered        # Google alone, two Gemini models — see below
+itsbob route '{"facts": {"stamina": 15}}' --mode google-tiered   # Google alone, two Gemini models — see below
 
 # The GUI
 itsbob gui                                     # http://127.0.0.1:8765, opens a browser tab
@@ -268,27 +268,46 @@ pip install -e ".[gui]"     # one extra dependency: Flask
 itsbob gui                  # opens http://127.0.0.1:8765 in your browser automatically
 ```
 
-It's one page, meant to be usable without reading any code first:
+Two panels, side by side:
 
-1. **Status strip** at the top — a green/grey pill per cloud provider
-   (`configured` / `no key`) and one for the local Back Brain
-   (`reachable` / `offline → heuristic fallback`), refreshed on load.
-2. **Game state box** — paste JSON (a pre-filled example is loaded by
-   default), or type a goal for cloud-tier prompts.
-3. **Route** button — runs the full pipeline and shows: the tier badge
-   (color-coded D/C/B/A/S), whether it was served from the semantic cache,
-   the Gatekeeper's reasoning and fingerprint, which scripts actually ran,
-   total latency against the 1.8s budget, and the raw JSON underneath for
-   anyone who wants it.
-4. **Classify only** button — runs just the Gatekeeper, no execution, if you
-   only want to see how something would be tagged.
-5. A **Tier S alert** renders as a highlighted red banner — "Unrecognized
-   state. Manual override required." — exactly where the spec says the
-   system should halt and ask you.
+**Left — chat.** Type a message and hit Send (or Enter). Paste JSON
+(`{"facts": {"stamina": 15, "minute": 60}}`) if you want to test a specific
+state, or just type plain text — anything that isn't valid JSON is
+automatically wrapped into `{"facts": {"message": "<your text>"}}` so you
+can talk to it conversationally without hand-writing a state object every
+time. Click one of the `example N` links under the input to load a ready
+state. itsbob's reply appears as a chat bubble; a Tier S response (nothing
+could parse the state) renders as a highlighted red bubble — "Unrecognized
+state. Manual override required." — exactly where the spec says the system
+should halt and ask you. Check **classify only** above the input to see how
+something would be tagged without executing anything.
+
+**Right — live processing.** Every message you send appends a trace card
+here, newest on top, so you can *watch it think* rather than read logs:
+
+- the tier badge (color-coded D/C/B/A/S) and, if it downgraded, what tier it
+  escalated from
+- the Gatekeeper's reasoning, its fingerprint, and its own latency
+- **which model actually got called** — provider + model name, or "—
+  (script/local/none)" when nothing needed to be
+- whether it was served from the semantic cache, and the running cache hit
+  rate
+- which scripts executed
+- total latency against the 1.8s budget, flagged if it went over
+- a collapsed **raw JSON** section per card with everything `itsbob route`
+  itself would print, for anyone who wants the full detail
+
+The **status strip** at the top shows the active router mode
+(`priority`/`google-tiered`), the local Back Brain's reachability, and every
+configured cloud provider — split into Tier B/Tier A when in google-tiered
+mode — refreshed on load.
 
 It binds to `127.0.0.1` only (not exposed to your network) and has no
 authentication — it's a local development tool, not a deployed service.
-Nothing about it requires the character simulation to be running.
+Nothing about it requires the character simulation to be running. The old
+single-shot `/api/route` and `/api/classify` endpoints are still there
+unchanged, if you're scripting against the GUI's backend directly (`curl`,
+a notebook, etc.) rather than using the page.
 
 ## Using the router as a library
 
@@ -367,6 +386,10 @@ model listed, to be green.
 | `itsbob: command not found` | venv not active, or install didn't register the entry point | `source .venv/bin/activate`; re-run `pip install -e ".[dev,gui]"` |
 | Every OpenRouter model — including one you just pinned yourself — 404s with `"This model is unavailable"` or `"No endpoints available matching your guardrail restrictions and data policy"` | **Not a code or key problem.** OpenRouter's own account-level Privacy setting blocks all `:free` models from routing until you opt in. | Go to [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy) and enable the free-model / prompt-training data policy toggle (OpenRouter requires this before any `:free` model will serve a request to a new key). Also clear any "Allowed Providers" / "Ignored Providers" restriction under [openrouter.ai/settings/preferences](https://openrouter.ai/settings/preferences) — an over-restricted provider list produces the same 404. Re-run `itsbob doctor --probe` after saving. |
 | `ITSBOB_GROQ_MODEL=llama-3.1-8b-instruct` (or another hand-typed id) still 404s | a typo, or that exact id doesn't exist on Groq (`instruct` vs. the real `instant`) | `itsbob doctor --probe` first to see which ids actually answer for your key, then pin one of *those* — don't guess a model id from memory |
+| `itsbob route '...'` crashes with a `JSONDecodeError` traceback | you passed the literal `'...'` from a README example — it's a placeholder, not real input | pass actual JSON: `itsbob route '{"facts": {"stamina": 15}}'`. Newer versions print a friendly error instead of a traceback here; update if you still see the raw traceback |
+| `ollama serve` prints `address already in use` | Ollama is already running (often auto-started as a background service on install) | that's fine, nothing to fix — `itsbob doctor` will still show it reachable; you don't need to run `ollama serve` yourself in that case |
+| Flask prints `Tip: install python-dotenv to use them` when you run `itsbob gui` | Flask's own unrelated `.env` auto-loading feature noticing a `.env` file exists | harmless — itsbob loads `.env` itself (`config.load_dotenv`) before Flask ever starts; ignore the tip or `pip install python-dotenv` to silence it |
+| Browser console/log shows `GET /favicon.ico 404` | no favicon route | harmless, cosmetic only |
 | `itsbob gui` prints an error about Flask | the `gui` extra wasn't installed | `pip install -e ".[gui]"` |
 | `itsbob route ...` always returns Tier S | both the local Back Brain and every cloud provider are unavailable | `itsbob doctor`; you need at least one of Ollama running or a cloud key set, or Tier D/C-only states, to avoid the halt |
 | `itsbob doctor` shows `ollama -- not reachable` | Ollama isn't installed or `ollama serve` isn't running | `ollama serve` in another terminal, and `ollama pull qwen2.5:1.5b`; re-run `itsbob doctor` |
