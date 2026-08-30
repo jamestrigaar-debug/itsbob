@@ -1,4 +1,7 @@
-"""The command line and the browser API. Offline: no test here calls a model."""
+"""The command line. Offline: no test here calls a model.
+
+The browser interface is tested in test_gui.py.
+"""
 
 from __future__ import annotations
 
@@ -154,65 +157,3 @@ def test_an_unexpected_error_is_a_message_not_a_traceback(home, capsys, monkeypa
 def test_the_simulation_still_runs(home, capsys):
     assert main(["run", "--ticks", "3", "--policy", "heuristic", "--offline"]) == 0
     assert capsys.readouterr().out.count("energy") == 3
-
-
-# -- the browser API -------------------------------------------------------
-
-
-@pytest.fixture
-def client(home):
-    pytest.importorskip("flask")
-    from itsbob.gui.app import create_app
-
-    return create_app(home).test_client()
-
-
-def test_the_page_loads(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert b"itsbob" in response.data
-
-
-def test_status_describes_every_subsystem(client):
-    body = client.get("/api/status").get_json()
-    assert set(body) >= {"policy", "tools", "tiers", "memory", "tasks"}
-    assert "run_shell" in body["tools"]
-
-
-def test_an_empty_store_reports_zero_not_missing(client):
-    """LongTermMemory defines __len__, so truthiness would hide it entirely."""
-    assert client.get("/api/status").get_json()["memory"]["records"] == 0
-
-
-def test_an_empty_message_is_rejected(client):
-    assert client.post("/api/chat", json={"message": "  "}).status_code == 400
-
-
-def test_tasks_can_be_created_and_removed(client):
-    created = client.post(
-        "/api/task", json={"name": "t", "prompt": "do it", "schedule": "every 30m"}
-    ).get_json()
-    assert created["task"]["schedule"] == "every 30m"
-    assert client.post("/api/task/remove", json={"id": created["task"]["id"]}).get_json()["ok"]
-
-
-def test_a_bad_schedule_is_a_400_not_a_500(client):
-    assert client.post("/api/task", json={"name": "t", "prompt": "x", "schedule": "soon"}).status_code == 400
-
-
-def test_memory_search_and_forget(client, home):
-    from itsbob.memory.base import MemoryRecord
-    from itsbob.memory.long_term import LongTermMemory
-
-    store = LongTermMemory(home / "memory.sqlite", embedder=None)
-    record = store.add(MemoryRecord(content="the spare key is under the pot"))
-    store.close()
-
-    hits = client.get("/api/memory?q=spare key").get_json()["hits"]
-    assert hits and "spare key" in hits[0]["content"]
-    assert client.post("/api/memory/forget", json={"id": record.id}).get_json()["ok"] is True
-
-
-def test_reset_clears_the_conversation_not_the_memory(client):
-    assert client.post("/api/reset").get_json()["ok"] is True
-    assert client.get("/api/status").get_json()["turns"] == 0

@@ -5,12 +5,18 @@ conversations, uses tools you can audit, and routes each step of its thinking
 to the cheapest model that can handle it.
 
 ```bash
-pip install -e ".[gui,speed]"
-echo "GOOGLE_API_KEY=..." > .env
+git clone https://github.com/jamestrigaar-debug/itsbob && cd itsbob
+./install.sh
+```
 
-itsbob doctor          # what's configured and what actually answers
+That creates the virtualenv, installs everything, asks for a key, and checks it
+against the real API before telling you it worked. Then:
+
+```bash
 itsbob chat            # talk to it
+itsbob gui             # the browser interface
 itsbob serve           # let it work on its own
+itsbob doctor          # what's configured, and what actually answers
 ```
 
 ---
@@ -149,10 +155,11 @@ export ITSBOB_ALWAYS_CONFIRM=delete_file
 ```
 
 **Confirmation fails closed.** A call needing a human with no handler attached
-— the daemon, a web request, a piped command — is denied. A prompt nobody can
-see is not consent. This is what makes the always-on mode safe by construction
-rather than by convention; `itsbob serve` tells you on startup which tools it
-therefore cannot use.
+— the daemon, a piped command — is denied. A prompt nobody can see is not
+consent. This is what makes the always-on mode safe by construction rather than
+by convention; `itsbob serve` tells you on startup which tools it therefore
+cannot use. The browser interface *can* answer, and an unanswered card there is
+denied after three minutes for the same reason.
 
 The four fences around `run_shell` / `run_python`:
 
@@ -265,16 +272,31 @@ supervisor here and there shouldn't be.
 ## The browser interface
 
 ```bash
-itsbob gui       # http://127.0.0.1:8765
+itsbob gui       # http://localhost:8765
 ```
 
-Chat on the left; on the right, every step as it happens — the tier and why it
-was chosen, each tool call with its arguments and result, what was recalled and
-what was written back — plus memory, task and audit panels.
+Chat on the left. On the right, **every step as it happens** — streamed over
+server-sent events, not delivered in one lump when the turn ends. You watch the
+tier get chosen, each tool call go out, and each result come back, which is the
+difference between an assistant you can supervise and one you have to trust.
 
-It binds to localhost with no authentication, and takes no confirm handler, so
-a web request cannot approve a risky tool on behalf of whoever left the tab
-open. Anything that can reach the port can still run allowed tools as you.
+Four panels: activity, memory (with *why* each hit surfaced), scheduled tasks,
+and the audit log.
+
+**You can approve tools from the page.** When the agent reaches something
+`guarded` mode gates, a card appears showing the exact command and why it wants
+to run it, with *Allow once* / *Deny* / *Always allow this tool*. The agent
+waits on your answer. This is what makes `guarded` mode usable in a browser at
+all — before, the interface passed no confirmation handler, so every command
+was correctly but uselessly refused.
+
+An unanswered card is **denied** after three minutes, counting down on the
+card. A closed tab is not a yes.
+
+One turn runs at a time (two would interleave into each other's conversation
+history). It binds to localhost with no authentication: anything that can reach
+the port can run allowed tools as you. `--public` binds to all interfaces and
+warns you at the point of use.
 
 ---
 
@@ -327,17 +349,43 @@ box.registry.register(Tool(
 
 ## Setup
 
-Python ≥ 3.10.
+Python ≥ 3.10. One command:
+
+```bash
+./install.sh
+```
+
+It finds a suitable Python, creates the virtualenv, installs with the browser
+interface and the fast recall path, links `itsbob` onto your PATH if it can,
+and runs `itsbob setup`. Re-running it is safe — it upgrades in place and never
+touches your keys.
+
+If anything in that chain does not suit you, the manual path still works:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[gui,speed,dev]"
-cp .env.example .env        # then paste your keys in
-itsbob doctor
+pip install -e ".[all,dev]"
+itsbob setup
 ```
 
-`.env` is gitignored, so keys never reach the repository — which also means a
-zip or clone won't carry them. Paste them in on the machine that runs it.
+`itsbob setup` writes your keys to `~/.itsbob/.env` at mode 600 and then
+**makes a real API call to check each one** — "the variable is set" and "the key
+works" are different claims, and only the second is worth being told. Because
+they live in the home directory rather than the working directory, the daemon
+and the GUI find them wherever they are started from.
+
+`make help` lists the shortcuts for working *on* itsbob rather than with it.
+
+### Running in the background
+
+```bash
+itsbob service install     # systemd --user unit, or a launchd plist
+itsbob service status
+itsbob service print       # see the unit without installing it
+```
+
+No supervisor ships with itsbob on purpose: your OS already has one that is
+better tested and is what an administrator expects to find.
 
 Runs with **zero configuration**: no keys falls back to the offline provider,
 no embedding API falls back to keyword-only recall, no Ollama falls back to the
@@ -430,9 +478,17 @@ src/itsbob/
     ingestion.py    anything in → one Snapshot shape
     pipeline.py     the original one-shot router (still importable)
   character/, engine/   the original tick simulation — `itsbob run`
-  gui/app.py      the browser interface
+  gui/            the browser interface
+    app.py          Flask routes and the SSE stream
+    session.py      one running agent: event fan-out and the approval gate
+    page.py         the single-page interface, inline (no build step)
+  store.py        locked SQLite: one lock per file, WAL, busy timeout
+  logfile.py      append-only JSONL with rotation
+  setup_wizard.py `itsbob setup` — keys, directories, and a live check
+  service.py      systemd/launchd unit generation
   cli.py          every command
-tests/            260 tests, none of which touch the network
+install.sh        one-command install
+tests/            356 tests, none of which touch the network
 ```
 
 ## The original simulation
