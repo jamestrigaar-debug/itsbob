@@ -242,13 +242,30 @@ def test_the_audit_log_rotates(tmp_path):
 # -- 7. vector recall materialized every float ------------------------------
 
 
-def test_vectors_are_kept_compact_not_as_python_lists():
+def test_vectors_are_never_python_float_lists():
+    """The invariant in both paths: a list of Python floats costs ~10x."""
     from array import array
 
     store = LongTermMemory(":memory:", embedder=HashingEmbedder(dims=128))
     store.add_many([MemoryRecord(content=f"item {i}") for i in range(20)])
     _, matrix = store._load_vectors(store.embedder.signature)
-    assert isinstance(matrix[0], array), "a list of Python floats costs ~10x the memory"
+    row = matrix[0]
+    assert not isinstance(row, list)
+    assert isinstance(row, array) or type(row).__module__.startswith("numpy")
+
+
+def test_the_pure_python_path_stays_compact_and_correct(monkeypatch):
+    """Exercised explicitly, since numpy is optional and CI may have it."""
+    from array import array
+
+    store = LongTermMemory(":memory:", embedder=HashingEmbedder(dims=128))
+    store._np = None  # force the fallback
+    store.add_many(
+        [MemoryRecord(content=f"memory number {i} about topic {i % 5}") for i in range(40)]
+    )
+    _, matrix = store._load_vectors(store.embedder.signature)
+    assert isinstance(matrix[0], array)
+    assert "number 17" in store.search("memory number 17 about topic", limit=1)[0].record.content
 
 
 def test_recall_is_still_correct_after_the_optimization():
