@@ -87,6 +87,21 @@ def test_a_failed_transaction_rolls_back(tmp_path):
     assert db.scalar("SELECT COUNT(*) FROM t") == 0
 
 
+def test_two_databases_do_not_share_a_transaction_counter(tmp_path):
+    """A class-level threading.local made one database's depth leak into
+    another's, so the inner one committed nothing."""
+    a = Database(tmp_path / "a.sqlite", schema="CREATE TABLE t (v INTEGER)")
+    b = Database(tmp_path / "b.sqlite", schema="CREATE TABLE t (v INTEGER)")
+    assert a._depth is not b._depth
+    with a.transaction() as ca:
+        ca.execute("INSERT INTO t VALUES (1)")
+        with b.transaction() as cb:
+            cb.execute("INSERT INTO t VALUES (2)")
+    # Reopened, so only committed rows are visible.
+    assert Database(tmp_path / "b.sqlite").scalar("SELECT COUNT(*) FROM t") == 1
+    assert Database(tmp_path / "a.sqlite").scalar("SELECT COUNT(*) FROM t") == 1
+
+
 def test_nested_transactions_commit_once(tmp_path):
     db = Database(tmp_path / "x.sqlite", schema="CREATE TABLE t (v INTEGER)")
     with db.transaction() as conn:
@@ -266,6 +281,25 @@ def test_the_pure_python_path_stays_compact_and_correct(monkeypatch):
     _, matrix = store._load_vectors(store.embedder.signature)
     assert isinstance(matrix[0], array)
     assert "number 17" in store.search("memory number 17 about topic", limit=1)[0].record.content
+
+
+def test_a_short_embedding_response_is_an_error_not_lost_vectors():
+    """zip() truncates by default, which would leave records silently
+    unembedded — and the check must not take the write down with it."""
+    from itsbob.llm.embeddings import Embedder
+
+    class Short(Embedder):
+        def __init__(self):
+            super().__init__(name="short", model="m", dims=4)
+
+        def embed(self, texts):
+            return [[1.0] * 4]  # one vector, however many texts
+
+    store = LongTermMemory(":memory:", embedder=Short())
+    store.add_many([MemoryRecord(content=f"m{i}") for i in range(3)])
+    assert len(store) == 3, "the memory is the thing being protected"
+    assert store.stats()["embed_errors"] == 1
+    assert store.search("m1", limit=1)  # lexical recall unaffected
 
 
 def test_recall_is_still_correct_after_the_optimization():

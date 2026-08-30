@@ -8,7 +8,7 @@ work with, and give an LLM policy something concrete to reason about.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator
 
 from ..config import EnergySettings, MemorySettings
 from ..memory.bank import MemoryBank

@@ -55,7 +55,6 @@ from .base import (
     MemoryRecord,
     RetrievalWeights,
     keyword_relevance,
-    rank,
     render_records,
     tokenize,
 )
@@ -411,6 +410,15 @@ class LongTermMemory:
         texts = [self._embed_text(r) for r in records]
         try:
             vectors = self.embedder.embed(texts)
+            if len(vectors) != len(records):
+                # Checked here, inside the guard, rather than by strict=True on
+                # the zip below: a provider returning the wrong number of
+                # vectors must be recorded as an embedding failure like any
+                # other, not raised through a write. The memory is the thing
+                # being protected; the vector is an optimization.
+                raise ValueError(
+                    f"embedder returned {len(vectors)} vectors for {len(records)} records"
+                )
         except Exception as exc:  # noqa: BLE001 - lexical recall still works
             self.embed_errors += 1
             self.last_embed_error = f"{type(exc).__name__}: {exc}"[:200]
@@ -422,7 +430,7 @@ class LongTermMemory:
             "VALUES (?, ?, ?, ?, ?)",
             [
                 (r.id, signature, len(v), array("f", v).tobytes(), now)
-                for r, v in zip(records, vectors)
+                for r, v in zip(records, vectors, strict=True)  # length checked above
             ],
         )
         self._invalidate_vector_cache()
@@ -540,7 +548,7 @@ class LongTermMemory:
         width = len(query_vector)
         norms = getattr(self, "_vec_norms", None) or [1.0] * len(ids)
         scored: list[tuple[str, float]] = []
-        for memory_id, vector, vn in zip(ids, matrix, norms):
+        for memory_id, vector, vn in zip(ids, matrix, norms, strict=True):
             if len(vector) != width:
                 continue
             dot = sum(map(mul, vector, query_vector))

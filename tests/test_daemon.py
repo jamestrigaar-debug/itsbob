@@ -10,7 +10,6 @@ import pytest
 
 from itsbob.agent.context import Turn
 from itsbob.daemon.notify import (
-    ConsoleSink,
     FileSink,
     MultiSink,
     NoticeGate,
@@ -18,7 +17,7 @@ from itsbob.daemon.notify import (
 )
 from itsbob.daemon.schedule import ScheduleError, parse_schedule
 from itsbob.daemon.service import Daemon
-from itsbob.daemon.tasks import MAX_CONSECUTIVE_FAILURES, Task, TaskStore
+from itsbob.daemon.tasks import MAX_CONSECUTIVE_FAILURES, TaskStore
 from itsbob.tools import Mode, build_toolbox
 
 

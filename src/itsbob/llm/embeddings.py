@@ -26,11 +26,11 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Mapping, Sequence
 
 from ..config import ProviderConfig
-from .base import LLMError, ProviderNotConfigured, ProviderUnavailable
+from .base import LLMError, ProviderNotConfigured
 
 __all__ = [
     "EmbeddingError",
@@ -214,7 +214,8 @@ class HashingEmbedder(Embedder):
         vector = [0.0] * self.dims
         words = _WORD_RE.findall(text.lower())
         features: list[str] = list(words)
-        features.extend(f"{a}_{b}" for a, b in zip(words, words[1:]))
+        # Not strict: these are deliberately offset by one to form bigrams.
+        features.extend(f"{a}_{b}" for a, b in zip(words, words[1:], strict=False))
         for feature in features:
             digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
             index = int.from_bytes(digest[:4], "big") % self.dims
@@ -232,7 +233,7 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity, clamped to ``[-1, 1]``. Returns 0 on a length mismatch."""
     if len(a) != len(b) or not a:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     if na == 0.0 or nb == 0.0:
@@ -366,7 +367,10 @@ class EmbeddingRouter(Embedder):
         raise EmbeddingError(f"all embedders failed ({self.last_error})")
 
     def _store(self, signature: str, texts: Sequence[str], vectors: Sequence[list[float]]) -> None:
-        for text, vector in zip(texts, vectors):
+        # strict: a provider returning fewer vectors than inputs is a bug, and
+        # zip's default would swallow it — the extra texts would simply never
+        # be embedded, and nothing downstream would ever say so.
+        for text, vector in zip(texts, vectors, strict=True):
             if self.cache_size and len(self._cache) >= self.cache_size:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[(signature, text)] = list(vector)

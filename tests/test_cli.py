@@ -5,7 +5,6 @@ The browser interface is tested in test_gui.py.
 
 from __future__ import annotations
 
-import json
 
 import pytest
 

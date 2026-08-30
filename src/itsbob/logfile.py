@@ -22,7 +22,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 __all__ = ["JsonlFile"]
 

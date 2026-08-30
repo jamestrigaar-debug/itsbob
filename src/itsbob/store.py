@@ -75,6 +75,12 @@ class Database:
             key = f"memory-{id(self)}"
 
         self._lock = _lock_for(key)
+        # Per instance, not per class. A class-level threading.local is shared
+        # by every Database, so a transaction opened on one database while
+        # another's was open read the wrong depth, concluded it was nested, and
+        # never committed — losing the write silently to every other reader.
+        # Which is the exact bug this module exists to prevent.
+        self._depth = threading.local()
         self._conn = sqlite3.connect(
             self.path, check_same_thread=False, timeout=busy_timeout_ms / 1000
         )
@@ -112,8 +118,8 @@ class Database:
         opens its own transaction still composes into a larger one.
         """
         with self._lock:
-            depth = getattr(self._local_depth, "value", 0)
-            self._local_depth.value = depth + 1
+            depth = getattr(self._depth, "value", 0)
+            self._depth.value = depth + 1
             try:
                 yield self._conn
             except Exception:
@@ -124,7 +130,7 @@ class Database:
                 if depth == 0:
                     self._conn.commit()
             finally:
-                self._local_depth.value = depth
+                self._depth.value = depth
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
         """Run one statement under the lock, committing if it wrote."""
@@ -188,7 +194,3 @@ class Database:
 
     def __repr__(self) -> str:  # pragma: no cover - convenience
         return f"<Database {self.path}>"
-
-    # Transaction depth is per-thread: two threads may each be inside their own
-    # outermost transaction, and neither should see the other's depth.
-    _local_depth = threading.local()

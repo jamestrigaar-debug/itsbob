@@ -11,7 +11,6 @@ import json
 import sqlite3
 import time
 
-import pytest
 
 from itsbob.llm.embeddings import Embedder, EmbeddingRouter, HashingEmbedder
 from itsbob.memory.base import MemoryKind, MemoryRecord

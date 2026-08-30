@@ -40,7 +40,6 @@ from __future__ import annotations
 import signal
 import threading
 import time
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -48,7 +47,7 @@ from typing import Any, Callable
 from ..agent import Agent, build_agent
 from ..agent.context import Conversation
 from ..memory.base import MemoryKind, MemoryRecord
-from .notify import MultiSink, Notification, NoticeGate, default_sink
+from .notify import Notification, NoticeGate, default_sink
 from .tasks import Task, TaskRun, TaskStore
 
 __all__ = ["Daemon", "DaemonEvent", "TaskTimeout"]

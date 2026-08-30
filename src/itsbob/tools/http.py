@@ -186,10 +186,11 @@ class ApiCatalog:
             if key.startswith(prefix) and key.endswith("_BASE")
         }
         for name in names:
-            upper = name.upper()
-
-            def _get(field: str, default: str = "") -> str:
-                return str(env.get(f"{prefix}{upper}_{field}", default)).strip()
+            def _get(field: str, default: str = "", _upper: str = name.upper()) -> str:
+                # _upper is bound at definition time: a closure over the loop
+                # variable would read whatever the last iteration left behind
+                # if this were ever called after the loop.
+                return str(env.get(f"{prefix}{_upper}_{field}", default)).strip()
 
             catalog.register(
                 ApiSpec(
@@ -264,7 +265,7 @@ def _summarize(status: int, payload: str, url: str) -> ToolResult:
 
 def _http_request(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     url = params["url"]
-    if not urllib.parse.urlparse(url).scheme in ("http", "https"):
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         raise ToolError(f"only http/https URLs are allowed, got {url!r}")
     status, payload, _ = _request(
         url,

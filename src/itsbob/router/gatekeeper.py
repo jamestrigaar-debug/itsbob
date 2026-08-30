@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 import time
 from functools import lru_cache
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 from ..llm.base import LLMRequest, Provider, system, user

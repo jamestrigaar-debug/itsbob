@@ -20,7 +20,7 @@ import os
 import stat
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
 from .config import find_dotenv, itsbob_home, load_dotenv
 

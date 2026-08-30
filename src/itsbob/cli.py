@@ -517,7 +517,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print("\nprobing every model on every tier:")
     answered = 0
     seen: set[tuple[str, str]] = set()
-    for tier_value, info in brain.describe()["tiers"].items():
+    for tier_value in brain.describe()["tiers"]:
         router = brain.router_for(_tier(tier_value))
         for provider in router.providers:
             if not provider.is_configured():

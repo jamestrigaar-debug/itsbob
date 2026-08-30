@@ -11,13 +11,12 @@ from doing is the more interesting half of the log.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..logfile import JsonlFile
 from .base import ToolCall, ToolResult

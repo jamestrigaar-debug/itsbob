@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from ..llm.base import Message, assistant, system, user
-from ..memory.base import MemoryKind, MemoryRecord
+from ..memory.base import MemoryRecord
 from .persona import Persona
 
 __all__ = ["Turn", "Step", "Conversation", "build_messages"]

@@ -27,7 +27,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from ..llm.base import LLMRequest, system, user
 from ..logfile import JsonlFile

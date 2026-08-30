@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..llm.base import AllProvidersFailed, LLMRequest, Provider, system, user
+from ..llm.base import AllProvidersFailed, LLMRequest, system, user
 from ..llm.router import LLMRouter, extract_json
 from .cache import SemanticCache
 from .gatekeeper import Gatekeeper
