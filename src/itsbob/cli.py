@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from .config import Settings, load_dotenv
 
@@ -452,26 +452,150 @@ def _cmd_memory(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+class ProbeResult(NamedTuple):
+    """What one real request to one model did."""
+
+    ok: bool
+    detail: str
+    latency_ms: float
+    #: "ok" | "auth" | "model" | "rate" | "network" — carried from the exception
+    #: type rather than re-derived from the message, so the summary does not
+    #: have to guess at what went wrong from prose.
+    kind: str
+
+
+def _probe_provider(provider, model: str) -> ProbeResult:
+    import time
+
+    from .llm.base import (
+        BadRequest,
+        LLMRequest,
+        ProviderNotConfigured,
+        RateLimited,
+        user,
+    )
+    from .llm.providers import vendor_message
+
+    started = time.perf_counter()
+    try:
+        response = provider.complete(
+            LLMRequest(
+                messages=[user("Reply with the single word: ready")],
+                max_tokens=1000,
+                temperature=0.0,
+            ),
+            model=model,
+        )
+    except Exception as exc:  # noqa: BLE001 - the failure is the result here
+        kind = (
+            "auth" if isinstance(exc, ProviderNotConfigured)
+            else "rate" if isinstance(exc, RateLimited)
+            else "model" if isinstance(exc, BadRequest)
+            else "network"
+        )
+        elapsed = (time.perf_counter() - started) * 1000
+        return ProbeResult(False, vendor_message(exc), elapsed, kind)
+    return ProbeResult(True, (response.text or "").strip()[:24], response.latency_ms, "ok")
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from .agent.brain import build_brain
-    from .llm.base import LLMRequest, user
     from .llm.embeddings import default_embedder
     from .llm.local import default_ollama_config, is_ollama_running, list_ollama_models
+    from .router.tiers import Tier
 
     home = _home(args)
     print(f"home: {home}  ({'exists' if home.exists() else 'will be created'})\n")
 
-    print("model tiers:")
     brain = build_brain(Settings.from_env(load_env_files=False))
-    for tier_value, info in brain.describe()["tiers"].items():
-        configured = [row for row in info["providers"] if row["configured"]]
-        first = configured[0] if configured else None
-        mark = "ok " if first else "-- "
-        detail = f"{first['provider']}: {first['models'][0]}" if first else "nothing configured"
-        print(f"  {mark}Tier {tier_value} ({info['label']:<16}) {detail}")
+    described = brain.describe()["tiers"]
+    ollama_up = is_ollama_running()
 
-    print("\nlocal Back Brain (free, private, preferred for Tier C):")
-    if is_ollama_running():
+    # Probe first, so the tier summary can report what actually answers rather
+    # than what merely has a key. Reporting "ok" for a configured-but-rejected
+    # key is the exact mistake this tool exists to prevent, and it made itself
+    # once already.
+    results: dict[tuple[str, str], ProbeResult] = {}
+    if args.probe:
+        print("probing every configured model (one real request each):")
+        seen: set[tuple[str, str]] = set()
+        for tier_value in described:
+            router = brain.router_for(Tier(tier_value))
+            if router is None:
+                continue
+            for provider in router.providers:
+                if not provider.is_configured():
+                    continue
+                for model in provider.models:
+                    if (provider.name, model) in seen:
+                        continue
+                    seen.add((provider.name, model))
+                    outcome = _probe_provider(provider, model)
+                    results[(provider.name, model)] = outcome
+                    mark = "ok" if outcome.ok else "!!"
+                    shown = (
+                        f"{outcome.latency_ms:5.0f}ms  {outcome.detail!r}"
+                        if outcome.ok
+                        else f"[{outcome.kind}] {outcome.detail[:110]}"
+                    )
+                    print(f"  {mark} {provider.name:<11} {model:<28} {shown}")
+        print()
+
+    print("model tiers:")
+    for tier_value, info in sorted(described.items(), key=lambda kv: Tier(kv[0]).rank):
+        if tier_value == Tier.C.value and ollama_up:
+            print(f"  ok Tier C ({info['label']:<15}) ollama (local) — preferred when running")
+            continue
+        answered = None
+        configured = [row for row in info["providers"] if row["configured"]]
+        if args.probe:
+            for row in configured:
+                for model in row["models"]:
+                    outcome = results.get((row["provider"], model))
+                    if outcome is not None and outcome.ok:
+                        answered = (row["provider"], model)
+                        break
+                if answered:
+                    break
+            if answered:
+                print(f"  ok Tier {tier_value} ({info['label']:<15}) {answered[0]}: {answered[1]}")
+            elif configured:
+                print(f"  !! Tier {tier_value} ({info['label']:<15}) configured, but nothing answered")
+            else:
+                print(f"  -- Tier {tier_value} ({info['label']:<15}) nothing configured")
+        elif configured:
+            first = configured[0]
+            models = ", ".join(first["models"][:2])
+            print(f"  ?  Tier {tier_value} ({info['label']:<15}) {first['provider']}: {models}  (not checked)")
+        else:
+            print(f"  -- Tier {tier_value} ({info['label']:<15}) nothing configured")
+
+    print("\nkeys as stored (compare these against the provider's console):")
+    from .setup_wizard import DEFAULT_KEYS, fingerprint, key_looks_wrong
+
+    any_key = False
+    for name, *_rest in DEFAULT_KEYS:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            print(f"  --  {name:<20} not set")
+            continue
+        any_key = True
+        warning = key_looks_wrong(name, value)
+        # The fingerprint is the point: input is hidden when a key is pasted,
+        # so a character lost in the paste is otherwise invisible and shows up
+        # only as an unexplained rejection.
+        print(f"  {'!!' if warning else 'ok '} {name:<20} {fingerprint(value)}")
+        if warning:
+            print(f"      {warning}")
+    if not any_key:
+        print("      none — run `itsbob setup`")
+
+    if not args.probe:
+        print("\n  ? means a key is present but has not been used. A key can be set and\n"
+              "    still be rejected — run `itsbob doctor --probe` to actually find out.")
+
+    print("\nlocal model (free, private, preferred for Tier C):")
+    if ollama_up:
         config = default_ollama_config()
         pulled = list_ollama_models()
         print(f"  ok  ollama reachable at {config.base_url}")
@@ -485,7 +609,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\nmemory:")
     store = _open_memory(args)
-    for key, value in store.stats().items():
+    stats = store.stats()
+    for key, value in stats.items():
         print(f"      {key:<16} {value}")
 
     print("\nembeddings:")
@@ -511,47 +636,92 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"      {len(tasks)} configured, {sum(1 for t in tasks if t.enabled)} enabled")
 
     if not args.probe:
-        print("\n(pass --probe to send one real request per model)")
         return 0
 
-    print("\nprobing every model on every tier:")
-    answered = 0
-    seen: set[tuple[str, str]] = set()
-    for tier_value in brain.describe()["tiers"]:
-        router = brain.router_for(_tier(tier_value))
-        for provider in router.providers:
-            if not provider.is_configured():
-                continue
-            for model in provider.models:
-                if (provider.name, model) in seen:
-                    continue
-                seen.add((provider.name, model))
-                try:
-                    response = provider.complete(
-                        LLMRequest(
-                            messages=[user("Reply with the single word: ready")],
-                            max_tokens=1000,
-                            temperature=0.0,
-                        ),
-                        model=model,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  !! {provider.name:<12} {model:<30} {type(exc).__name__}: {exc}"[:150])
-                    continue
-                print(
-                    f"  ok {provider.name:<12} {model:<30} {response.latency_ms:6.0f}ms "
-                    f"{response.text.strip()[:24]!r}"
-                )
-                answered += 1
-    # A partly-degraded set of free providers is the normal state, not a failure.
-    print(f"\n{answered} model(s) answered." if answered else "\nNothing answered.")
-    return 0 if answered else 1
+    working = sum(1 for outcome in results.values() if outcome.ok)
+    rejected = sorted({
+        name for (name, _), outcome in results.items() if outcome.kind == "auth"
+    })
+    stale = sorted({
+        f"{name}/{model}" for (name, model), outcome in results.items() if outcome.kind == "model"
+    })
+
+    print()
+    print(f"{working} model(s) answered." if working
+          else "Nothing answered — itsbob cannot think until at least one model does.")
+    for name in rejected:
+        env_var = f"{name.upper()}_API_KEY"
+        print(
+            f"\n  ! {name} is REJECTING your key, so every model on it fails.\n"
+            f"    Fix or remove {env_var} in ~/.itsbob/.env — while it is set and\n"
+            f"    invalid, itsbob still tries {name} first on every call."
+        )
+        if name == "google":
+            print(
+                "    An AI Studio key looks like `AIza…` (39 characters). Get one at\n"
+                "    https://aistudio.google.com/apikey — free, no card."
+            )
+    if stale and working:
+        print(f"\n  · retired/unavailable models (harmless, itsbob walks past them): {', '.join(stale[:6])}")
+
+    # With one provider dead, every tier falls through to the same surviving
+    # model. It works, but the cost ladder — the reason the tiers exist — is
+    # gone, and that is not obvious from a screen full of ticks.
+    answering = {name for (name, _), outcome in results.items() if outcome.ok}
+    if working and len(answering) == 1 and rejected:
+        only = next(iter(answering))
+        print(
+            f"\n  · every tier is now answered by {only}, so trivial and hard requests\n"
+            f"    cost the same. Fixing the rejected key restores the cheap/premium split."
+        )
+    return 0 if working else 1
 
 
 def _tier(value: str):
     from .router.tiers import Tier
 
     return Tier(value)
+
+
+def _cmd_models(args: argparse.Namespace) -> int:
+    """What each provider actually serves today, versus what itsbob asks for."""
+    from .llm.catalog import default_provider_configs, list_models
+
+    configs = {c.name: c for c in default_provider_configs()}
+    any_key = False
+
+    for name, config in configs.items():
+        if args.provider and args.provider != name:
+            continue
+        wanted = list(config.models())
+        if not config.is_configured():
+            print(f"\n{name}: no {config.api_key_env} set")
+            continue
+        any_key = True
+        live = list_models(config)
+        print(f"\n{name}:")
+        if not live:
+            print("  could not read the model list (network, or the key is rejected)")
+            print(f"  itsbob will try: {', '.join(wanted)}")
+            continue
+        missing = [m for m in wanted if m not in live]
+        print(f"  itsbob will try: {', '.join(wanted)}")
+        if missing:
+            print(f"  !! not served any more: {', '.join(missing)}")
+            print(f"     pin a live one:  export ITSBOB_{name.upper()}_MODEL=<id>")
+        chat_like = [m for m in live if "embed" not in m and "whisper" not in m and "tts" not in m]
+        shown = chat_like if args.all else chat_like[:25]
+        print(f"  {len(live)} model(s) available:")
+        for model in shown:
+            mark = "*" if model in wanted else " "
+            print(f"   {mark} {model}")
+        if len(chat_like) > len(shown):
+            print(f"     … {len(chat_like) - len(shown)} more (--all to see them)")
+
+    if not any_key:
+        print("\nNo provider keys are set. Run `itsbob setup`.")
+        return 1
+    return 0
 
 
 def _cmd_tools(args: argparse.Namespace) -> int:
@@ -802,6 +972,11 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor = with_mode(add("doctor", "What is actually configured, and what works."))
     doctor.add_argument("--probe", action="store_true", help="send one real request per model")
     doctor.set_defaults(handler=_cmd_doctor)
+
+    models = add("models", "What each provider actually serves, versus what itsbob asks for.")
+    models.add_argument("--provider", choices=["google", "groq", "openrouter"])
+    models.add_argument("--all", action="store_true", help="list every model, not the first 25")
+    models.set_defaults(handler=_cmd_models)
 
     with_mode(add("tools", "Tools available, and the current policy.")).set_defaults(
         handler=_cmd_tools

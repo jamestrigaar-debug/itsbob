@@ -22,6 +22,7 @@ __all__ = [
     "PROVIDER_TEMPLATES",
     "default_provider_configs",
     "discover_openrouter_free_models",
+    "list_models",
 ]
 
 
@@ -52,15 +53,21 @@ OPENROUTER = ProviderConfig(
 # across multiple `itsbob doctor --probe` runs; if they 404 for you too, run
 # `itsbob doctor --probe` and pin whatever answers with `ITSBOB_GROQ_MODEL`
 # (see README: Optional tuning env vars).
+# Groq retires models on its own schedule and does not keep the old ids alive.
+# A user report showed gemma2-9b-it decommissioned (400) and both llama-3.x ids
+# gone (404), with only openai/gpt-oss-20b answering — which is why that one is
+# first here. Rather than keep guessing at replacements from memory, use
+# `itsbob models --probe` to ask Groq what it serves today and pin one with
+# ITSBOB_GROQ_MODEL. The 404s are harmless (the router walks past them); they
+# just waste an attempt.
 GROQ = ProviderConfig(
     name="groq",
     base_url="https://api.groq.com/openai/v1",
     api_key_env="GROQ_API_KEY",
     default_model="openai/gpt-oss-20b",
     fallback_models=(
-        "gemma2-9b-it",
+        "openai/gpt-oss-120b",
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
     ),
     requests_per_minute=30,
 )
@@ -137,6 +144,39 @@ def _with_openrouter_attribution(
     if not headers:
         return config
     return ProviderConfig(**{**config.__dict__, "headers": headers})
+
+
+def list_models(config: ProviderConfig, env: Mapping[str, str] | None = None,
+                *, timeout: float = 20.0) -> tuple[str, ...]:
+    """Ask a provider what it actually serves right now.
+
+    Every supported vendor exposes OpenAI's ``/models``. Hardcoded ids go stale
+    constantly — that is the normal state of a free tier, not an unusual one —
+    so the fix is to be able to ask rather than to guess better next time.
+    Returns ``()`` when the endpoint cannot be read, since this is a diagnostic
+    and must never be the thing that fails.
+    """
+    env = os.environ if env is None else env
+    key = config.api_key(env)
+    if not key:
+        return ()
+    url = f"{config.base_url.rstrip('/')}/models"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except Exception:  # network, auth, egress policy — all non-fatal here
+        return ()
+    # Google's OpenAI-compatible shim returns "models/gemini-3.5-flash" while
+    # chat completions want "gemini-3.5-flash". Comparing the two raw makes
+    # every configured model look retired.
+    ids = [
+        str(m["id"]).split("/", 1)[-1] if str(m.get("id", "")).startswith("models/")
+        else str(m.get("id", ""))
+        for m in (payload.get("data") or [])
+        if m.get("id")
+    ]
+    return tuple(sorted(i for i in ids if i))
 
 
 def discover_openrouter_free_models(
