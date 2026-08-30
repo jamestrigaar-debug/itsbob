@@ -146,9 +146,68 @@ GUI load it automatically:
 cp .env.example .env
 ```
 
-Tier A (premium/expensive models like GPT-4o) isn't wired to a separate
-provider yet — `ComplexityRouter.premium_router` defaults to the same cloud
-router Tier B uses. Point it at a dedicated expensive-model router yourself:
+### Google-tiered mode — Google answers every cloud tier itself
+
+By default (`mode="priority"`) Tier B and Tier A share the same pool of
+cloud providers, tried in `ITSBOB_PROVIDER_ORDER`. If you'd rather **Google
+alone** answer both cloud tiers — at two different Gemini models, cheap for
+Tier B and stronger for Tier A — with Groq/OpenRouter only as a backup that's
+tried *after* Google rather than before it, use **google-tiered** mode:
+
+```bash
+export ITSBOB_ROUTER_MODE=google-tiered
+itsbob doctor            # now shows Tier B and Tier A as two separate Gemini chains
+itsbob route '...'
+itsbob gui                # the status strip shows the same split
+```
+
+or per-call, without changing the env:
+
+```bash
+itsbob route '...' --mode google-tiered
+```
+
+The ladder, in cheapest-to-strongest order:
+
+| Tier | Default model | Falls back to |
+|---|---|---|
+| B (standard cloud) | `gemini-3.1-flash-lite` | `gemini-3.5-flash-lite` → `gemini-3.6-flash` |
+| A (premium cloud) | `gemini-3.6-flash` | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` |
+
+Only `GOOGLE_API_KEY` is required. If Groq/OpenRouter keys are *also* set,
+they're appended behind Google on both tiers as low-tier backups — reached
+only once every Gemini model tried has failed or hit quota, never tried
+first. Set them or leave them unset independently; nothing here requires
+them. To go fully Google-only with no Groq/OpenRouter involved at all:
+
+```python
+from itsbob.router import build_google_tiered_router
+from itsbob.config import Settings
+
+router = build_google_tiered_router(Settings.from_env(), low_tier_backup=False)
+```
+
+Pin different Gemini model ids (if your account's model access differs)
+directly on the call:
+
+```python
+router = build_google_tiered_router(
+    Settings.from_env(),
+    tier_b_model="gemini-3.1-flash-lite",
+    tier_a_model="gemini-3.6-flash",
+    fallback_model="gemini-3.5-flash-lite",
+)
+```
+
+See [docs/GOOGLE_SETUP.md](docs/GOOGLE_SETUP.md) for getting the key itself
+and finding which Gemini model ids your account currently has access to
+(the exact names above may not match what's live for you).
+
+### Wiring in a different Tier A provider entirely
+
+`google-tiered` mode is the built-in way to split Tier B/A between two
+models. If you want Tier A answered by a non-Google, non-free model
+(GPT-4o-class, say) instead, build `ComplexityRouter` directly:
 
 ```python
 from itsbob.router import ComplexityRouter, Gatekeeper, default_registry, SemanticCache
@@ -172,7 +231,8 @@ router = ComplexityRouter(
 
 | Variable | Effect |
 |---|---|
-| `ITSBOB_PROVIDER_ORDER` | comma-separated cloud try-order, e.g. `groq,google,openrouter` |
+| `ITSBOB_ROUTER_MODE` | `priority` (default) or `google-tiered` — see [Google-tiered mode](#google-tiered-mode--google-answers-every-cloud-tier-itself) |
+| `ITSBOB_PROVIDER_ORDER` | comma-separated cloud try-order, e.g. `groq,google,openrouter` (ignored in `google-tiered` mode) |
 | `ITSBOB_GROQ_MODEL` / `ITSBOB_GOOGLE_MODEL` / `ITSBOB_OPENROUTER_MODEL` | pin a cloud model id (old default becomes a fallback, never dropped) |
 | `ITSBOB_MAX_ATTEMPTS` | total cloud provider attempts per call (default 4) |
 | `ITSBOB_ALLOW_OFFLINE` | set `false` to make missing cloud keys a hard error instead of the offline `EchoProvider` |
@@ -194,6 +254,7 @@ itsbob classify '{"facts": {"stamina": 15, "minute": 60}}'
 # Full pipeline: classify, cache-check, route, execute
 itsbob route '{"facts": {"stamina": 15, "minute": 60}}'
 itsbob route @path/to/state.json --goal "win the league"
+itsbob route '...' --mode google-tiered        # Google alone, two Gemini models — see below
 
 # The GUI
 itsbob gui                                     # http://127.0.0.1:8765, opens a browser tab
@@ -284,15 +345,28 @@ Per the spec's own phasing, these are real gaps, not oversights:
 - **A real screen-scraper** — nothing in this repo reads a game window. You
   provide `raw_state` as JSON (from wherever your scraper lives); `compress()`
   is the ingestion boundary it should feed into.
-- **Tier A on a genuinely separate premium provider** — see
-  [Cloud providers](#cloud-providers-tier-b--tier-a--optional) above for how
-  to wire one in; out of the box it shares Tier B's router.
+- **Tier A on a genuinely separate, non-Google premium provider** (a real
+  GPT-4o-class endpoint, say) — `google-tiered` mode covers Tier A on a
+  stronger *Gemini* model out of the box; a different vendor entirely still
+  needs the manual `ComplexityRouter(...)` wiring in
+  [Wiring in a different Tier A provider entirely](#wiring-in-a-different-tier-a-provider-entirely).
 
 ## Troubleshooting
+
+**A `--probe` run with some `!!` lines is normal, not broken.** `itsbob
+doctor --probe` tries every model on every configured provider and reports
+each attempt — a `!!` next to a specific model just means *that model* is
+gone or blocked; the router already walks past it to the next one
+automatically during a real call. What matters is that **at least one
+provider shows `ok`** on at least one model. If Groq or Google (or Ollama)
+answers, the router works end to end — you do not need OpenRouter, or every
+model listed, to be green.
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `itsbob: command not found` | venv not active, or install didn't register the entry point | `source .venv/bin/activate`; re-run `pip install -e ".[dev,gui]"` |
+| Every OpenRouter model — including one you just pinned yourself — 404s with `"This model is unavailable"` or `"No endpoints available matching your guardrail restrictions and data policy"` | **Not a code or key problem.** OpenRouter's own account-level Privacy setting blocks all `:free` models from routing until you opt in. | Go to [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy) and enable the free-model / prompt-training data policy toggle (OpenRouter requires this before any `:free` model will serve a request to a new key). Also clear any "Allowed Providers" / "Ignored Providers" restriction under [openrouter.ai/settings/preferences](https://openrouter.ai/settings/preferences) — an over-restricted provider list produces the same 404. Re-run `itsbob doctor --probe` after saving. |
+| `ITSBOB_GROQ_MODEL=llama-3.1-8b-instruct` (or another hand-typed id) still 404s | a typo, or that exact id doesn't exist on Groq (`instruct` vs. the real `instant`) | `itsbob doctor --probe` first to see which ids actually answer for your key, then pin one of *those* — don't guess a model id from memory |
 | `itsbob gui` prints an error about Flask | the `gui` extra wasn't installed | `pip install -e ".[gui]"` |
 | `itsbob route ...` always returns Tier S | both the local Back Brain and every cloud provider are unavailable | `itsbob doctor`; you need at least one of Ollama running or a cloud key set, or Tier D/C-only states, to avoid the halt |
 | `itsbob doctor` shows `ollama -- not reachable` | Ollama isn't installed or `ollama serve` isn't running | `ollama serve` in another terminal, and `ollama pull qwen2.5:1.5b`; re-run `itsbob doctor` |
@@ -370,6 +444,7 @@ src/itsbob/
     cache.py            SemanticCache — fingerprint-keyed, TTL
     scripts.py          ScriptRegistry, default_registry() — the Golden Rule's name→macro map
     pipeline.py          ComplexityRouter — dispatch, cost-aware prompts, timeout escalation
+    google_tiered.py      build_google_tiered_router() — Google-only, two Gemini models, one per tier
 
   gui/               browser GUI (needs the `gui` extra)
     app.py             Flask app: /, /api/status, /api/route, /api/classify

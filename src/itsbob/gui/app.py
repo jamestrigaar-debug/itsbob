@@ -19,6 +19,8 @@ import threading
 import webbrowser
 from typing import Any
 
+import os
+
 from ..config import Settings
 from ..factory import build_router
 from ..llm.local import is_ollama_running
@@ -67,23 +69,39 @@ def create_app():
 
     @app.get("/api/status")
     def status():
-        cloud_router = build_router(settings)
-        providers = [
-            {
-                "name": row["provider"],
-                "configured": row["configured"],
-                "models": row["models"],
-                "circuit_open": row["circuit_open"],
+        mode = os.environ.get("ITSBOB_ROUTER_MODE", "priority").strip() or "priority"
+
+        def describe(router) -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": row["provider"],
+                    "configured": row["configured"],
+                    "models": row["models"],
+                    "circuit_open": row["circuit_open"],
+                }
+                for row in router.describe()
+            ]
+
+        if mode == "google-tiered":
+            router = get_router()
+            tier_info = {
+                "tier_b": describe(router.cloud_router),
+                "tier_a": describe(router.premium_router),
             }
-            for row in cloud_router.describe()
-        ]
+            providers = tier_info["tier_b"]  # for clients that only read the flat list
+        else:
+            tier_info = None
+            providers = describe(build_router(settings))
+
         return jsonify(
             {
+                "mode": mode,
                 "local_back_brain": {
                     "reachable": is_ollama_running(),
                     "note": "ollama serve on 127.0.0.1:11434",
                 },
                 "cloud_providers": providers,
+                "tiers": tier_info,
             }
         )
 
@@ -218,9 +236,16 @@ async function refreshStatus() {
   try {
     const r = await fetch('/api/status'); const s = await r.json();
     const bits = [];
+    bits.push(`<span class="stat">mode: ${s.mode}</span>`);
     bits.push(`<span class="stat ${s.local_back_brain.reachable ? 'ok' : 'down'}">Back Brain (Tier C): ${s.local_back_brain.reachable ? 'reachable' : 'offline → heuristic fallback'}</span>`);
-    for (const p of s.cloud_providers) {
-      bits.push(`<span class="stat ${p.configured ? 'ok' : 'down'}">${p.name}: ${p.configured ? 'configured' : 'no key'}</span>`);
+    const providerPill = (p) => `<span class="stat ${p.configured ? 'ok' : 'down'}">${p.name}${p.models && p.models[0] ? ' · ' + p.models[0] : ''}: ${p.configured ? 'configured' : 'no key'}</span>`;
+    if (s.tiers) {
+      bits.push('<span class="stat">Tier B (Google, cheap):</span>');
+      s.tiers.tier_b.forEach(p => bits.push(providerPill(p)));
+      bits.push('<span class="stat">Tier A (Google, premium):</span>');
+      s.tiers.tier_a.forEach(p => bits.push(providerPill(p)));
+    } else {
+      for (const p of s.cloud_providers) bits.push(providerPill(p));
     }
     el.innerHTML = bits.join('');
   } catch (e) { el.innerHTML = '<span class="stat down">status unavailable</span>'; }

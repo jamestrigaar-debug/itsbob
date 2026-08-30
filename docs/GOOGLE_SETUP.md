@@ -173,7 +173,21 @@ others) rather than restricting to only it:
 export ITSBOB_PROVIDER_ORDER=google,groq,openrouter
 ```
 
-For the complexity router specifically, Google/Gemini Flash is a natural
-default for `cloud_router` (Tier B) given its speed/cost profile — see
-[README: Cloud providers](../README.md#cloud-providers-tier-b--tier-a--optional)
-for wiring a separate, more expensive model in as Tier A.
+## 7. Google answering every complexity-router cloud tier
+
+If you want Google to be the *only* cloud provider the
+[complexity router](../README.md#the-router-pipeline) uses — at two
+different Gemini models, a cheap one for Tier B and a stronger one for
+Tier A, with Groq/OpenRouter only as a backup tried after Google rather
+than before it — that's **google-tiered mode**:
+
+```bash
+export ITSBOB_ROUTER_MODE=google-tiered
+itsbob doctor       # shows Tier B and Tier A as two separate Gemini chains
+itsbob route '{"facts": {"opponent_formation": "4-3-3"}, "events": ["opponent tactic shift"]}'
+```
+
+Only `GOOGLE_API_KEY` is required for this mode. See [README:
+Google-tiered mode](../README.md#google-tiered-mode--google-answers-every-cloud-tier-itself)
+for the full model ladder, how to disable the Groq/OpenRouter backup
+entirely, and how to pin different Gemini model ids.

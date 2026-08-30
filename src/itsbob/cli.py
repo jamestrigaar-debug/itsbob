@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Sequence
 
@@ -100,6 +101,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     route.add_argument("state", help="JSON game state, or @path/to/file.json")
     route.add_argument("--goal", default="win the league")
+    route.add_argument(
+        "--mode",
+        default=None,
+        choices=("priority", "google-tiered"),
+        help="cloud wiring: 'priority' tries every configured provider; "
+        "'google-tiered' uses Google alone, at two Gemini models "
+        "(overrides ITSBOB_ROUTER_MODE for this call)",
+    )
 
     gui = sub.add_parser("gui", help="launch the browser GUI (requires the 'gui' extra)")
     gui.add_argument("--host", default="127.0.0.1")
@@ -166,12 +175,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     settings = Settings.from_env(dotenv=None)
-    router = build_router(settings)
+    router_mode = os.environ.get("ITSBOB_ROUTER_MODE", "priority").strip() or "priority"
+    print(f"router mode: {router_mode}  (ITSBOB_ROUTER_MODE; 'priority' or 'google-tiered')\n")
 
-    print("configured providers (in try-order):")
-    for row in router.describe():
-        mark = "ok " if row["configured"] else "-- "
-        print(f"  {mark}{row['provider']:<12} rpm={row['rpm']:<4} models={row['models']}")
+    if router_mode == "google-tiered":
+        from .router import build_google_tiered_router
+
+        complexity_router = build_google_tiered_router(settings)
+        print("Tier B (cheap Gemini, in try-order):")
+        for row in complexity_router.cloud_router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} models={row['models']}")
+        print("\nTier A (premium Gemini, in try-order):")
+        for row in complexity_router.premium_router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} models={row['models']}")
+        router = complexity_router.cloud_router
+    else:
+        router = build_router(settings)
+        print("configured providers (in try-order):")
+        for row in router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} rpm={row['rpm']:<4} models={row['models']}")
 
     print("\nlocal Back Brain (Tier C, the Gatekeeper's classifier engine):")
     if is_ollama_running():
@@ -188,7 +213,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\nprobing:")
     answered = 0
-    for provider in router.providers:
+    probe_providers = router.providers
+    if router_mode == "google-tiered":
+        # Tier A's premium model is a *different* Google provider instance
+        # than Tier B's — probe both, de-duplicated by (name, model tuple).
+        seen = {(p.name, p.models) for p in probe_providers}
+        probe_providers = list(probe_providers) + [
+            p for p in complexity_router.premium_router.providers
+            if (p.name, p.models) not in seen
+        ]
+    for provider in probe_providers:
         if not provider.is_configured():
             print(f"  -- {provider.name:<12} no API key")
             continue
@@ -268,7 +302,7 @@ def _cmd_classify(args: argparse.Namespace) -> int:
 
 def _cmd_route(args: argparse.Namespace) -> int:
     settings = Settings.from_env(dotenv=None)
-    router = build_complexity_router(settings, goal=args.goal)
+    router = build_complexity_router(settings, goal=args.goal, mode=args.mode)
     result = router.route(_load_state_arg(args.state))
     print(json.dumps(result.as_dict(), indent=2))
     return 0 if result.ok else 1

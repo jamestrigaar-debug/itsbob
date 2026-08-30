@@ -43,15 +43,24 @@ OPENROUTER = ProviderConfig(
 
 # Groq's free tier is generous and extremely fast — good default for a
 # simulation that makes a call every tick.
+#
+# Groq deprecates models on its own schedule, independent of this repo — the
+# 3.3/3.1 Llama ids below are kept as fallbacks because Groq brings models
+# back and reintroduces similarly-named ones often enough that dropping them
+# outright just repeats this same churn later. gpt-oss-20b and gemma2-9b-it
+# are listed first because they're the two that have proven reliably live
+# across multiple `itsbob doctor --probe` runs; if they 404 for you too, run
+# `itsbob doctor --probe` and pin whatever answers with `ITSBOB_GROQ_MODEL`
+# (see README: Optional tuning env vars).
 GROQ = ProviderConfig(
     name="groq",
     base_url="https://api.groq.com/openai/v1",
     api_key_env="GROQ_API_KEY",
-    default_model="llama-3.3-70b-versatile",
+    default_model="openai/gpt-oss-20b",
     fallback_models=(
-        "llama-3.1-8b-instant",
-        "openai/gpt-oss-20b",
         "gemma2-9b-it",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
     ),
     requests_per_minute=30,
 )
