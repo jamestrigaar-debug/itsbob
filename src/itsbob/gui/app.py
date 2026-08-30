@@ -472,7 +472,8 @@ def run_gui(
     app = create_app(home, mode=mode)
     shown = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host  # noqa: S104
     url = f"http://{shown}:{port}"
-    print(f"  itsbob → {url}")
+    print(f"  itsbob  → {url}")
+    print(f"  messages → {url}/messages   (what it said without being asked)")
     print("  ctrl-c to stop\n")
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()

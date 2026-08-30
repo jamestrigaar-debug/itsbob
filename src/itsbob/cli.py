@@ -105,7 +105,7 @@ def _build_agent(args: argparse.Namespace, *, interactive: bool = True):
         mode=getattr(args, "mode", None),
         confirm=_confirmer(getattr(args, "yes", False)) if interactive else None,
         persona=persona,
-        max_steps=getattr(args, "max_steps", 8),
+        max_steps=getattr(args, "max_steps", 10),
         embeddings=not getattr(args, "no_embeddings", False),
     )
 
@@ -971,7 +971,11 @@ def _build_parser() -> argparse.ArgumentParser:
     chat = with_mode(add("chat", "Interactive conversation."))
     chat.add_argument("-v", "--verbose", action="store_true", help="show tiers and tool results")
     chat.add_argument("-y", "--yes", action="store_true", help="approve every tool without asking")
-    chat.add_argument("--max-steps", type=int, default=8)
+    chat.add_argument(
+        "--max-steps", type=int, default=10,
+        help="steps before the budget checks whether it is getting anywhere "
+             "(it extends itself while it is, up to 60)",
+    )
     chat.add_argument("--no-embeddings", action="store_true", help="keyword-only recall, no API calls")
     chat.set_defaults(handler=_cmd_chat)
 
@@ -981,7 +985,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument("-v", "--verbose", action="store_true")
     ask.add_argument("-y", "--yes", action="store_true")
     ask.add_argument("--json", action="store_true", help="machine-readable turn record")
-    ask.add_argument("--max-steps", type=int, default=8)
+    ask.add_argument("--max-steps", type=int, default=10)
     ask.add_argument("--no-embeddings", action="store_true")
     ask.set_defaults(handler=_cmd_ask)
 
