@@ -417,3 +417,141 @@ def test_a_malformed_extra_pattern_does_not_break_the_gate():
     tool = Tool(name="run_shell", description="", run=lambda p, c: ToolResult(True), risk=Risk.EXECUTE)
     assert policy.evaluate(tool, {"command": "ls"}).allowed is True
     assert policy.evaluate(tool, {"command": "nukeit now"}).allowed is False
+
+
+# -- from a user's install log: a rejected key looked healthy ---------------
+
+
+class _SdkError(Exception):
+    """Shaped like the openai SDK's exceptions, which carry status_code."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status_code = status
+
+
+def test_an_invalid_key_is_a_provider_failure_not_a_bad_model():
+    """Google returns 400 for a bad key, which read as 'try the next model' —
+    so an invalid key burned every model on every call and reported it as a
+    model problem."""
+    from itsbob.llm.base import BadRequest, ProviderNotConfigured
+    from itsbob.llm.providers import _translate_error
+
+    bad_key = _SdkError(
+        "Error code: 400 - [{'error': {'code': 400, 'message': "
+        "'Please pass a valid API key', 'status': 'INVALID_ARGUMENT'}}]",
+        400,
+    )
+    assert isinstance(_translate_error("google", bad_key), ProviderNotConfigured)
+
+    dead_model = _SdkError(
+        "Error code: 400 - {'error': {'message': 'The model `gemma2-9b-it` has been "
+        "decommissioned'}}",
+        400,
+    )
+    assert isinstance(_translate_error("groq", dead_model), BadRequest)
+
+
+def test_a_rejected_key_costs_one_attempt_not_every_model():
+    """The router must move to the next provider, not walk the dead one's list."""
+    from itsbob.llm.base import LLMRequest, LLMResponse, Provider, Usage, user
+    from itsbob.llm.router import LLMRouter
+    from itsbob.config import ProviderConfig
+
+    attempts: list[str] = []
+
+    class Rejecting(Provider):
+        def __init__(self):
+            super().__init__(ProviderConfig(
+                name="dead", base_url="", api_key_env="X",
+                default_model="m1", fallback_models=("m2", "m3", "m4"),
+            ))
+
+        def is_configured(self, env=None):
+            return True
+
+        def _complete(self, request, model):
+            attempts.append(model)
+            from itsbob.llm.providers import _translate_error
+
+            raise _translate_error(
+                "dead", _SdkError("{'error': {'message': 'Please pass a valid API key'}}", 400)
+            )
+
+    class Working(Provider):
+        def __init__(self):
+            super().__init__(ProviderConfig(
+                name="alive", base_url="", api_key_env="Y", default_model="good",
+            ))
+
+        def is_configured(self, env=None):
+            return True
+
+        def _complete(self, request, model):
+            return LLMResponse(text="ready", model=model, provider="alive", usage=Usage(1, 1))
+
+    router = LLMRouter([Rejecting(), Working()], max_attempts=4)
+    response = router.complete(LLMRequest(messages=[user("hi")]))
+    assert response.provider == "alive"
+    assert attempts == ["m1"], f"burned {len(attempts)} attempts on a key that cannot work"
+
+
+def test_the_vendors_own_message_is_extracted():
+    from itsbob.llm.providers import vendor_message
+
+    exc = _SdkError(
+        "Error code: 404 - {'error': {'message': 'The model `x` does not exist', 'code': 404}}", 404
+    )
+    assert vendor_message(exc) == "The model `x` does not exist"
+
+
+@pytest.mark.parametrize(
+    "key,wrong",
+    [
+        ("AQ.Ab8RN6IZ5YmwV0v9wgkQQckhCgESjBQ1qX-TXRf", True),   # an OAuth token
+        ("ya29.a0AfH6SMBx1234567890", True),
+        ("AIzaSyA123456789012345678901234567890", False),
+        ("", False),                                            # nothing to judge
+    ],
+)
+def test_a_google_key_of_the_wrong_shape_is_flagged_before_the_api_call(key, wrong):
+    from itsbob.setup_wizard import key_looks_wrong
+
+    assert (key_looks_wrong("GOOGLE_API_KEY", key) is not None) is wrong
+
+
+def test_model_ids_from_google_are_normalized():
+    """Google's /models returns `models/gemini-x`; chat wants `gemini-x`. Comparing
+    them raw made every configured model look retired."""
+    import json as _json
+    from unittest.mock import patch
+
+    from itsbob.config import ProviderConfig
+    from itsbob.llm.catalog import list_models
+
+    payload = _json.dumps({"data": [{"id": "models/gemini-3.5-flash"}, {"id": "gpt-oss-20b"}]})
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return payload.encode()
+
+    config = ProviderConfig(name="g", base_url="https://x/v1", api_key_env="K", default_model="m")
+    with patch("urllib.request.urlopen", return_value=_Response()):
+        with patch("json.load", return_value=_json.loads(payload)):
+            assert list_models(config, {"K": "key"}) == ("gemini-3.5-flash", "gpt-oss-20b")
+
+
+def test_listing_models_never_raises_when_unreachable():
+    from itsbob.config import ProviderConfig
+    from itsbob.llm.catalog import list_models
+
+    config = ProviderConfig(
+        name="g", base_url="https://127.0.0.1:1/v1", api_key_env="K", default_model="m"
+    )
+    assert list_models(config, {"K": "key"}, timeout=0.2) == ()

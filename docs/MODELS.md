@@ -82,6 +82,30 @@ TIER_MODELS[Tier.A] = ("gemini-pro-latest",)
 brain = build_brain()
 ```
 
+## When a key is rejected
+
+Symptom: every model on one provider fails at once, and `itsbob doctor
+--probe` marks them `[auth]`.
+
+```
+!! google  gemini-3.5-flash  [auth] google: Please pass a valid API key — check the key for this provider
+```
+
+That is the *key*, not the models. Two things to check:
+
+**Is it the right kind of credential?** An AI Studio key starts with `AIza`
+and is about 39 characters. A value starting `AQ.` or `ya29.` is an OAuth
+token — a different thing entirely, and Google rejects it with exactly the
+message above. `itsbob setup` warns about this before it spends a request.
+
+**Is it still valid?** Keys can be revoked or scoped to a project without
+Generative Language API access. Create a fresh one at
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+
+While a rejected key is set, itsbob still tries that provider first on every
+call — it costs one wasted attempt each time and pushes everything onto your
+backup provider. Either fix it or remove it from `~/.itsbob/.env`.
+
 ## When a model id dies
 
 Free and preview model ids get retired and renamed constantly. This is the
@@ -89,8 +113,15 @@ normal failure, not an unusual one — the whole `llm/` layer exists to absorb
 it. Symptom: `BadRequest ... 404 ... is no longer available`.
 
 ```bash
-itsbob doctor --probe     # which ids answer for your key today
+itsbob models             # what each provider serves today, vs what itsbob asks for
+itsbob models --provider groq --all
+itsbob doctor --probe     # actually call each one
 ```
+
+`itsbob models` reads the provider's own `/models` endpoint, so it is never
+stale the way this page will eventually be. Anything itsbob is configured to
+try but the provider no longer serves is flagged, with the env var to pin a
+live one.
 
 Or ask Google directly:
 

@@ -24,7 +24,7 @@ from typing import Mapping
 
 from .config import find_dotenv, itsbob_home, load_dotenv
 
-__all__ = ["run_setup", "write_env", "verify_key", "DEFAULT_KEYS"]
+__all__ = ["run_setup", "write_env", "verify_key", "key_looks_wrong", "DEFAULT_KEYS"]
 
 #: Recognised providers, in the order they are offered. Google first because
 #: one key covers all three tiers, which nothing else does.
@@ -34,7 +34,39 @@ DEFAULT_KEYS = (
     ("OPENROUTER_API_KEY", "OpenRouter", "https://openrouter.ai/keys", False),
 )
 
-_TICK, _CROSS, _DOT = "✓", "✗", "·"
+_TICK, _CROSS, _DOT, _WARN = "✓", "✗", "·", "!"
+
+#: What a real key from each vendor looks like. Checked before spending an API
+#: call, because "that is not a key for this service" is a much more useful
+#: thing to be told than a 400 three seconds later — and because the shapes are
+#: distinctive enough that a mismatch is almost never a false alarm. A warning,
+#: never a refusal: vendors change formats and a stale check must not lock
+#: anyone out of their own working key.
+_KEY_SHAPES = {
+    "GOOGLE_API_KEY": (
+        lambda k: k.startswith("AIza") and len(k) >= 35,
+        "Google AI Studio keys start with `AIza` and are about 39 characters. "
+        "A value starting `AQ.` or `ya29.` is an OAuth token, not an API key — "
+        "those are rejected with \"Please pass a valid API key\".",
+    ),
+    "GROQ_API_KEY": (
+        lambda k: k.startswith("gsk_"),
+        "Groq keys start with `gsk_`.",
+    ),
+    "OPENROUTER_API_KEY": (
+        lambda k: k.startswith("sk-or-"),
+        "OpenRouter keys start with `sk-or-`.",
+    ),
+}
+
+
+def key_looks_wrong(name: str, key: str) -> str | None:
+    """A warning if the key is not shaped like one for this vendor, else None."""
+    shape = _KEY_SHAPES.get(name)
+    if shape is None or not key.strip():
+        return None
+    matches, explanation = shape
+    return None if matches(key.strip()) else explanation
 
 
 def _say(message: str = "") -> None:
@@ -178,6 +210,13 @@ def run_setup(
             _say(f"     Get one at {url}")
             value = _ask(f"     Paste your {name} (or press Enter to skip): ", secret=True)
             if value:
+                warning = key_looks_wrong(name, value)
+                if warning:
+                    _say(f"     {_WARN} That does not look like a {label} key.")
+                    _say(f"       {warning}")
+                    if not _confirm("       Use it anyway?", default=False):
+                        _say(f"     {_DOT} skipped — get one at {url}")
+                        continue
                 collected[name] = value
             elif primary:
                 _say(f"     {_DOT} skipped — itsbob will run offline until you add one")
@@ -188,18 +227,34 @@ def run_setup(
             os.environ[key] = value
         _say()
         _say(f"  {_TICK} wrote {len(collected)} key(s) to {target} (mode 600)")
+        # Also flagged here, not only on rejection: a non-interactive run
+        # (--google-key ...) never saw the prompt, and a key that happens to be
+        # accepted today through some proxy is still the wrong kind of key.
+        for key, value in collected.items():
+            warning = key_looks_wrong(key, value)
+            if warning:
+                _say(f"  {_WARN} {key} does not look like a key for that service.")
+                _say(f"    {warning}")
 
     # 3. Verification — the only step that proves anything.
     configured = [name for name, *_ in DEFAULT_KEYS if os.environ.get(name, "").strip()]
     working = 0
+    rejected: list[str] = []
     if verify and configured:
         _say()
         _say("  Checking each key against the real API…")
         for name in configured:
-            ok, detail = verify_key(name, os.environ[name])
+            key = os.environ[name]
+            shape_warning = key_looks_wrong(name, key)
+            ok, detail = verify_key(name, key)
             mark = _TICK if ok else _CROSS
             _say(f"  {mark} {name:<20} {detail}")
-            working += bool(ok)
+            if ok:
+                working += 1
+            else:
+                rejected.append(name)
+                if shape_warning:
+                    _say(f"    {_WARN} {shape_warning}")
     elif not configured:
         _say()
         _say(f"  {_DOT} No keys configured. itsbob will run, but it cannot think:")
@@ -221,7 +276,11 @@ def run_setup(
     if working:
         _say(f"  {_TICK} Ready. {working} provider(s) answering.")
     elif configured:
-        _say(f"  {_CROSS} Keys are set but none answered. Run `itsbob doctor --probe` for detail.")
+        _say(f"  {_CROSS} Keys are set but none answered — itsbob cannot think yet.")
+        for name in rejected:
+            url = next((u for n, _, u, _ in DEFAULT_KEYS if n == name), "")
+            _say(f"    {name} was rejected. Get a working key at {url}")
+        _say("    Then re-run `itsbob setup`, or `itsbob doctor --probe` for the full errors.")
     else:
         _say(f"  {_DOT} Set up, but with no model configured.")
     _say()
@@ -232,8 +291,7 @@ def run_setup(
     _say("    itsbob serve                let it work on its own")
     _say()
 
-    if interactive and working and _confirm("  Open the browser interface now?", default=False):
-        from .gui.app import run_gui
-
-        run_gui(home=root)
+    # Deliberately no "open the browser now?" prompt: it lands at the very end
+    # of an installer, when people are already typing their next command, and
+    # swallows it.
     return 0 if (working or not configured) else 1

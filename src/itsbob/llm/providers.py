@@ -153,6 +153,50 @@ class GoogleProvider(OpenAICompatibleProvider):
 
 _STATUS_RE = re.compile(r"\b(4\d\d|5\d\d)\b")
 
+#: Vendors disagree about the status code for a bad credential. Google returns
+#: **400** with "Please pass a valid API key", not 401 — so a status-only
+#: classification files it under "bad request", which the router reads as "bad
+#: model, try the next one". The result was that an invalid key burned every
+#: model on the provider, on every single call, and reported it as a model
+#: problem. Matching the message is the only reliable way to tell the two
+#: apart.
+_AUTH_MARKERS = (
+    "api key not valid",
+    "api_key_invalid",
+    "pass a valid api key",
+    "invalid api key",
+    "incorrect api key",
+    "invalid authentication",
+    "unauthenticated",
+    "no auth credentials",
+    "authentication failed",
+    "invalid_api_key",
+    "permission denied",
+)
+
+
+def _looks_like_bad_credentials(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _AUTH_MARKERS)
+
+
+def vendor_message(exc: Exception) -> str:
+    """The vendor's own explanation, dug out of the SDK's wrapper.
+
+    ``BadRequestError: Error code: 400 - [{'error': {'code': 400, 'message':
+    'Please pass a valid API key'...`` — everything a person needs is in there,
+    and it is exactly the part that gets cut off when the string is truncated
+    for display.
+    """
+    text = str(exc)
+    match = re.search(r"'message':\s*(['\"])(.*?)\1", text, re.DOTALL)
+    if match:
+        return match.group(2).strip()
+    match = re.search(r'"message":\s*"(.*?)"', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
 
 def _translate_error(provider: str, exc: Exception) -> Exception:
     """Map an SDK exception onto our error vocabulary.
@@ -168,12 +212,18 @@ def _translate_error(provider: str, exc: Exception) -> Exception:
         match = _STATUS_RE.search(str(exc))
         status = int(match.group(1)) if match else None
 
-    message = f"{provider}: {type(exc).__name__}: {exc}"[:500]
+    detail = vendor_message(exc)
+    message = f"{provider}: {detail}"[:500]
 
     if status == 429:
         return RateLimited(message, retry_after=_retry_after(exc))
-    if status in (401, 403):
-        return ProviderNotConfigured(message)
+    if status in (401, 403) or _looks_like_bad_credentials(detail):
+        # Provider-level, whatever the status code says: no other model on this
+        # host will accept the credential either, so trying them wastes the
+        # attempt budget and buries the real cause under model errors.
+        return ProviderNotConfigured(
+            f"{provider}: {detail} — check the key for this provider"[:500]
+        )
     if status == 404:
         return BadRequest(message)
     if status is not None and 500 <= status < 600:
