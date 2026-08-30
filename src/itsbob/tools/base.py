@@ -45,7 +45,21 @@ __all__ = [
 
 
 class Risk(str, Enum):
-    """What a tool can do if it goes wrong. Ordered, and the ordering is used."""
+    """What a tool can do if it goes wrong. Ordered, and the ordering is used.
+
+    The ordering is defined explicitly, in both directions. An earlier version
+    supplied only ``__ge__``/``__gt__``, so ``<`` and ``<=`` fell through to
+    ``str`` and compared alphabetically: ``Risk.READ < Risk.EXECUTE`` was
+    **False**, and ``sorted()`` put destructive first. A policy check written
+    the natural way round would have permitted exactly what it meant to refuse.
+
+    All four comparisons are written out rather than derived with
+    ``functools.total_ordering``, which does nothing useful on a ``str`` mixin:
+    it only fills in operators the class does not already have, and ``str``
+    supplies every one of them. Decorating this class with it left ``>``
+    comparing alphabetically while ``<`` compared correctly — a worse state
+    than before, because the two disagreed.
+    """
 
     READ = "read"  #: observes only — a wrong call wastes time, nothing else
     WRITE = "write"  #: changes files inside the workspace
@@ -57,9 +71,14 @@ class Risk(str, Enum):
     def level(self) -> int:
         return _RISK_ORDER[self]
 
-    def __ge__(self, other: object) -> bool:  # type: ignore[override]
+    def __lt__(self, other: object) -> bool:  # type: ignore[override]
         if isinstance(other, Risk):
-            return self.level >= other.level
+            return self.level < other.level
+        return NotImplemented
+
+    def __le__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Risk):
+            return self.level <= other.level
         return NotImplemented
 
     def __gt__(self, other: object) -> bool:  # type: ignore[override]
@@ -67,6 +86,18 @@ class Risk(str, Enum):
             return self.level > other.level
         return NotImplemented
 
+    def __ge__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Risk):
+            return self.level >= other.level
+        return NotImplemented
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Risk):
+            return self.value == other.value
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.value)
 
 _RISK_ORDER = {
     Risk.READ: 0,

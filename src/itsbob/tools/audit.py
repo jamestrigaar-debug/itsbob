@@ -11,14 +11,14 @@ from doing is the more interesting half of the log.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
+from ..logfile import JsonlFile
 from .base import ToolCall, ToolResult
 
 __all__ = ["AuditLog"]
@@ -38,13 +38,18 @@ class AuditLog:
     #: activity without re-reading the file.
     keep: int = 500
     max_value_chars: int = 2000
+    #: Rotate past this size. An agent that runs for months otherwise fills the
+    #: disk one tool call at a time, and nothing notices until it is full.
+    max_bytes: int = 5_000_000
+    backups: int = 3
 
     def __post_init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._file: JsonlFile | None = None
         if self.path is not None:
             self.path = Path(self.path).expanduser()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = JsonlFile(self.path, max_bytes=self.max_bytes, keep=self.backups)
 
     def record(
         self,
@@ -71,37 +76,24 @@ class AuditLog:
             self.entries.append(entry)
             if len(self.entries) > self.keep:
                 del self.entries[: len(self.entries) - self.keep]
-            if self.path is not None:
-                with self.path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(entry, default=str) + "\n")
+        if self._file is not None:
+            self._file.append(entry)
         return entry
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return list(self.entries[-limit:])
 
-    def read(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
-        """Replay the file, oldest first. Skips lines that aren't valid JSON."""
-        if self.path is None or not self.path.exists():
-            return iter(())
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        if limit is not None:
-            lines = lines[-limit:]
-
-        def _iter() -> Iterator[dict[str, Any]]:
-            for line in lines:
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-        return _iter()
+    def read(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Replay from disk, oldest first, across rotations."""
+        return self._file.read(limit) if self._file is not None else []
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             entries = list(self.entries)
         return {
             "path": str(self.path) if self.path else None,
+            "bytes": self._file.size() if self._file is not None else 0,
             "in_memory": len(entries),
             "ok": sum(1 for e in entries if e["ok"] is True),
             "failed": sum(1 for e in entries if e["ok"] is False),

@@ -34,8 +34,16 @@ Per-tool overrides: `ITSBOB_AUTO_ALLOW`, `ITSBOB_ALWAYS_CONFIRM` (which wins),
 A call that needs a human, with no confirmation handler attached, is **denied**.
 Not queued, not assumed-yes.
 
-This applies to the daemon, the browser interface, and any piped or scripted
-invocation. `itsbob chat` attaches a handler only when stdin is a terminal.
+This applies to the daemon and to any piped or scripted invocation. `itsbob
+chat` attaches a handler only when stdin is a terminal.
+
+The browser interface *does* attach one, because a browser is somewhere a
+person actually is: a tool needing approval raises a card showing the exact
+arguments, and the agent blocks on the answer. The fail-closed property is kept
+by the timeout — a card nobody answers within three minutes is **denied**, so a
+closed tab, a backgrounded laptop, or a card scrolled off screen can never
+become an approval. "Always allow this tool" lasts for that browser session
+only and is never written to disk.
 
 The reasoning: a prompt nobody can see is not consent. It also means the
 always-on mode is safe *by construction* rather than by convention — you cannot
@@ -100,7 +108,9 @@ where `~/.itsbob` lives.
 
 **It is not multi-user.** No authentication anywhere. The browser interface
 binds to `127.0.0.1`, and anything that can reach that port can run allowed
-tools as you.
+tools as you — including approving its own confirmation prompts. `itsbob gui
+--public` binds to every interface and warns you at the point of use; only do
+that on a network where you would hand someone your shell.
 
 **It does not sandbox the network.** `ITSBOB_ALLOWED_HOSTS` restricts which
 hosts the *tools* will reach. It does nothing about a script that opens its own

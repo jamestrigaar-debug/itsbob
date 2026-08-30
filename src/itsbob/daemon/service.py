@@ -19,12 +19,25 @@ recorded against that task and the loop continues. Five consecutive failures
 disable the task, because at that point it is broken rather than unlucky and
 running it hourly forever helps nobody.
 
+**Nor can a slow one.** Tasks run on a worker thread with a hard wall-clock
+deadline. Without it a single task that wedges — a tool waiting on a socket
+that never answers — stalls every other schedule indefinitely, and the symptom
+("my 8am briefing stopped arriving") points nowhere near the cause. Python
+cannot kill a thread, so an overrunning task is abandoned rather than stopped:
+it is recorded as failed, the loop moves on, and the orphan finishes into a
+locked database where it can do no damage. That is a real cost, and it is
+still much better than blocking the daemon.
+
+**Ctrl-C and SIGTERM stop it cleanly.** A service manager stopping the daemon
+mid-task would otherwise lose the run record entirely.
+
 Each run gets a fresh conversation and the shared long-term memory, so a task
 starts clean but can still notice "third morning in a row".
 """
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -34,10 +47,14 @@ from typing import Any, Callable
 from ..agent import Agent, build_agent
 from ..agent.context import Conversation
 from ..memory.base import MemoryKind, MemoryRecord
-from .notify import MultiSink, Notification, NoticeGate, default_sink
+from .notify import Notification, NoticeGate, default_sink
 from .tasks import Task, TaskRun, TaskStore
 
-__all__ = ["Daemon", "DaemonEvent"]
+__all__ = ["Daemon", "DaemonEvent", "TaskTimeout"]
+
+
+class TaskTimeout(TimeoutError):
+    """A task ran past the daemon's per-task deadline and was abandoned."""
 
 
 @dataclass
@@ -65,6 +82,8 @@ class Daemon:
         max_sleep: float = 60.0,
         on_event: EventFn | None = None,
         remember_runs: bool = True,
+        task_timeout: float = 600.0,
+        handle_signals: bool = True,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -77,7 +96,14 @@ class Daemon:
         self.max_sleep = max_sleep
         self.on_event = on_event
         self.remember_runs = remember_runs
+        #: Hard wall-clock bound per task. Generous, because a task may
+        #: legitimately do a lot of work; finite, because nothing may wedge the
+        #: loop. Set to 0 to disable (and accept that a stuck task stops
+        #: everything).
+        self.task_timeout = task_timeout
+        self.handle_signals = handle_signals
         self._stop = threading.Event()
+        self._abandoned = 0
         self.started_at: float | None = None
         self.runs_completed = 0
         self.notifications_sent = 0
@@ -85,17 +111,35 @@ class Daemon:
     # -- lifecycle ---------------------------------------------------------
 
     def run_forever(self) -> None:
-        """Block until :meth:`stop` is called or the process is interrupted."""
+        """Block until :meth:`stop` is called, or a stop signal arrives."""
         self.started_at = time.time()
+        self._install_signal_handlers()
         self._emit("started", tasks=len(self.tasks), policy=self.agent.toolbox.policy.mode.value)
         try:
             while not self._stop.is_set():
                 self.tick()
+                if self._stop.is_set():
+                    break
                 self._stop.wait(self._sleep_for())
         except KeyboardInterrupt:  # pragma: no cover - interactive
             pass
         finally:
             self._emit("stopped", runs=self.runs_completed, notified=self.notifications_sent)
+
+    def _install_signal_handlers(self) -> None:
+        """Turn SIGTERM/SIGINT into a clean stop, when we can.
+
+        ``signal.signal`` only works on the main thread, and a caller embedding
+        the daemon may want its own handlers — so a failure here is ignored
+        rather than fatal.
+        """
+        if not self.handle_signals:
+            return
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, lambda *_: self.stop())
+            except (ValueError, OSError, AttributeError):  # not main thread, or unsupported
+                return
 
     def stop(self) -> None:
         self._stop.set()
@@ -128,11 +172,20 @@ class Daemon:
 
         status, output, tools = "ok", "", ()
         try:
-            turn = self._run_prompt(task.prompt)
+            turn = self._run_bounded(task)
             output = turn.final
             tools = tuple(turn.tools_used)
             if turn.error:
                 status = "failed"
+        except TaskTimeout:
+            status = "failed"
+            self._abandoned += 1
+            output = (
+                f"exceeded the {self.task_timeout:g}s task limit and was abandoned. "
+                "It may still be running in the background; the daemon moved on so "
+                "other schedules are not held up."
+            )
+            self._emit("error", task=task.name, error=output)
         except Exception as exc:  # noqa: BLE001 - one task must not stop the loop
             status = "failed"
             output = f"{type(exc).__name__}: {exc}"
@@ -172,10 +225,50 @@ class Daemon:
         task = self.tasks.find(needle)
         return None if task is None else self.run_task(task)
 
+    def _run_bounded(self, task: Task):
+        """Run one task with a hard deadline, on its own thread.
+
+        A fresh thread per run, not a shared worker pool. With a pool of one, a
+        task that wedges holds the only worker and every *subsequent* task times
+        out behind it — which turns one broken task into a broken daemon, the
+        exact failure the deadline exists to prevent. A pool sized above one
+        just moves the ceiling. Daemon threads, so an abandoned run never keeps
+        the process alive at exit.
+        """
+        if not self.task_timeout:
+            return self._run_prompt(task.prompt)
+
+        box: dict[str, Any] = {}
+
+        def target() -> None:
+            try:
+                box["value"] = self._run_prompt(task.prompt)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                box["error"] = exc
+
+        thread = threading.Thread(
+            target=target, name=f"itsbob-task-{task.id}", daemon=True
+        )
+        thread.start()
+        thread.join(self.task_timeout)
+        if thread.is_alive():
+            raise TaskTimeout(f"task {task.name!r} exceeded {self.task_timeout:g}s")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
     def _run_prompt(self, prompt: str):
         # A fresh conversation per run: a nightly task should not inherit
         # yesterday's context. Long-term memory is shared, so it still can.
         self.agent.conversation = Conversation()
+        # The agent's own budget sits just inside the daemon's, so an overrun
+        # normally ends as a proper turn ("I ran out of time, here is what I
+        # found") rather than as an abandoned thread.
+        # getattr, because the agent is injectable and a stand-in need not
+        # carry every field the real one does.
+        current = getattr(self.agent, "max_seconds", None)
+        if self.task_timeout and isinstance(current, (int, float)):
+            self.agent.max_seconds = min(current, self.task_timeout * 0.9)
         return self.agent.chat(prompt)
 
     def _deliver(self, notification: Notification) -> bool:
@@ -224,6 +317,8 @@ class Daemon:
             "next_due": self.tasks.next_due_at(),
             "runs_completed": self.runs_completed,
             "notifications_sent": self.notifications_sent,
+            "abandoned_runs": self._abandoned,
+            "task_timeout_s": self.task_timeout,
             "policy_mode": policy.mode.value,
             "can_run_commands": (
                 policy.mode.value == "trusted" or "run_shell" in policy.auto_allow

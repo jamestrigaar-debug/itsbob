@@ -33,6 +33,17 @@ where = ["src"]
 [tool.setuptools.package-data]
 itsbob = ["templates/*.txt"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness and real-bug rules, not style opinions. The two that have
+# actually caught things here: B905 (zip without strict= silently truncates,
+# which hid unembedded memories) and B023 (a closure over a loop variable).
+select = ["F", "E4", "E7", "E9", "B", "PLE", "UP032", "RUF010"]
+ignore = ["B008"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

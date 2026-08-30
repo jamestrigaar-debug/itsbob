@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from itsbob.agent.brain import TierResult
 from itsbob.agent.context import Conversation, Step, Turn, build_messages

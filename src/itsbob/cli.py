@@ -462,7 +462,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"home: {home}  ({'exists' if home.exists() else 'will be created'})\n")
 
     print("model tiers:")
-    brain = build_brain(Settings.from_env(dotenv=None))
+    brain = build_brain(Settings.from_env(load_env_files=False))
     for tier_value, info in brain.describe()["tiers"].items():
         configured = [row for row in info["providers"] if row["configured"]]
         first = configured[0] if configured else None
@@ -517,7 +517,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print("\nprobing every model on every tier:")
     answered = 0
     seen: set[tuple[str, str]] = set()
-    for tier_value, info in brain.describe()["tiers"].items():
+    for tier_value in brain.describe()["tiers"]:
         router = brain.router_for(_tier(tier_value))
         for provider in router.providers:
             if not provider.is_configured():
@@ -581,10 +581,63 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    from .setup_wizard import run_setup
+
+    keys = {}
+    for name in ("google", "groq", "openrouter"):
+        value = getattr(args, f"{name}_key", None)
+        if value:
+            keys[f"{name.upper()}_API_KEY"] = value.strip()
+    return run_setup(
+        home=_home(args),
+        keys=keys or None,
+        verify=not args.no_verify,
+        interactive=sys.stdin.isatty() and not keys,
+    )
+
+
+def _cmd_service(args: argparse.Namespace) -> int:
+    from .service import install_service, service_status, uninstall_service, unit_text
+
+    if args.service_action == "status":
+        print(f"itsbob daemon service: {service_status()}")
+        return 0
+    if args.service_action == "print":
+        print(unit_text(_home(args), mode=getattr(args, "mode", None)), end="")
+        return 0
+    if args.service_action == "uninstall":
+        ok, message = uninstall_service()
+        print(message)
+        return 0 if ok else 1
+
+    ok, message = install_service(
+        _home(args), mode=getattr(args, "mode", None), start=not args.no_start
+    )
+    print(("  " if ok else "error: ") + message)
+    if ok:
+        print("\n  It will now run in the background and survive a reboot.")
+        print("  Add work for it with:  itsbob task add <name> <what to do> <schedule>")
+    return 0 if ok else 1
+
+
 def _cmd_gui(args: argparse.Namespace) -> int:
     from .gui.app import run_gui
 
-    run_gui(host=args.host, port=args.port, open_browser=not args.no_browser, home=_home(args))
+    host = "0.0.0.0" if getattr(args, "public", False) else args.host  # noqa: S104 - opt-in
+    if host != "127.0.0.1":
+        print(
+            "  ! binding to "
+            f"{host} — the interface has no authentication, so anyone who can reach\n"
+            "    this port can run tools as you. Only do this on a network you trust.\n"
+        )
+    run_gui(
+        host=host,
+        port=args.port,
+        open_browser=not args.no_browser,
+        home=_home(args),
+        mode=getattr(args, "mode", None),
+    )
     return 0
 
 
@@ -596,7 +649,7 @@ def _cmd_gui(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     from .factory import build_simulation
 
-    settings = Settings.from_env(dotenv=None)
+    settings = Settings.from_env(load_env_files=False)
     if args.db:
         settings = Settings(
             providers=settings.providers,
@@ -630,6 +683,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  itsbob setup                first run: keys and a working check\n"
             "  itsbob chat\n"
             '  itsbob ask "what did I say about the deploy?"\n'
             '  itsbob task add inbox "Summarise new files in ~/inbox" "every 30m"\n'
@@ -650,6 +704,14 @@ def _build_parser() -> argparse.ArgumentParser:
             help="what tools may do without asking (default guarded, or ITSBOB_TOOL_MODE)",
         )
         return sub
+
+    # setup
+    setup = add("setup", "Get set up: keys, directories, and a check that it all works.")
+    setup.add_argument("--google-key", help="set GOOGLE_API_KEY without being prompted")
+    setup.add_argument("--groq-key", help="set GROQ_API_KEY without being prompted")
+    setup.add_argument("--openrouter-key", help="set OPENROUTER_API_KEY without being prompted")
+    setup.add_argument("--no-verify", action="store_true", help="skip the live API check")
+    setup.set_defaults(handler=_cmd_setup)
 
     # chat
     chat = with_mode(add("chat", "Interactive conversation."))
@@ -749,10 +811,24 @@ def _build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--limit", type=int, default=40)
     audit.set_defaults(handler=_cmd_audit)
 
-    gui = add("gui", "Browser interface.")
+    # service
+    service = add("service", "Run the daemon in the background, across reboots.")
+    service_subs = service.add_subparsers(dest="service_action", required=True)
+    install = with_mode(service_subs.add_parser("install", help="install and start it"))
+    install.add_argument("--no-start", action="store_true", help="write the unit but do not start")
+    install.set_defaults(handler=_cmd_service)
+    service_subs.add_parser("uninstall", help="stop and remove it").set_defaults(handler=_cmd_service)
+    service_subs.add_parser("status", help="is it running?").set_defaults(handler=_cmd_service)
+    with_mode(service_subs.add_parser("print", help="show the unit file without installing")).set_defaults(
+        handler=_cmd_service
+    )
+
+    gui = with_mode(add("gui", "Browser interface."))
     gui.add_argument("--host", default="127.0.0.1")
     gui.add_argument("--port", type=int, default=8765)
     gui.add_argument("--no-browser", action="store_true")
+    gui.add_argument("--public", action="store_true",
+                     help="bind to 0.0.0.0 — there is NO authentication, so only on a trusted network")
     gui.set_defaults(handler=_cmd_gui)
 
     # legacy

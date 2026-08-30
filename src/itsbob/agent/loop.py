@@ -48,12 +48,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 from ..llm.base import AllProvidersFailed, LLMRequest, system
-from ..memory.base import MemoryKind, MemoryRecord
 from ..router.gatekeeper import Gatekeeper
 from ..router.ingestion import Snapshot, compress
-from ..router.tiers import GateDecision, Tier
+from ..router.tiers import Tier
 from ..tools import ToolCall, Toolbox
-from .brain import TieredBrain, TierResult
+from .brain import TieredBrain
 from .context import Conversation, Step, Turn, build_messages
 from .persona import Persona
 from .writer import MemoryWriter

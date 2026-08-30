@@ -258,12 +258,15 @@ def build_brain(
         if google is not None:
             providers.append(GoogleProvider(google, env=env))
         providers.extend(backups)
+        if not providers and settings.allow_offline:
+            # Only when there is nothing real. Putting the offline provider
+            # *behind* a configured one turns every transient failure — a
+            # rate limit, a retired model — into a confident-looking wrong
+            # answer instead of an error the caller can act on. A real
+            # provider failing must fail.
+            providers.append(EchoProvider())
         if not providers:
-            if not settings.allow_offline:
-                continue
-            providers.append(EchoProvider())
-        elif settings.allow_offline:
-            providers.append(EchoProvider())
+            continue
         routers[tier] = LLMRouter(
             providers, tracker=tracker, max_attempts=settings.max_attempts
         )

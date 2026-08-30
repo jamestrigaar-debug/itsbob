@@ -245,15 +245,27 @@ class EchoProvider(Provider):
     def _decide(self, prompt: str, digest: str) -> dict[str, Any]:
         options = re.findall(r"^\s*-\s*([a-z_][a-z0-9_]*)\b", prompt, re.MULTILINE)
         options = list(dict.fromkeys(options))
-        if options:
-            action = options[int(digest[:8], 16) % len(options)]
-        else:
-            action = "observe"
-        return {
+        action = options[int(digest[:8], 16) % len(options)] if options else "observe"
+        payload: dict[str, Any] = {
             "action": action,
             "rationale": "offline heuristic: deterministic choice from the prompt",
             "confidence": 0.4,
         }
+        if '"thought"' in prompt or '"final"' in prompt:
+            # The agent loop is asking for a step. Answer in its shape and say
+            # plainly that no model is configured — an off-shape reply here
+            # reads as a malformed model response and sends the loop round the
+            # escalate-and-retry path for something no retry can fix.
+            payload.update(
+                thought="no language model is configured",
+                tool=None,
+                final=(
+                    "I have no model configured, so I can't actually think about this. "
+                    "Set GOOGLE_API_KEY in ~/.itsbob/.env (or run `itsbob setup`) and "
+                    "ask again — `itsbob doctor` will confirm it worked."
+                ),
+            )
+        return payload
 
     def _narrate(self, request: LLMRequest, digest: str) -> str:
         last = next(

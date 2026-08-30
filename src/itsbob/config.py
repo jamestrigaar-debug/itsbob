@@ -17,29 +17,95 @@ __all__ = [
     "MemorySettings",
     "EnergySettings",
     "Settings",
+    "find_dotenv",
+    "itsbob_home",
     "load_dotenv",
 ]
 
 
+def itsbob_home(env: Mapping[str, str] | None = None) -> Path:
+    """Where itsbob keeps its state. ``ITSBOB_HOME``, else ``~/.itsbob``."""
+    env = os.environ if env is None else env
+    return Path(env.get("ITSBOB_HOME", "").strip() or Path.home() / ".itsbob").expanduser()
+
+
+def find_dotenv(start: str | Path | None = None) -> list[Path]:
+    """Every ``.env`` worth loading, nearest first.
+
+    Looks in the current directory, then each parent up to the filesystem root,
+    then ``$ITSBOB_HOME/.env``.
+
+    This exists because loading only ``./.env`` made the whole system look
+    broken from anywhere but the source checkout: ``itsbob serve`` started from
+    a home directory saw no API keys, silently fell through to the offline
+    provider, and answered with plausible nonsense. A daemon is *usually*
+    started from somewhere else, so the default was wrong exactly where it
+    mattered most.
+
+    Nearest wins, so a project-local ``.env`` overrides the global one — the
+    same precedence git and npm use, and the one people already expect.
+    """
+    found: list[Path] = []
+    here = Path(start).expanduser().resolve() if start else Path.cwd()
+    for directory in (here, *here.parents):
+        candidate = directory / ".env"
+        if candidate.is_file():
+            found.append(candidate)
+    home_env = itsbob_home() / ".env"
+    if home_env.is_file() and home_env not in found:
+        found.append(home_env)
+    return found
+
+
 def load_dotenv(
-    path: str | Path = ".env",
+    path: str | Path | None = None,
     *,
     override: bool = False,
     env: MutableMapping[str, str] | None = None,
+    search: bool = True,
 ) -> dict[str, str]:
-    """Load a ``KEY=value`` file into the environment.
+    """Load ``KEY=value`` files into the environment.
+
+    With no ``path``, loads every file :func:`find_dotenv` turns up, nearest
+    first. Because a value is only applied when the key is not already set, the
+    nearest file wins and the rest fill gaps — so a project ``.env`` overrides
+    ``~/.itsbob/.env`` without either having to know about the other.
 
     Deliberately dependency-free and forgiving: blank lines and ``#`` comments
     are skipped, a leading ``export`` is tolerated, and surrounding quotes are
-    stripped. Returns the values it parsed (whether or not they were applied).
+    stripped. Returns everything it parsed, whether or not it was applied.
     """
     env = os.environ if env is None else env
-    p = Path(path)
-    if not p.is_file():
+
+    if path is None:
+        if not search:
+            return {}
+        merged: dict[str, str] = {}
+        for candidate in find_dotenv():
+            for key, value in _read_dotenv(candidate).items():
+                merged.setdefault(key, value)
+                if override or key not in env:
+                    env[key] = value
+        return merged
+
+    parsed = _read_dotenv(Path(path))
+    for key, value in parsed.items():
+        if override or key not in env:
+            env[key] = value
+    return parsed
+
+
+def _read_dotenv(p: Path) -> dict[str, str]:
+    """Parse one file. Missing or unreadable is empty, never an error."""
+    try:
+        if not p.is_file():
+            return {}
+        text = p.read_text(encoding="utf-8")
+    except OSError:
         return {}
 
     parsed: dict[str, str] = {}
-    for raw in p.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -55,8 +121,6 @@ def load_dotenv(
         if not key:
             continue
         parsed[key] = value
-        if override or key not in env:
-            env[key] = value
     return parsed
 
 
@@ -154,9 +218,10 @@ class Settings:
         cls,
         env: Mapping[str, str] | None = None,
         *,
-        dotenv: str | Path | None = ".env",
+        dotenv: str | Path | None = None,
+        load_env_files: bool = True,
     ) -> "Settings":
-        if dotenv is not None and env is None:
+        if env is None and load_env_files:
             load_dotenv(dotenv)
         env = os.environ if env is None else env
 

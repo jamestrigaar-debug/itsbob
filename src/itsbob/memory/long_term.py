@@ -38,21 +38,23 @@ the case.
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
 import sqlite3
 import time
 from array import array
+from operator import mul
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from ..store import Database
 from .base import (
     DEFAULT_WEIGHTS,
     MemoryKind,
     MemoryRecord,
     RetrievalWeights,
     keyword_relevance,
-    rank,
     render_records,
     tokenize,
 )
@@ -221,18 +223,15 @@ class LongTermMemory:
         self.embed_errors = 0
         self.last_embed_error: str | None = None
 
-        if self.database not in (":memory:", "") and "mode=memory" not in self.database:
-            Path(self.database).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.database, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
+        self._db = Database(self.database, schema=_SCHEMA)
+        self.database = self._db.path
         self._migrate()
-        self._conn.executescript(_INDEXES)
+        self._db.executescript(_INDEXES)
         self.fts_enabled = self._try_enable_fts()
-        self._conn.commit()
 
         self._np = _try_numpy()
         self._vec_cache: tuple[str, list[str], Any] | None = None
+        self._vec_norms: list[float] | None = None
 
     # -- schema ----------------------------------------------------------------
 
@@ -243,29 +242,28 @@ class LongTermMemory:
         working; they simply have ``source='agent'`` and no expiry until
         something rewrites them.
         """
-        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(memories)")}
+        existing = self._db.columns("memories")
         for column, ddl in (
             ("last_access_at", "ALTER TABLE memories ADD COLUMN last_access_at REAL NOT NULL DEFAULT 0"),
             ("source", "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'agent'"),
             ("expires_at", "ALTER TABLE memories ADD COLUMN expires_at REAL"),
         ):
             if column not in existing:
-                self._conn.execute(ddl)
+                self._db.execute(ddl)
 
     def _try_enable_fts(self) -> bool:
         try:
-            self._conn.executescript(_FTS_SCHEMA)
+            self._db.executescript(_FTS_SCHEMA)
         except sqlite3.OperationalError:
             return False  # SQLite built without FTS5; LIKE fallback covers it
         # Backfill anything written before the index existed (or by an older
         # itsbob), so an upgrade doesn't leave half the corpus unsearchable.
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM memories_fts").fetchone()
-        if int(row["n"]) == 0:
-            self._conn.executemany(
+        if int(self._db.scalar("SELECT COUNT(*) FROM memories_fts", default=0)) == 0:
+            self._db.executemany(
                 "INSERT INTO memories_fts (id, content, tags) VALUES (?, ?, ?)",
                 [
                     (r["id"], r["content"], " ".join(json.loads(r["tags"] or "[]")))
-                    for r in self._conn.execute("SELECT id, content, tags FROM memories")
+                    for r in self._db.query("SELECT id, content, tags FROM memories")
                 ],
             )
         return True
@@ -275,38 +273,38 @@ class LongTermMemory:
     def add(self, record: MemoryRecord, *, embed: bool | None = None) -> MemoryRecord:
         source = str(record.metadata.get("source", "agent"))
         expires_at = record.metadata.get("expires_at")
-        self._conn.execute(
-            """
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
             INSERT OR REPLACE INTO memories (
                 id, content, kind, importance, tick, created_at,
                 last_access_tick, last_access_at, access_count, salience,
                 tags, metadata, source, expires_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                record.id,
-                record.content,
-                record.kind.value,
-                record.importance,
-                record.tick,
-                record.created_at,
-                record.last_access_tick,
-                record.metadata.get("last_access_at", record.created_at),
-                record.access_count,
-                record.salience,
-                json.dumps(list(record.tags)),
-                json.dumps(record.metadata),
-                source,
-                float(expires_at) if expires_at is not None else None,
-            ),
-        )
-        if self.fts_enabled:
-            self._conn.execute("DELETE FROM memories_fts WHERE id = ?", (record.id,))
-            self._conn.execute(
-                "INSERT INTO memories_fts (id, content, tags) VALUES (?, ?, ?)",
-                (record.id, record.content, " ".join(record.tags)),
+                (
+                    record.id,
+                    record.content,
+                    record.kind.value,
+                    record.importance,
+                    record.tick,
+                    record.created_at,
+                    record.last_access_tick,
+                    record.metadata.get("last_access_at", record.created_at),
+                    record.access_count,
+                    record.salience,
+                    json.dumps(list(record.tags)),
+                    json.dumps(record.metadata),
+                    source,
+                    float(expires_at) if expires_at is not None else None,
+                ),
             )
-        self._conn.commit()
+            if self.fts_enabled:
+                conn.execute("DELETE FROM memories_fts WHERE id = ?", (record.id,))
+                conn.execute(
+                    "INSERT INTO memories_fts (id, content, tags) VALUES (?, ?, ?)",
+                    (record.id, record.content, " ".join(record.tags)),
+                )
 
         if embed if embed is not None else self.auto_embed:
             self._embed_records([record])
@@ -334,42 +332,47 @@ class LongTermMemory:
         if not sets:
             return False
         params.append(record_id)
-        cursor = self._conn.execute(
-            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", params
-        )
-        if not cursor.rowcount:
-            return False
-        if "content" in fields or "tags" in fields:
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", params
+            )
+            if not cursor.rowcount:
+                return False
+            reindex = "content" in fields or "tags" in fields
+            if reindex:
+                conn.execute("DELETE FROM vectors WHERE memory_id = ?", (record_id,))
+                if self.fts_enabled:
+                    conn.execute("DELETE FROM memories_fts WHERE id = ?", (record_id,))
+
+        if reindex:
             record = self.get(record_id)
             if record is not None:
                 if self.fts_enabled:
-                    self._conn.execute("DELETE FROM memories_fts WHERE id = ?", (record_id,))
-                    self._conn.execute(
+                    self._db.execute(
                         "INSERT INTO memories_fts (id, content, tags) VALUES (?, ?, ?)",
                         (record_id, record.content, " ".join(record.tags)),
                     )
-                self._conn.execute("DELETE FROM vectors WHERE memory_id = ?", (record_id,))
                 self._invalidate_vector_cache()
                 if self.auto_embed:
                     self._embed_records([record])
-        self._conn.commit()
         return True
 
     def forget(self, record_id: str) -> bool:
-        cursor = self._conn.execute("DELETE FROM memories WHERE id = ?", (record_id,))
-        self._conn.execute("DELETE FROM vectors WHERE memory_id = ?", (record_id,))
-        if self.fts_enabled:
-            self._conn.execute("DELETE FROM memories_fts WHERE id = ?", (record_id,))
-        self._conn.commit()
+        with self._db.transaction() as conn:
+            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (record_id,))
+            conn.execute("DELETE FROM vectors WHERE memory_id = ?", (record_id,))
+            if self.fts_enabled:
+                conn.execute("DELETE FROM memories_fts WHERE id = ?", (record_id,))
+            removed = cursor.rowcount > 0
         self._invalidate_vector_cache()
-        return cursor.rowcount > 0
+        return removed
 
     def expire(self, *, now: float | None = None) -> int:
         """Drop records past their ``expires_at``. Returns how many went."""
         now = time.time() if now is None else now
         ids = [
             row["id"]
-            for row in self._conn.execute(
+            for row in self._db.query(
                 "SELECT id FROM memories WHERE expires_at IS NOT NULL AND expires_at <= ?",
                 (now,),
             )
@@ -389,7 +392,7 @@ class LongTermMemory:
             return 0
         doomed = [
             row["id"]
-            for row in self._conn.execute(
+            for row in self._db.query(
                 "SELECT id FROM memories ORDER BY importance ASC, created_at ASC LIMIT ?",
                 (total - max_records,),
             )
@@ -407,21 +410,29 @@ class LongTermMemory:
         texts = [self._embed_text(r) for r in records]
         try:
             vectors = self.embedder.embed(texts)
+            if len(vectors) != len(records):
+                # Checked here, inside the guard, rather than by strict=True on
+                # the zip below: a provider returning the wrong number of
+                # vectors must be recorded as an embedding failure like any
+                # other, not raised through a write. The memory is the thing
+                # being protected; the vector is an optimization.
+                raise ValueError(
+                    f"embedder returned {len(vectors)} vectors for {len(records)} records"
+                )
         except Exception as exc:  # noqa: BLE001 - lexical recall still works
             self.embed_errors += 1
             self.last_embed_error = f"{type(exc).__name__}: {exc}"[:200]
             return 0
         signature = self.embedder.signature
         now = time.time()
-        self._conn.executemany(
+        self._db.executemany(
             "INSERT OR REPLACE INTO vectors (memory_id, signature, dims, vector, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             [
                 (r.id, signature, len(v), array("f", v).tobytes(), now)
-                for r, v in zip(records, vectors)
+                for r, v in zip(records, vectors, strict=True)  # length checked above
             ],
         )
-        self._conn.commit()
         self._invalidate_vector_cache()
         return len(records)
 
@@ -446,12 +457,12 @@ class LongTermMemory:
         if self.embedder is None:
             return 0
         signature = self.embedder.signature
-        rows = self._conn.execute(
+        rows = self._db.query(
             "SELECT m.* FROM memories m LEFT JOIN vectors v "
             "  ON v.memory_id = m.id AND v.signature = ? "
             "WHERE v.memory_id IS NULL",
             (signature,),
-        ).fetchall()
+        )
         done = 0
         for start in range(0, len(rows), batch_size):
             batch = [_from_row(r) for r in rows[start : start + batch_size]]
@@ -460,6 +471,7 @@ class LongTermMemory:
 
     def _invalidate_vector_cache(self) -> None:
         self._vec_cache = None
+        self._vec_norms = None
 
     def _load_vectors(self, signature: str) -> tuple[list[str], Any]:
         """Ids and vectors for one signature, cached until the next write."""
@@ -478,7 +490,7 @@ class LongTermMemory:
 
         ids: list[str] = []
         raw: list[bytes] = []
-        for row in self._conn.execute(sql, params):
+        for row in self._db.query(sql, params):
             ids.append(row["memory_id"])
             raw.append(row["vector"])
 
@@ -489,7 +501,17 @@ class LongTermMemory:
                 else self._np.zeros((0, 0), dtype=self._np.float32)
             )
         else:
-            matrix = [array("f", blob).tolist() for blob in raw]
+            # array('f'), not .tolist(). A list of 768 Python floats costs
+            # ~30KB (24 bytes per float object plus a pointer); the same
+            # numbers in an array('f') cost ~3KB. At 400 memories that was the
+            # difference between 10.7MB and ~1MB per search, and it scaled
+            # linearly into hundreds of megabytes on a store that had been
+            # used for a while.
+            matrix = [(v := array("f"), v.frombytes(blob), v)[2] for blob in raw]
+            # Norms never change once a vector is stored, so computing them
+            # here means each search does one dot product per candidate rather
+            # than a dot and two norms.
+            self._vec_norms = [math.sqrt(sum(x * x for x in v)) or 1.0 for v in matrix]
 
         self._vec_cache = (signature, ids, matrix)
         return ids, matrix
@@ -523,15 +545,17 @@ class LongTermMemory:
         qn = math.sqrt(sum(x * x for x in query_vector))
         if qn == 0.0:
             return []
+        width = len(query_vector)
+        norms = getattr(self, "_vec_norms", None) or [1.0] * len(ids)
         scored: list[tuple[str, float]] = []
-        for memory_id, vector in zip(ids, matrix):
-            if len(vector) != len(query_vector):
+        for memory_id, vector, vn in zip(ids, matrix, norms, strict=True):
+            if len(vector) != width:
                 continue
-            dot = sum(a * b for a, b in zip(vector, query_vector))
-            vn = math.sqrt(sum(a * a for a in vector))
-            scored.append((memory_id, dot / (vn * qn) if vn else 0.0))
-        scored.sort(key=lambda pair: -pair[1])
-        return scored[:top_k]
+            dot = sum(map(mul, vector, query_vector))
+            scored.append((memory_id, dot / (vn * qn)))
+        # nlargest beats a full sort when top_k is small relative to the
+        # candidate set, which it always is here.
+        return heapq.nlargest(top_k, scored, key=lambda pair: pair[1])
 
     # -- reading ---------------------------------------------------------------
 
@@ -554,11 +578,11 @@ class LongTermMemory:
             # than an all-terms filter.
             match = " OR ".join(f'"{t}"' for t in terms[:16])
             try:
-                rows = self._conn.execute(
+                rows = self._db.query(
                     "SELECT id, bm25(memories_fts, 1.0, 0.5) AS score FROM memories_fts "
                     "WHERE memories_fts MATCH ? ORDER BY score LIMIT ?",
                     (match, top_k),
-                ).fetchall()
+                )
                 # SQLite's bm25() is negated (more negative = better match),
                 # so flip it into "bigger is better" like every other signal.
                 return [(row["id"], -float(row["score"])) for row in rows]
@@ -568,10 +592,10 @@ class LongTermMemory:
         # LIKE has no notion of match quality, so every hit scores the same
         # and importance/recency decide the order among them.
         like = " OR ".join("content LIKE ?" for _ in terms[:8])
-        rows = self._conn.execute(
+        rows = self._db.query(
             f"SELECT id FROM memories WHERE {like} ORDER BY created_at DESC LIMIT ?",
             (*(f"%{t}%" for t in terms[:8]), top_k),
-        ).fetchall()
+        )
         return [(row["id"], 1.0) for row in rows]
 
     def search(
@@ -609,7 +633,7 @@ class LongTermMemory:
             fallback = True
             candidates = {
                 row["id"]
-                for row in self._conn.execute(
+                for row in self._db.query(
                     "SELECT id FROM memories ORDER BY importance DESC, created_at DESC LIMIT ?",
                     (pool,),
                 )
@@ -684,13 +708,13 @@ class LongTermMemory:
         """
         hits = self.search(query, limit=limit, kinds=kinds, min_importance=min_importance)
         if tick is not None:
-            for hit in hits:
-                hit.record.touch(tick)
-                self._conn.execute(
-                    "UPDATE memories SET last_access_tick = ? WHERE id = ?",
-                    (hit.record.last_access_tick, hit.record.id),
-                )
-            self._conn.commit()
+            with self._db.transaction() as conn:
+                for hit in hits:
+                    hit.record.touch(tick)
+                    conn.execute(
+                        "UPDATE memories SET last_access_tick = ? WHERE id = ?",
+                        (hit.record.last_access_tick, hit.record.id),
+                    )
         return [hit.record for hit in hits]
 
     def _fetch(
@@ -714,9 +738,9 @@ class LongTermMemory:
             if kinds:
                 clauses.append(f"kind IN ({', '.join('?' for _ in kinds)})")
                 params.extend(k.value if isinstance(k, MemoryKind) else str(k) for k in kinds)
-            rows = self._conn.execute(
+            rows = self._db.query(
                 f"SELECT * FROM memories WHERE {' AND '.join(clauses)}", params
-            ).fetchall()
+            )
             out.extend(_from_row(row) for row in rows)
         if tags:
             wanted = {t.strip().lower() for t in tags if t.strip()}
@@ -727,14 +751,13 @@ class LongTermMemory:
         for record in records:
             record.access_count += 1
             record.metadata["last_access_at"] = now
-        self._conn.executemany(
+        self._db.executemany(
             "UPDATE memories SET access_count = ?, last_access_at = ? WHERE id = ?",
             [(r.access_count, now, r.id) for r in records],
         )
-        self._conn.commit()
 
     def get(self, record_id: str) -> MemoryRecord | None:
-        row = self._conn.execute("SELECT * FROM memories WHERE id = ?", (record_id,)).fetchone()
+        row = self._db.one("SELECT * FROM memories WHERE id = ?", (record_id,))
         return _from_row(row) if row else None
 
     def all(self, *, limit: int | None = None) -> list[MemoryRecord]:
@@ -743,18 +766,18 @@ class LongTermMemory:
         if limit is not None:
             sql += " LIMIT ?"
             params = (limit,)
-        return [_from_row(row) for row in self._conn.execute(sql, params)]
+        return [_from_row(row) for row in self._db.query(sql, params)]
 
     def recent(self, limit: int = 20) -> list[MemoryRecord]:
         return [
             _from_row(row)
-            for row in self._conn.execute(
+            for row in self._db.query(
                 "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (limit,)
             )
         ]
 
     def by_kind(self, kind: MemoryKind, *, limit: int = 20) -> list[MemoryRecord]:
-        rows = self._conn.execute(
+        rows = self._db.query(
             "SELECT * FROM memories WHERE kind = ? ORDER BY created_at DESC LIMIT ?",
             (kind.value, limit),
         )
@@ -762,7 +785,7 @@ class LongTermMemory:
 
     def by_tag(self, tag: str, *, limit: int = 20) -> list[MemoryRecord]:
         needle = f'"{tag.strip().lower()}"'
-        rows = self._conn.execute(
+        rows = self._db.query(
             "SELECT * FROM memories WHERE tags LIKE ? ORDER BY created_at DESC LIMIT ?",
             (f"%{needle}%", limit),
         )
@@ -770,8 +793,7 @@ class LongTermMemory:
 
     @property
     def latest_tick(self) -> int:
-        row = self._conn.execute("SELECT MAX(tick) AS t FROM memories").fetchone()
-        return int(row["t"] or 0)
+        return int(self._db.scalar("SELECT MAX(tick) FROM memories", default=0) or 0)
 
     def render(self, limit: int = 10) -> str:
         return render_records(self.recent(limit=limit))
@@ -788,9 +810,9 @@ class LongTermMemory:
         vectorized = 0
         if signature:
             vectorized = int(
-                self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM vectors WHERE signature = ?", (signature,)
-                ).fetchone()["n"]
+                self._db.scalar(
+                    "SELECT COUNT(*) FROM vectors WHERE signature = ?", (signature,), default=0
+                )
             )
         total = len(self)
         return {
@@ -809,11 +831,10 @@ class LongTermMemory:
         }
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()
-        return int(row["n"])
+        return int(self._db.scalar("SELECT COUNT(*) FROM memories", default=0))
 
     def close(self) -> None:
-        self._conn.close()
+        self._db.close()
 
     def __enter__(self) -> "LongTermMemory":
         return self
