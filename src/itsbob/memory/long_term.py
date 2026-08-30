@@ -779,6 +779,12 @@ class LongTermMemory:
     def stats(self) -> dict[str, Any]:
         """What recall can actually do right now, and what it's falling back to."""
         signature = self.embedder.signature if self.embedder is not None else None
+        # Whether the vectors came from a real embedding model or the offline
+        # hashing fallback. Both produce recall; only one produces *semantic*
+        # recall, and a caller reporting "semantic recall: on" for the fallback
+        # would be overstating what the store can do.
+        active = getattr(self.embedder, "active", self.embedder)
+        offline = getattr(active, "name", None) == "hashing"
         vectorized = 0
         if signature:
             vectorized = int(
@@ -797,7 +803,8 @@ class LongTermMemory:
             "unembedded": max(0, total - vectorized) if signature else total,
             "embed_errors": self.embed_errors,
             "last_embed_error": self.last_embed_error,
-            "semantic_recall": bool(signature and vectorized),
+            "offline_embedder": offline,
+            "semantic_recall": bool(signature and vectorized and not offline),
             "degraded": bool(getattr(self.embedder, "degraded", False)),
         }
 

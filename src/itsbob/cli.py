@@ -375,7 +375,12 @@ def _open_memory(args: argparse.Namespace, *, embeddings: bool = True):
 
 def _cmd_memory(args: argparse.Namespace) -> int:
     action = args.memory_action
-    store = _open_memory(args, embeddings=action in ("search", "add", "reindex"))
+    # Always attach the embedder, even for commands that never embed. Building
+    # it costs nothing (the HTTP client is lazy), and opening the store without
+    # one made `memory stats` report "keyword-only recall, set GOOGLE_API_KEY"
+    # on a machine where the key was set and semantic recall was working — a
+    # diagnostic that describes the diagnostic tool rather than the system.
+    store = _open_memory(args)
 
     if action == "search":
         hits = store.search(args.query, limit=args.limit)
@@ -412,10 +417,26 @@ def _cmd_memory(args: argparse.Namespace) -> int:
         stats = store.stats()
         for key, value in stats.items():
             print(f"  {key:<16} {value}")
-        if not stats["semantic_recall"]:
+        # Branch on the actual cause. "Set GOOGLE_API_KEY" is wrong advice when
+        # the key is set and the store is simply empty, and wrong advice in a
+        # diagnostic is worse than none — it sends you to fix the one thing
+        # that was never broken.
+        if stats["offline_embedder"]:
             print(
-                "\n  note: recall is keyword-only. Set GOOGLE_API_KEY for semantic "
-                "recall, then run `itsbob memory reindex`."
+                "\n  note: using the offline hashing embedder — recall works but "
+                "cannot match paraphrases. Set GOOGLE_API_KEY (and unset "
+                "ITSBOB_EMBED_OFFLINE), then run `itsbob memory reindex`."
+            )
+        elif stats["embedder"] is None:
+            print(
+                "\n  note: recall is keyword-only — no embedding model is configured. "
+                "Set GOOGLE_API_KEY, then run `itsbob memory reindex`."
+            )
+        elif stats["unembedded"]:
+            print(
+                f"\n  note: {stats['unembedded']} record(s) have no vector for the "
+                "current embedding model, so semantic recall will not find them. "
+                "Run `itsbob memory reindex`."
             )
         if stats["degraded"]:
             print(f"\n  warning: embeddings degraded — {stats['last_embed_error']}")

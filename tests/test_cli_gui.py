@@ -46,9 +46,39 @@ def test_memory_search_with_no_hits_is_not_an_error(home, capsys):
     assert "nothing found" in capsys.readouterr().out
 
 
-def test_memory_stats_flags_keyword_only_recall(home, capsys):
+def test_memory_stats_flags_the_offline_embedder(home, capsys):
+    """The `home` fixture sets ITSBOB_EMBED_OFFLINE, so this is the fallback."""
     main(["memory", "stats"])
-    assert "keyword-only" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "offline hashing embedder" in out
+    assert "cannot match paraphrases" in out
+
+
+def test_memory_stats_flags_a_missing_embedder(home, capsys, monkeypatch):
+    monkeypatch.setattr("itsbob.cli._open_memory", lambda *a, **k: _NoEmbedder())
+    main(["memory", "stats"])
+    assert "no embedding model is configured" in capsys.readouterr().out
+
+
+class _NoEmbedder:
+    def stats(self):
+        return {
+            "database": ":memory:", "records": 0, "fts5": True, "numpy": False,
+            "embedder": None, "embedded": 0, "unembedded": 0, "embed_errors": 0,
+            "last_embed_error": None, "offline_embedder": False,
+            "semantic_recall": False, "degraded": False,
+        }
+
+
+def test_memory_stats_describes_the_store_not_the_command(home, capsys, monkeypatch):
+    """`stats` used to open the store without an embedder and then report that
+    the store had no embedder — a diagnostic describing itself."""
+    monkeypatch.delenv("ITSBOB_EMBED_OFFLINE", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "not-used-no-call-is-made")
+    main(["memory", "stats"])
+    out = capsys.readouterr().out
+    assert "gemini-embedding" in out
+    assert "keyword-only" not in out
 
 
 def test_memory_forget_reports_a_missing_id(home, capsys):
