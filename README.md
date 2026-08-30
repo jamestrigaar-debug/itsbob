@@ -133,6 +133,12 @@ export GOOGLE_API_KEY=...        # https://aistudio.google.com — Gemini Flash
 export OPENROUTER_API_KEY=...    # https://openrouter.ai — dozens of `:free` models
 ```
 
+**Using Google?** Getting a key, picking a specific Gemini model (Flash vs.
+Pro, pinning a model id, finding current model names), rate limits, and
+Google-specific troubleshooting are all in
+**[docs/GOOGLE_SETUP.md](docs/GOOGLE_SETUP.md)** — the two-line env var above
+is enough to get going, that doc is for everything past that.
+
 Or copy `.env.example` to `.env` and fill it in — every CLI command and the
 GUI load it automatically:
 
@@ -349,6 +355,7 @@ Every tick, `Simulation`:
 ## Repository map
 
 ```
+docs/GOOGLE_SETUP.md  getting a key, picking a specific Gemini model, rate limits
 pyproject.toml     deps: openai>=1.40 (base); pytest (dev); flask (gui); langchain (optional)
 src/itsbob/
   __init__.py       public API (build_complexity_router, ComplexityRouter, build_simulation, ...)
