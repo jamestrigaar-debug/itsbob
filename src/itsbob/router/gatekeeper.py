@@ -87,7 +87,9 @@ class Gatekeeper:
             json_mode=True,
         )
         started = time.perf_counter()
-        response = self.local_provider.complete(request, model=self.local_model)  # type: ignore[union-attr]
+        response = self.local_provider.complete_with_fallback(  # type: ignore[union-attr]
+            request, preferred_model=self.local_model
+        )
         latency_ms = (time.perf_counter() - started) * 1000
 
         tag, fingerprint = _parse_gatekeeper_reply(response.text)

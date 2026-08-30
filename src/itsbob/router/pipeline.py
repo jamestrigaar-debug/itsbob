@@ -173,7 +173,9 @@ class ComplexityRouter:
                 max_tokens=80,
                 temperature=0.3,
             )
-            response = provider.complete(request, model=self.gatekeeper.local_model)
+            response = provider.complete_with_fallback(
+                request, preferred_model=self.gatekeeper.local_model
+            )
         except Exception as exc:  # noqa: BLE001
             return self._tier_s(state, decision, reason=f"local summary failed: {exc}")
         return RouteResult(
@@ -197,7 +199,12 @@ class ComplexityRouter:
         )
         request = LLMRequest(
             messages=[system(CLOUD_SYSTEM_PREFIX), user(prompt)],
-            max_tokens=200,
+            # A "30 words" answer is maybe ~50 tokens, but the JSON envelope,
+            # multiple action names, and some models' non-zero reasoning
+            # overhead before the first visible token eat into the same
+            # budget — 200 was tight enough to truncate real responses
+            # mid-array ('{"actions": ["WING_' with no closing brace).
+            max_tokens=350,
             temperature=0.4,
         )
 
@@ -253,7 +260,10 @@ class ComplexityRouter:
                     temperature=0.0,
                     json_mode=True,
                 )
-                payload = extract_json(provider.complete(request, model=self.gatekeeper.local_model).text)
+                response = provider.complete_with_fallback(
+                    request, preferred_model=self.gatekeeper.local_model
+                )
+                payload = extract_json(response.text)
                 name = str((payload or {}).get("action", "")).strip()
                 if name and self.registry.has(name):
                     script_result = self.registry.execute(name, state)

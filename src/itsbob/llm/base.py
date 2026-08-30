@@ -204,5 +204,38 @@ class Provider(ABC):
             return (request.model,)
         return self.models
 
+    def complete_with_fallback(
+        self, request: LLMRequest, *, preferred_model: str | None = None
+    ) -> LLMResponse:
+        """Like :meth:`complete`, but walks this provider's own fallback models
+        on failure instead of trying only one.
+
+        :meth:`complete` alone tries exactly one model — fine when called
+        through :class:`~itsbob.llm.router.LLMRouter`, which does its own
+        cross-provider *and* cross-model walking, but a caller that talks to
+        a single :class:`Provider` directly (the Gatekeeper's local Back
+        Brain, for one) gets no failover at all without this: a pinned model
+        that 404s (retired, or simply never pulled locally) silently fails
+        the whole call instead of falling through to a model this provider
+        actually has. ``preferred_model`` is tried first if given, then every
+        model in :attr:`models` in order, each tried once.
+        """
+        tried: list[str] = []
+        if preferred_model:
+            tried.append(preferred_model)
+        tried.extend(m for m in self.models if m not in tried)
+        if not tried:
+            raise ProviderNotConfigured(f"{self.name}: no model configured")
+
+        last_exc: Exception | None = None
+        for model in tried:
+            try:
+                return self.complete(request, model=model)
+            except Exception as exc:  # noqa: BLE001 - try the next model
+                last_exc = exc
+                continue
+        assert last_exc is not None  # tried is non-empty, so the loop ran at least once
+        raise last_exc
+
     def __repr__(self) -> str:  # pragma: no cover - convenience
         return f"<{type(self).__name__} {self.name} models={list(self.models)}>"

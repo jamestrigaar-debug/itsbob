@@ -211,7 +211,29 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\nlocal Back Brain (Tier C, the Gatekeeper's classifier engine):")
     if is_ollama_running():
-        print("  ok  ollama       reachable at http://127.0.0.1:11434")
+        from .llm.local import default_ollama_config, list_ollama_models
+
+        print(f"  ok  ollama       reachable at {default_ollama_config().base_url}")
+        pulled = list_ollama_models()
+        wanted = default_ollama_config().models()
+        missing = [m for m in wanted if m not in pulled]
+        if pulled:
+            print(f"      pulled models: {pulled}")
+        else:
+            print("      no models pulled yet")
+        if missing == list(wanted):
+            print(
+                f"      !! none of itsbob's configured models ({list(wanted)}) are "
+                f"pulled — every local classify/summarize call will 404. Run "
+                f"`ollama pull {wanted[0]}`, or `ollama pull <one of {pulled}>` "
+                "and `export ITSBOB_OLLAMA_MODEL=<that one>`."
+            )
+        elif missing:
+            print(
+                f"      note: {missing} not pulled — itsbob will fall through "
+                f"to whichever of {list(wanted)} is pulled, which is fine, but "
+                "`ollama pull` the missing one(s) to stop wasting the first attempt(s)."
+            )
     else:
         print(
             "  --  ollama       not reachable — Tier C/gatekeeper classification "

@@ -23,7 +23,13 @@ from typing import Any, Mapping
 from ..config import ProviderConfig
 from .base import LLMRequest, LLMResponse, Provider, ProviderUnavailable, Usage
 
-__all__ = ["OllamaProvider", "OLLAMA", "default_ollama_config", "is_ollama_running"]
+__all__ = [
+    "OllamaProvider",
+    "OLLAMA",
+    "default_ollama_config",
+    "is_ollama_running",
+    "list_ollama_models",
+]
 
 
 def default_ollama_config(env: Mapping[str, str] | None = None) -> ProviderConfig:
@@ -72,6 +78,25 @@ def is_ollama_running(base_url: str | None = None, *, timeout: float = 0.5) -> b
         return False
 
 
+def list_ollama_models(base_url: str | None = None, *, timeout: float = 2.0) -> list[str]:
+    """The model tags actually pulled locally, per Ollama's own ``/api/tags``.
+
+    Used by ``itsbob doctor`` to catch the "configured a model that was
+    never pulled" mistake *before* a call 404s — returns ``[]`` if Ollama
+    isn't reachable rather than raising, since this is a diagnostic, not a
+    call that needs to succeed.
+    """
+    base_url = base_url or default_ollama_config().base_url
+    try:
+        with urllib.request.urlopen(
+            f"{base_url.rstrip('/')}/api/tags", timeout=timeout
+        ) as resp:
+            data = json.load(resp)
+        return [m.get("name") or m.get("model") for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
 class OllamaProvider(Provider):
     """Talks to a local `ollama serve` instance via its native `/api/chat`.
 
@@ -112,6 +137,15 @@ class OllamaProvider(Provider):
         try:
             with urllib.request.urlopen(http_request, timeout=self.config.timeout) as resp:
                 data: dict[str, Any] = json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ProviderUnavailable(
+                    f"ollama: model {model!r} is not pulled locally "
+                    f"(HTTP 404) — run `ollama pull {model}`, or unset "
+                    "ITSBOB_OLLAMA_MODEL to use whatever this repo's default "
+                    "(qwen2.5:1.5b) or its fallbacks resolve to instead"
+                ) from exc
+            raise ProviderUnavailable(f"ollama: {exc}") from exc
         except urllib.error.URLError as exc:
             raise ProviderUnavailable(f"ollama: {exc}") from exc
         except TimeoutError as exc:  # pragma: no cover - platform dependent
