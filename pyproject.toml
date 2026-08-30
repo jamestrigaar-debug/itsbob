@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "itsbob"
 version = "0.2.0"
-description = "A roleplay chatbot who earns credits to message you first, with file-injected persona and memory."
+description = "A complexity-based hierarchical LLM router (Classify First, Execute Cheapest, Fallback Gracefully) with an energy-metered character simulation built on it."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 # All three providers speak the OpenAI wire format, so langchain is not required.
 # Install this extra only if you want to wrap the router in a LangChain chain.
 langchain = ["langchain>=0.3", "langchain-openai>=0.2"]
+gui = ["flask>=3.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

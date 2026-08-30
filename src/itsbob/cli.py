@@ -16,7 +16,9 @@ from typing import Any, Sequence
 from .config import Settings, load_dotenv
 from .factory import build_router, build_simulation
 from .llm.base import AllProvidersFailed, LLMRequest, user
+from .llm.local import is_ollama_running
 from .memory.long_term import LongTermMemory
+from .router import build_complexity_router
 
 __all__ = ["main"]
 
@@ -31,6 +33,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "doctor": _cmd_doctor,
         "ask": _cmd_ask,
         "memory": _cmd_memory,
+        "classify": _cmd_classify,
+        "route": _cmd_route,
+        "gui": _cmd_gui,
     }[args.command]
     try:
         return handler(args)
@@ -85,7 +90,31 @@ def _build_parser() -> argparse.ArgumentParser:
     memory.add_argument("--query", default=None)
     memory.add_argument("--limit", type=int, default=20)
 
+    classify = sub.add_parser(
+        "classify", help="run only the Gatekeeper: tier + fingerprint, no execution"
+    )
+    classify.add_argument("state", help="JSON game state, or @path/to/file.json")
+
+    route = sub.add_parser(
+        "route", help="full complexity-router pipeline: classify, route, execute"
+    )
+    route.add_argument("state", help="JSON game state, or @path/to/file.json")
+    route.add_argument("--goal", default="win the league")
+
+    gui = sub.add_parser("gui", help="launch the browser GUI (requires the 'gui' extra)")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", type=int, default=8765)
+    gui.add_argument(
+        "--no-browser", action="store_true", help="don't auto-open a browser tab"
+    )
+
     return parser
+
+
+def _load_state_arg(raw: str) -> str:
+    if raw.startswith("@"):
+        return open(raw[1:], encoding="utf-8").read()
+    return raw
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +172,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     for row in router.describe():
         mark = "ok " if row["configured"] else "-- "
         print(f"  {mark}{row['provider']:<12} rpm={row['rpm']:<4} models={row['models']}")
+
+    print("\nlocal Back Brain (Tier C, the Gatekeeper's classifier engine):")
+    if is_ollama_running():
+        print("  ok  ollama       reachable at http://127.0.0.1:11434")
+    else:
+        print(
+            "  --  ollama       not reachable — Tier C/gatekeeper classification "
+            "falls back to the rule-based heuristic (see README: Local Back Brain)"
+        )
 
     if not args.probe:
         print("\n(pass --probe to send a real one-token request to each)")
@@ -213,6 +251,40 @@ def _cmd_memory(args: argparse.Namespace) -> int:
     for record in records:
         print(f"  [{record.importance:.2f}] {record.render()}")
     store.close()
+    return 0
+
+
+def _cmd_classify(args: argparse.Namespace) -> int:
+    from .router import Gatekeeper, compress, default_registry
+    from .llm.local import OllamaProvider
+
+    state = compress(_load_state_arg(args.state))
+    local = OllamaProvider() if is_ollama_running() else None
+    gatekeeper = Gatekeeper(registry=default_registry(), local_provider=local)
+    decision = gatekeeper.classify(state)
+    print(json.dumps(decision.as_dict(), indent=2))
+    return 0
+
+
+def _cmd_route(args: argparse.Namespace) -> int:
+    settings = Settings.from_env(dotenv=None)
+    router = build_complexity_router(settings, goal=args.goal)
+    result = router.route(_load_state_arg(args.state))
+    print(json.dumps(result.as_dict(), indent=2))
+    return 0 if result.ok else 1
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    try:
+        from .gui.app import run_gui
+    except ImportError as exc:
+        print(
+            "error: the GUI needs Flask — install it with `pip install -e \".[gui]\"`\n"
+            f"({exc})",
+            file=sys.stderr,
+        )
+        return 1
+    run_gui(host=args.host, port=args.port, open_browser=not args.no_browser)
     return 0
 
 
