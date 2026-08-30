@@ -55,7 +55,7 @@ if ! "$PIP" install --quiet --upgrade -e ".[all]"; then
     $PIP install -e '.[all]'"
   ok "installed itsbob (core only — no GUI; add it later with: $PIP install -e '.[gui]')"
 else
-  ok "installed itsbob with the browser interface and the fast recall path"
+  ok "installed itsbob with the browser interface, image support and fast recall"
 fi
 
 BIN="$VENV/bin/itsbob"; [ -x "$BIN" ] || BIN="$VENV/Scripts/itsbob.exe"

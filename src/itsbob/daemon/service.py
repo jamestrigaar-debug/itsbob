@@ -46,6 +46,7 @@ starts clean but can still notice "third morning in a row".
 
 from __future__ import annotations
 
+import queue
 import signal
 import threading
 import time
@@ -96,6 +97,7 @@ class Daemon:
         health_gate: bool = True,
         defer_seconds: float = 600.0,
         max_defers: int = 6,
+        discord: Any = None,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -120,6 +122,12 @@ class Daemon:
         #: After this many consecutive deferrals (about an hour at the default
         #: interval) say so once — work that is never run is also a failure.
         self.max_defers = max_defers
+        #: Two-way Discord, when configured. Messages typed in the channel are
+        #: queued here and run between ticks, on this same thread — one
+        #: consumer for the agent, so a chat message and a scheduled task can
+        #: never interleave into each other's conversation.
+        self.discord = discord
+        self._inbox: queue.Queue = queue.Queue(maxsize=50)
         self._stop = threading.Event()
         self._abandoned = 0
         self._defers: dict[str, int] = {}
@@ -134,17 +142,68 @@ class Daemon:
         """Block until :meth:`stop` is called, or a stop signal arrives."""
         self.started_at = time.time()
         self._install_signal_handlers()
+        self._start_discord()
         self._emit("started", tasks=len(self.tasks), policy=self.agent.toolbox.policy.mode.value)
         try:
             while not self._stop.is_set():
                 self.tick()
+                self.drain_inbox()
                 if self._stop.is_set():
                     break
-                self._stop.wait(self._sleep_for())
+                # Capped when Discord is listening: a person waiting on a reply
+                # measures the delay differently to a nightly backup does.
+                wait = self._sleep_for()
+                if self.discord is not None:
+                    wait = min(wait, 3.0)
+                self._stop.wait(wait)
         except KeyboardInterrupt:  # pragma: no cover - interactive
             pass
         finally:
+            if self.discord is not None:
+                self.discord.stop()
             self._emit("stopped", runs=self.runs_completed, notified=self.notifications_sent)
+
+    def _start_discord(self) -> None:
+        if self.discord is None:
+            return
+        if self.discord.start():
+            self._emit("discord_started", channel=self.discord.client.channel_id)
+        else:
+            self._emit("discord_failed", error=self.discord.last_error or "unknown")
+            self.discord = None
+
+    def submit_message(self, text: str, **extra: Any) -> bool:
+        """Queue an outside message (from Discord) to run between ticks."""
+        try:
+            self._inbox.put_nowait((text, extra))
+        except queue.Full:
+            return False
+        return True
+
+    def drain_inbox(self) -> int:
+        """Answer everything queued from outside. Returns how many ran."""
+        answered = 0
+        while not self._stop.is_set():
+            try:
+                text, extra = self._inbox.get_nowait()
+            except queue.Empty:
+                return answered
+            self._emit("message", source=extra.get("source", "external"), text=text[:200])
+            turn = None
+            error: str | None = None
+            try:
+                turn = self._run_prompt(text)
+            except Exception as exc:  # noqa: BLE001 - one bad message, not the loop
+                error = f"{type(exc).__name__}: {exc}"
+                self._emit("message_failed", error=error)
+            callback = extra.get("on_done")
+            if callback is not None:
+                try:
+                    callback(turn, error)
+                except Exception:  # noqa: BLE001
+                    pass
+            answered += 1
+        return answered
 
     def _install_signal_handlers(self) -> None:
         """Turn SIGTERM/SIGINT into a clean stop, when we can.
@@ -416,10 +475,38 @@ def build_daemon(
     root = Path(home).expanduser() if home else default_home()
     root.mkdir(parents=True, exist_ok=True)
     agent = agent or build_agent(home=root, **agent_kwargs)
-    return Daemon(
+    daemon = Daemon(
         agent=agent,
         tasks=tasks or TaskStore(root / "tasks.sqlite"),
-        sink=sink if sink is not None else default_sink(root, console=console),
+        sink=sink if sink is not None else _default_sink_with_discord(root, console=console),
         home=root,
         on_event=on_event,
     )
+    daemon.discord = _build_bridge(daemon)
+    return daemon
+
+
+def _build_bridge(daemon: Daemon) -> Any:
+    """The Discord bridge, wired to answer through the daemon's own inbox."""
+    from ..integrations.discord import DiscordBridge, DiscordClient
+
+    client = DiscordClient.from_env()
+    if client is None:
+        return None
+    return DiscordBridge(client=client, submit=daemon.submit_message)
+
+
+def _default_sink_with_discord(root: Path, *, console: bool) -> Any:
+    """The usual sinks, plus the Discord channel when one is configured.
+
+    Appended, never substituted: `notifications.jsonl` is what the messages
+    window reads, and a configured channel must not empty that page.
+    """
+    from ..daemon.notify import MultiSink
+    from ..integrations.discord import DiscordClient, DiscordSink
+
+    base = default_sink(root, console=console)
+    client = DiscordClient.from_env()
+    if client is None:
+        return base
+    return MultiSink(sinks=[*base.sinks, DiscordSink(client=client)])

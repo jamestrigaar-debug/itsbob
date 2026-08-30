@@ -319,3 +319,53 @@ def test_empty_memory_reports_zero_rather_than_missing(client):
 def test_reset_clears_the_conversation(client):
     assert client.post("/api/reset").get_json()["ok"] is True
     assert client.get("/api/status").get_json()["turns"] == 0
+
+
+# -- the messages window and the API panel ---------------------------------
+
+
+def test_the_messages_window_is_its_own_page(client):
+    response = client.get("/messages")
+    assert response.status_code == 200
+    body = response.data
+    assert b"/api/messages/stream" in body  # live
+    assert b"/api/chat" not in body  # and genuinely separate from the conversation
+
+
+def test_messages_are_listed_and_can_be_marked_read(client, tmp_path):
+    from itsbob.daemon.notify import FileSink, Notification
+
+    sink = FileSink(path=tmp_path / "home" / "notifications.jsonl")
+    sink.send(Notification(title="backup finished", body="all good", task="nightly"))
+    sink.send(Notification(title="disk is nearly full", body="4%", urgency="high"))
+
+    body = client.get("/api/messages").get_json()
+    assert [m["title"] for m in body["messages"]] == [
+        "backup finished", "disk is nearly full"
+    ]
+    assert body["unread"] == 2
+    assert client.get("/api/status").get_json()["unread"] == 2
+
+    marked = client.post("/api/messages/read", json={"all": True}).get_json()
+    assert marked["unread"] == 0
+    assert client.get("/api/messages?unread=1").get_json()["messages"] == []
+
+
+def test_the_status_names_which_apis_are_live(client, monkeypatch):
+    """The API panel exists so a task can be written against a key that is set."""
+    body = client.get("/api/status").get_json()
+    assert isinstance(body["apis"], list)
+    for row in body["apis"]:
+        assert {"name", "configured", "key_env", "base_url"} <= set(row)
+
+
+def test_discord_reports_that_it_is_not_configured_rather_than_failing(client):
+    body = client.get("/api/discord").get_json()
+    assert body["configured"] is False and "DISCORD_BOT_TOKEN" in body["hint"]
+    assert client.post("/api/discord", json={"enabled": True}).status_code == 409
+
+
+def test_the_page_links_to_the_messages_window(client):
+    body = client.get("/").data
+    assert b"/messages" in body
+    assert b'data-panel="apis"' in body
