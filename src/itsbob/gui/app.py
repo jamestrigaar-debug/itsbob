@@ -37,16 +37,36 @@ EXAMPLE_MESSAGES = [
 ]
 
 
-def _as_game_state_json(raw_text: str) -> str:
-    """Accept plain text as well as JSON: wrap non-JSON input as a fact."""
-    stripped = raw_text.strip()
+def _parse_as_state(text: str, *, wrap_key: str) -> dict[str, Any]:
+    """JSON (either flat facts, or {"facts":..., "events":...}) or plain text,
+    normalized to {"facts": {...}, "events": [...]}."""
+    stripped = text.strip()
     if not stripped:
-        return "{}"
+        return {"facts": {}, "events": []}
     try:
-        json.loads(stripped)
-        return stripped
+        parsed = json.loads(stripped)
     except json.JSONDecodeError:
-        return json.dumps({"facts": {"message": stripped}})
+        return {"facts": {wrap_key: stripped}, "events": []}
+    if isinstance(parsed, dict):
+        if "facts" in parsed or "events" in parsed:
+            return {"facts": dict(parsed.get("facts") or {}), "events": list(parsed.get("events") or [])}
+        return {"facts": parsed, "events": []}
+    return {"facts": {wrap_key: stripped}, "events": []}
+
+
+def _merge_context_and_message(context_text: str, message_text: str) -> dict[str, Any]:
+    """Context is background state (set/overridden first); the message is the
+    live turn on top of it — mirroring how a real screen-scrape (context)
+    plus a fresh event (message) would combine. Both accept JSON or plain
+    text independently, which is the point: for testing, you can hold a
+    context fixed as JSON and vary the message as plain text, or vice versa.
+    """
+    ctx = _parse_as_state(context_text, wrap_key="context")
+    msg = _parse_as_state(message_text, wrap_key="message")
+    return {
+        "facts": {**ctx["facts"], **msg["facts"]},
+        "events": [*ctx["events"], *msg["events"]],
+    }
 
 
 def create_app():
@@ -116,17 +136,20 @@ def create_app():
 
     @app.post("/api/chat")
     def chat():
-        """One turn: freeform or JSON input in, a chat reply + full trace out."""
+        """One turn: context + message in (each freeform or JSON), a chat reply + full trace out.
+
+        ``context`` is optional background state, merged in *before* the
+        message so a message's facts/events win on overlap — meant for
+        testing a fixed scenario (context) against varying inputs (message)
+        without retyping the whole state each time.
+        """
         payload = request.get_json(force=True, silent=True) or {}
-        raw_text = str(payload.get("message", ""))
+        message_text = str(payload.get("message", ""))
+        context_text = str(payload.get("context", ""))
         goal = payload.get("goal") or "win the league"
         classify_only = bool(payload.get("classify_only"))
 
-        state_json = _as_game_state_json(raw_text)
-        try:
-            parsed = json.loads(state_json)
-        except json.JSONDecodeError as exc:
-            return jsonify({"error": f"invalid JSON: {exc}"}), 400
+        parsed = _merge_context_and_message(context_text, message_text)
 
         router = get_router()
         router.goal = goal
@@ -267,6 +290,12 @@ _PAGE = """
   .row2 { display: flex; gap: 14px; align-items: center; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
   .row2 label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
   .row2 .examples span { cursor: pointer; text-decoration: underline; margin-right: 10px; }
+  #context-toggle { cursor: pointer; text-decoration: underline; color: var(--muted); font-size: 11.5px; user-select: none; }
+  #context-wrap { display: none; flex-direction: column; gap: 4px; }
+  #context-wrap.open { display: flex; }
+  #context-wrap label { font-size: 11px; color: var(--muted); }
+  #ctx { resize: vertical; min-height: 40px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    font-size: 12.5px; font-family: ui-monospace, Menlo, Consolas, monospace; }
 
   section.monitor { display: flex; flex-direction: column; min-width: 0; }
   section.monitor h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
@@ -296,6 +325,11 @@ _PAGE = """
   <section class="chat">
     <div id="chat-log"></div>
     <div id="composer">
+      <div id="context-wrap">
+        <label for="ctx">Context (optional, sent with every message — background facts/state, JSON or plain text; useful for testing the same message against different scenarios)</label>
+        <textarea id="ctx" placeholder='e.g. {"facts": {"opponent_formation": "4-4-2", "morale": "low"}, "events": ["68 Yellow card"]}'></textarea>
+      </div>
+      <span id="context-toggle" onclick="toggleContext()">+ add context</span>
       <div class="row1">
         <textarea id="msg" placeholder='Describe a situation, or paste JSON — e.g. {"facts": {"stamina": 15, "minute": 60}}'></textarea>
         <button class="send" onclick="send()">Send</button>
@@ -342,6 +376,13 @@ function renderExamples() {
 }
 function useExample(i) {
   document.getElementById('msg').value = examples[i];
+}
+
+function toggleContext() {
+  const wrap = document.getElementById('context-wrap');
+  const toggle = document.getElementById('context-toggle');
+  const open = wrap.classList.toggle('open');
+  toggle.textContent = open ? '- hide context' : '+ add context';
 }
 
 function addBubble(role, text, tier) {
@@ -402,19 +443,21 @@ function addTrace(data, mode) {
 
 async function send() {
   const msgEl = document.getElementById('msg');
+  const ctxEl = document.getElementById('ctx');
   const text = msgEl.value.trim();
-  if (!text) return;
+  const context = ctxEl.value.trim();
+  if (!text && !context) return;
   const goal = document.getElementById('goal').value;
   const classifyOnly = document.getElementById('classify-only').checked;
 
-  addBubble('user', text);
+  addBubble('user', context ? `[context] ${context}\n[message] ${text}` : text);
   msgEl.value = '';
   const thinking = addBubble('bot', 'thinking…');
 
   try {
     const r = await fetch('/api/chat', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message: text, goal, classify_only: classifyOnly })
+      body: JSON.stringify({ message: text, context, goal, classify_only: classifyOnly })
     });
     const data = await r.json();
     thinking.remove();

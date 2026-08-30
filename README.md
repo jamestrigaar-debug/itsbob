@@ -282,6 +282,13 @@ state. Manual override required." — exactly where the spec says the system
 should halt and ask you. Check **classify only** above the input to see how
 something would be tagged without executing anything.
 
+Click **+ add context** to reveal a separate **Context** field: background
+state (JSON or plain text) merged in before the message on every send, so a
+message's facts win on overlap. Mainly for testing — hold a scenario fixed
+in Context and vary only the Message across sends, or the reverse, rather
+than retyping the whole state every time. Either field works alone; leaving
+Context empty behaves exactly as before.
+
 **Right — live processing.** Every message you send appends a trace card
 here, newest on top, so you can *watch it think* rather than read logs:
 
