@@ -12,12 +12,14 @@ from .base import (
     score_record,
     tokenize,
 )
-from .long_term import LongTermMemory
+from .long_term import HybridWeights, LongTermMemory, RecallHit
 from .short_term import ShortTermMemory
 
 __all__ = [
     "ConsolidationReport",
+    "HybridWeights",
     "LongTermMemory",
+    "RecallHit",
     "MemoryBank",
     "MemoryKind",
     "MemoryRecord",
