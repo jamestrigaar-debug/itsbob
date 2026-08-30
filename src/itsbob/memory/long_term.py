@@ -51,9 +51,11 @@ from typing import Any, Callable, Iterable, Sequence
 from ..store import Database
 from .base import (
     DEFAULT_WEIGHTS,
+    Horizon,
     MemoryKind,
     MemoryRecord,
     RetrievalWeights,
+    Subject,
     keyword_relevance,
     render_records,
     tokenize,
@@ -76,7 +78,9 @@ CREATE TABLE IF NOT EXISTS memories (
     tags             TEXT NOT NULL DEFAULT '[]',
     metadata         TEXT NOT NULL DEFAULT '{}',
     source           TEXT NOT NULL DEFAULT 'agent',
-    expires_at       REAL
+    expires_at       REAL,
+    subject          TEXT NOT NULL DEFAULT 'user',
+    horizon          TEXT NOT NULL DEFAULT 'long'
 );
 CREATE TABLE IF NOT EXISTS vectors (
     memory_id  TEXT NOT NULL,
@@ -98,6 +102,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_kind       ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_memories_created    ON memories(created_at);
 CREATE INDEX IF NOT EXISTS idx_memories_expires    ON memories(expires_at);
+CREATE INDEX IF NOT EXISTS idx_memories_subject    ON memories(subject);
+CREATE INDEX IF NOT EXISTS idx_memories_horizon    ON memories(horizon, created_at);
 CREATE INDEX IF NOT EXISTS idx_vectors_signature   ON vectors(signature);
 """
 
@@ -247,6 +253,8 @@ class LongTermMemory:
             ("last_access_at", "ALTER TABLE memories ADD COLUMN last_access_at REAL NOT NULL DEFAULT 0"),
             ("source", "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'agent'"),
             ("expires_at", "ALTER TABLE memories ADD COLUMN expires_at REAL"),
+            ("subject", "ALTER TABLE memories ADD COLUMN subject TEXT NOT NULL DEFAULT 'user'"),
+            ("horizon", "ALTER TABLE memories ADD COLUMN horizon TEXT NOT NULL DEFAULT 'long'"),
         ):
             if column not in existing:
                 self._db.execute(ddl)
@@ -272,15 +280,15 @@ class LongTermMemory:
 
     def add(self, record: MemoryRecord, *, embed: bool | None = None) -> MemoryRecord:
         source = str(record.metadata.get("source", "agent"))
-        expires_at = record.metadata.get("expires_at")
+        expires_at = record.expires_at
         with self._db.transaction() as conn:
             conn.execute(
                 """
             INSERT OR REPLACE INTO memories (
                 id, content, kind, importance, tick, created_at,
                 last_access_tick, last_access_at, access_count, salience,
-                tags, metadata, source, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tags, metadata, source, expires_at, subject, horizon
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     record.id,
@@ -297,6 +305,8 @@ class LongTermMemory:
                     json.dumps(record.metadata),
                     source,
                     float(expires_at) if expires_at is not None else None,
+                    record.subject.value,
+                    record.horizon.value,
                 ),
             )
             if self.fts_enabled:
@@ -318,7 +328,10 @@ class LongTermMemory:
 
     def update(self, record_id: str, **fields: Any) -> bool:
         """Patch one record in place. Re-embeds if the content changed."""
-        allowed = {"content", "importance", "tags", "metadata", "kind", "expires_at"}
+        allowed = {
+            "content", "importance", "tags", "metadata", "kind",
+            "expires_at", "subject", "horizon",
+        }
         sets, params = [], []
         for key, value in fields.items():
             if key not in allowed:
@@ -380,6 +393,77 @@ class LongTermMemory:
         for record_id in ids:
             self.forget(record_id)
         return len(ids)
+
+    #: How many short-horizon rows survive. "A few replies" in the request that
+    #: prompted this: enough to carry a thread, not enough to become the corpus.
+    short_term_capacity: int = 24
+    #: And how long one lives regardless of how quiet it has been since.
+    short_term_ttl_seconds: float = 6 * 3600.0
+
+    def prune_short_term(self, *, keep: int | None = None, now: float | None = None) -> int:
+        """Expire the short-horizon working set, by clock then by count.
+
+        Two limits rather than one because they fail differently. The clock
+        alone leaves a burst of forty rows from one busy hour all live at once;
+        the count alone lets a single row from last Tuesday sit in the working
+        set forever because nothing has pushed it out.
+
+        Long-horizon rows are never touched here — the whole point of promoting
+        something to long-term is that this method cannot reach it.
+        """
+        now = time.time() if now is None else now
+        keep = self.short_term_capacity if keep is None else max(0, keep)
+        cutoff = now - self.short_term_ttl_seconds
+
+        doomed = [
+            row["id"]
+            for row in self._db.query(
+                "SELECT id FROM memories WHERE horizon = 'short' AND created_at < ?",
+                (cutoff,),
+            )
+        ]
+        survivors = [
+            row["id"]
+            for row in self._db.query(
+                "SELECT id FROM memories WHERE horizon = 'short' AND created_at >= ? "
+                "ORDER BY created_at DESC",
+                (cutoff,),
+            )
+        ]
+        doomed.extend(survivors[keep:])
+        for record_id in doomed:
+            self.forget(record_id)
+        return len(doomed)
+
+    def promote(self, record_id: str, *, importance: float | None = None) -> bool:
+        """Move a short-horizon row into long-term memory.
+
+        Consolidation is a real event, not a side effect of scoring: something
+        that started as "what we are doing right now" turned out to be worth
+        keeping, and clearing ``expires_at`` is what makes that stick.
+        """
+        fields: dict[str, Any] = {"horizon": Horizon.LONG.value, "expires_at": None}
+        if importance is not None:
+            fields["importance"] = importance
+        return self.update(record_id, **fields)
+
+    def by_subject(self, subject: Subject, *, limit: int = 20) -> list[MemoryRecord]:
+        rows = self._db.query(
+            "SELECT * FROM memories WHERE subject = ? ORDER BY created_at DESC LIMIT ?",
+            (Subject.coerce(subject).value, limit),
+        )
+        return [_from_row(row) for row in rows]
+
+    def counts_by(self, column: str) -> dict[str, int]:
+        """Row counts grouped by ``subject`` or ``horizon``, for the status panel."""
+        if column not in ("subject", "horizon", "kind"):
+            raise ValueError(f"cannot group by {column!r}")
+        return {
+            str(row[column]): int(row["n"])
+            for row in self._db.query(
+                f"SELECT {column}, COUNT(*) AS n FROM memories GROUP BY {column}"  # noqa: S608
+            )
+        }
 
     def prune(self, max_records: int) -> int:
         """Keep the ``max_records`` most valuable; drop the rest.
@@ -828,6 +912,8 @@ class LongTermMemory:
             "offline_embedder": offline,
             "semantic_recall": bool(signature and vectorized and not offline),
             "degraded": bool(getattr(self.embedder, "degraded", False)),
+            "by_subject": self.counts_by("subject"),
+            "by_horizon": self.counts_by("horizon"),
         }
 
     def __len__(self) -> int:
@@ -879,7 +965,10 @@ def _from_row(row: sqlite3.Row) -> MemoryRecord:
     return MemoryRecord(
         id=row["id"],
         content=row["content"],
-        kind=MemoryKind(row["kind"]),
+        kind=MemoryKind.coerce(row["kind"]),
+        subject=Subject.coerce(row["subject"] if "subject" in keys else None),
+        horizon=Horizon.coerce(row["horizon"] if "horizon" in keys else None),
+        expires_at=row["expires_at"] if "expires_at" in keys else None,
         importance=row["importance"],
         tick=row["tick"],
         created_at=row["created_at"],

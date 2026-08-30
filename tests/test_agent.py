@@ -404,3 +404,205 @@ def test_a_broken_event_listener_does_not_break_the_turn(tmp_path):
 
     agent = _agent(tmp_path, [{"final": "fine"}])
     assert agent.chat("hi", on_event=explode).final == "fine"
+
+
+# -- token discipline: budget, feasibility, local-first ---------------------
+
+
+def test_the_step_budget_extends_itself_while_work_is_landing(tmp_path):
+    """A fixed budget was stopping real work mid-task. Progress buys more steps."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    # Reads a different file each step, so every step succeeds and none repeats.
+    for i in range(12):
+        (workspace / f"f{i}.txt").write_text(f"file {i}", encoding="utf-8")
+
+    script = [
+        {"thought": "reading", "tool": "read_file", "params": {"path": f"f{i}.txt"}}
+        for i in range(12)
+    ] + [{"final": "done"}]
+    agent = _agent(tmp_path, script, max_steps=3, extend_by=3, hard_max_steps=15)
+    turn = agent.chat("read every file in the workspace and tell me what they say")
+    assert turn.extensions >= 2
+    assert len(turn.steps) > 3  # the original budget did not end it
+
+
+def test_a_turn_going_nowhere_still_stops_at_the_first_checkpoint(tmp_path):
+    """Extension is earned by successful tool calls, not granted by default."""
+    script = [
+        {"thought": "hmm", "tool": "read_file", "params": {"path": "missing.txt"}}
+    ] * 20 + [{"final": "gave up"}]
+    agent = _agent(tmp_path, script, max_steps=6, extend_by=6, hard_max_steps=30)
+    turn = agent.chat("read a file that is not there")
+    assert turn.extensions == 0
+    assert len(turn.steps) <= 6
+
+
+def test_the_feasibility_check_refuses_before_spending_the_budget():
+    """One cheap call beats eight premium steps discovering the same thing."""
+    from itsbob.agent.budget import FeasibilityCheck
+
+    class Refusing:
+        def complete_json(self, tier, request, **kwargs):
+            return {"feasible": False, "reason": "there is no printer tool",
+                    "missing": ["a printer"]}, None
+
+    check = FeasibilityCheck(brain=Refusing())
+    verdict = check.check(message="print this on paper", tools=["read_file"])
+    assert not verdict.feasible and verdict.checked
+    assert "printer" in verdict.explain()
+
+
+def test_an_unusable_feasibility_answer_lets_the_turn_proceed():
+    """A false 'no' refuses work it could have done — worse than a wasted turn."""
+    from itsbob.agent.budget import FeasibilityCheck
+
+    class Broken:
+        def complete_json(self, tier, request, **kwargs):
+            raise RuntimeError("no model")
+
+    assert FeasibilityCheck(brain=Broken()).check(message="x", tools=[]).feasible
+
+    class Vague:
+        def complete_json(self, tier, request, **kwargs):
+            return {"feasible": False}, None  # refused, but said nothing useful
+
+    assert FeasibilityCheck(brain=Vague()).check(message="x", tools=[]).feasible
+
+
+def test_the_spend_guard_stops_a_turn_that_has_cost_too_much():
+    from itsbob.agent.budget import SpendGuard
+
+    guard = SpendGuard(max_tokens_per_turn=100)
+    guard.start_turn()
+    guard.add(60)
+    assert guard.exceeded() is None
+    guard.add(60)
+    assert "over its" in (guard.exceeded() or "")
+    guard.start_turn()  # a new turn starts clean
+    assert guard.exceeded() is None
+
+
+def test_cheap_work_goes_to_the_local_model_and_is_counted():
+    """'Configured' and 'answered' are different claims; only one saves money."""
+    from itsbob.agent.brain import TieredBrain
+    from itsbob.llm.base import LLMRequest, LLMResponse, Usage, user
+    from itsbob.router.tiers import Tier
+
+    class FakeLocal:
+        name = "ollama"
+        models = ("qwen2.5:1.5b",)
+        calls = 0
+
+        def complete_with_fallback(self, request, preferred_model=None):
+            type(self).calls += 1
+            return LLMResponse(text="hi", model="qwen2.5:1.5b", provider="ollama",
+                               usage=Usage(prompt_tokens=5, completion_tokens=2))
+
+    class NeverAsked:
+        def complete(self, request, *, purpose=""):
+            raise AssertionError("the cloud tier should not have been reached")
+
+        def describe(self):
+            return []
+
+    brain = TieredBrain({Tier.A: NeverAsked()}, local=FakeLocal())
+    request = LLMRequest(messages=[user("hello")])
+    assert brain.complete(Tier.C, request).response.provider == "ollama"
+    # A bookkeeping chore takes the local path even at a higher tier.
+    chore = LLMRequest(messages=[user("classify")], metadata={"local_ok": True})
+    assert brain.complete(Tier.A, chore).response.provider == "ollama"
+    assert brain.local_answers == 2 and brain.local_share == 1.0
+    assert brain.describe()["local"]["answers"] == 2
+
+
+# -- memory attribution ----------------------------------------------------
+
+
+def test_bobs_own_opinions_are_stored_as_bobs(tmp_path):
+    """Asked for its favourite films, it wrote all five down as the user's."""
+    from itsbob.memory.base import Subject
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    brain = FakeBrain(
+        [
+            {
+                "memories": [
+                    {"content": "I liked Blade Runner most", "subject": "bob",
+                     "kind": "preference", "horizon": "long"},
+                    {"content": "The user is looking for something to watch tonight",
+                     "subject": "user", "horizon": "short"},
+                ]
+            }
+        ]
+    )
+    written = MemoryWriter(brain=brain, store=store).write(
+        message="what are your five favourite films?",
+        answer="Blade Runner, Alien, Heat, Chungking Express, Stalker.",
+    )
+    by_subject = {r.subject: r for r in written}
+    assert by_subject[Subject.SELF].content.startswith("I liked")
+    assert by_subject[Subject.USER].expires_at is not None  # short-term expires
+
+
+def test_a_self_labelled_sentence_wins_over_a_wrong_subject_label():
+    """A model that writes 'I liked X' and labels it `user` contradicted itself."""
+    from itsbob.agent.writer import MemoryWriter
+    from itsbob.memory.base import Subject
+
+    brain = FakeBrain(
+        [{"memories": [{"content": "I liked Blade Runner", "subject": "user"}]}]
+    )
+
+    class Store:
+        def search(self, *a, **k):
+            return []
+
+    extracted = MemoryWriter(brain=brain, store=Store()).extract(
+        message="what did you think of it?", answer="Blade Runner was the best."
+    )
+    assert extracted[0].subject is Subject.SELF
+
+
+def test_recalled_memories_are_grouped_by_who_they_are_about():
+    from itsbob.memory.base import MemoryRecord, Subject
+
+    rendered = build_messages(
+        persona=Persona(name="Bob"),
+        tools="",
+        snapshot_text="hi",
+        conversation=Conversation(),
+        memories=[
+            MemoryRecord(content="prefers dark roast", subject=Subject.USER),
+            MemoryRecord(content="I liked Blade Runner", subject=Subject.SELF),
+        ],
+    )[0].content
+    assert "About the user:" in rendered
+    assert "do not attribute these to the user" in rendered
+
+
+def test_short_term_memory_is_pruned_by_count_and_by_clock(tmp_path):
+    import time
+
+    from itsbob.memory.base import Horizon, MemoryRecord
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    store.short_term_capacity = 3
+    for i in range(6):
+        store.add(MemoryRecord(content=f"working on step {i}", horizon=Horizon.SHORT))
+    store.add(MemoryRecord(content="lives in Reading"))  # long-horizon, untouchable
+    assert store.prune_short_term() == 3
+    assert len(store) == 4
+    assert store.counts_by("horizon") == {"short": 3, "long": 1}
+
+    # Old enough to expire regardless of how few there are.
+    store.short_term_ttl_seconds = 0.0
+    assert store.prune_short_term() == 3
+    assert store.counts_by("horizon") == {"long": 1}
+
+    # And a promoted memory survives both limits.
+    stale = store.add(MemoryRecord(content="this thread matters", horizon=Horizon.SHORT))
+    assert store.promote(stale.id)
+    assert store.prune_short_term(keep=0) == 0
+    assert store.get(stale.id).expires_at is None
+    assert time.time() > 0  # (the clock is only used for the TTL above)

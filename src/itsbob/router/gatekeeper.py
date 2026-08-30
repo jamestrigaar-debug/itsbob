@@ -266,6 +266,10 @@ class Gatekeeper:
             max_tokens=200,
             temperature=0.0,
             json_mode=True,
+            # Classification is on the critical path of every turn, so it keeps
+            # the tight budget even though the local provider now allows a long
+            # one for actually answering.
+            metadata={"timeout": 8.0, "local_ok": True},
         )
 
     def _classify_with_local(self, snapshot: Snapshot) -> GateDecision | None:

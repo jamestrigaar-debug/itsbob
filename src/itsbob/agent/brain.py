@@ -44,7 +44,7 @@ from ..llm.base import AllProvidersFailed, LLMRequest, LLMResponse, Provider
 from ..llm.catalog import GOOGLE, default_provider_configs
 from ..llm.local import OllamaProvider, is_ollama_running
 from ..llm.providers import EchoProvider, GoogleProvider, build_provider
-from ..llm.router import LLMRouter, UsageTracker, extract_json
+from ..llm.router import LLMRouter, UsageRecord, UsageTracker, extract_json
 from ..router.tiers import Tier
 
 __all__ = ["TIER_MODELS", "TierResult", "TieredBrain", "build_brain"]
@@ -121,9 +121,18 @@ class TieredBrain:
         if not routers:
             raise ValueError("TieredBrain needs at least one tier")
         self.routers = dict(routers)
-        #: Ollama, when it is running. Free and private, so Tier C prefers it.
+        #: Ollama, when it is running. Free and private, so it gets first refusal
+        #: on everything cheap.
         self.local = local
         self.tracker = tracker or UsageTracker()
+        #: Proof, not hope. "The local model is configured" and "the local model
+        #: answered" are different claims, and only the second one saves money —
+        #: so both are counted and both are reported by `describe()`, `itsbob
+        #: doctor` and the status panel.
+        self.local_calls = 0
+        self.local_answers = 0
+        self.local_failures = 0
+        self.last_local_error: str | None = None
 
     def router_for(self, tier: Tier) -> LLMRouter | None:
         return self.routers.get(tier)
@@ -139,17 +148,38 @@ class TieredBrain:
         errors: dict[str, str] = {}
         attempts = 0
 
-        # Tier C prefers the local model when one is up: it is free, private,
-        # and fast enough for the work Tier C is given.
-        if tier is Tier.C and self.local is not None:
+        # The local model gets first refusal on everything cheap: it is free,
+        # private, and fast enough for the work in question. That is Tier C —
+        # greetings, recall, one obvious step — plus any request explicitly
+        # marked `local_ok`, which is how the bookkeeping chores (classifying,
+        # extracting memories, summarizing, the feasibility check) stay off the
+        # bill entirely. Short back-to-back chats are the case this exists for:
+        # they are the cheapest turns and, without this, the most wasteful.
+        if self.local is not None and (tier is Tier.C or request.metadata.get("local_ok")):
             attempts += 1
+            self.local_calls += 1
             try:
                 response = self.local.complete_with_fallback(request)
                 if response.text.strip():
+                    self.local_answers += 1
+                    self.tracker.record(
+                        UsageRecord(
+                            provider=response.provider,
+                            model=response.model,
+                            ok=True,
+                            usage=response.usage,
+                            latency_ms=response.latency_ms,
+                            purpose=f"{purpose}.local",
+                        )
+                    )
                     return TierResult(response=response, tier=Tier.C, attempts=attempts)
                 errors["ollama"] = "empty response"
+                self.local_failures += 1
+                self.last_local_error = "empty response"
             except Exception as exc:  # noqa: BLE001 - cloud tiers still to try
                 errors["ollama"] = f"{type(exc).__name__}: {exc}"[:200]
+                self.local_failures += 1
+                self.last_local_error = errors["ollama"]
 
         for candidate in chain:
             router = self.routers.get(candidate)
@@ -214,11 +244,21 @@ class TieredBrain:
             raise AllProvidersFailed({k: RuntimeError(v) for k, v in errors.items()})
         raise AllProvidersFailed({k: RuntimeError(v) for k, v in errors.items()})
 
+    @property
+    def local_share(self) -> float:
+        """Fraction of local attempts that produced an answer. 0 when unused."""
+        return self.local_answers / self.local_calls if self.local_calls else 0.0
+
     def describe(self) -> dict[str, Any]:
         return {
             "local": None if self.local is None else {
                 "provider": self.local.name,
                 "models": list(self.local.models),
+                "calls": self.local_calls,
+                "answers": self.local_answers,
+                "failures": self.local_failures,
+                "hit_rate": round(self.local_share, 3),
+                "last_error": self.last_local_error,
             },
             "tiers": {
                 tier.value: {
