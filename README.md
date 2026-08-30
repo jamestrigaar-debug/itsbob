@@ -1,286 +1,496 @@
-# 1tsb0b
+# itsbob — Complexity-Based Hierarchical Router
 
-A roleplay chatbot who speaks l33t, has to earn the right to message you, and
-never lets a language model write his dialogue.
+**Classify First, Execute Cheapest, Fallback Gracefully.**
 
-He runs on your laptop, always on, reachable from a browser anywhere. Talking
-*to* him is free. Messaging *you* first costs credits he earns by waiting and
-behaving — and when he spends them, you judge whether it was worth it.
-
-Two things matter. **The API makes decisions, not sentences** — it is called
-under a rigid protocol and must answer with exactly one control line, and the
-words come from a pool of 426 pre-written, tone-tagged lines. And **his
-personality is learned, not configured** — from your feedback and his memory,
-with no API calls at all.
+`itsbob` decides, for every incoming piece of state, the *cheapest tier of
+intelligence* that can safely handle it — a deterministic script, a small
+local model, a cheap cloud API, an expensive one, or (if nothing can parse
+the state) a halt-and-ask-the-human alert — and never lets anything but a
+pre-registered script name touch actuation.
 
 ```
-   1TSB0B|P00L|8.4|0.3|0.0|7.5|1.0|7.0|good news
-   ───┬── ─┬── ─────────┬───────────── ────┬────
-   sentinel │      six tone axes        topic hint
-          action
+Tier D   Direct Script      no LLM, <50ms        trivial if/else
+Tier C   Local Back Brain   local LLM, ~600ms     summarize/paraphrase/format
+Tier B   Standard Cloud     cheap API, ~1.2s      tactical, multi-step reasoning
+Tier A   Premium Cloud      expensive API         high-stakes, nuanced judgment
+Tier S   Critical Fallback  halt, ask the user     nothing else could parse the state
 ```
 
-Anything else — a stray "Sure!", a code fence, `8` instead of `8.0` — is a
-protocol violation. One terse correction, then a deterministic local decision
-takes over. A model having a bad day can produce a malformed line; it cannot
-produce a surprising personality or an unbounded bill.
+A browser **GUI** ships with it — paste a game state, click Route, watch the
+tier badge, the Gatekeeper's reasoning, the cache hit/miss, and the scripts
+that ran. See [The GUI](#the-gui).
 
-## The loop
+This repository also carries `itsbob`'s original foundation project — a
+tick-based character simulation with an energy-metered decision loop — which
+the router is layered on top of and can run independently. See
+[The character simulation](#the-character-simulation-the-original-foundation).
+
+## Quick start
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e ".[dev,gui]"
+
+itsbob doctor                    # what's configured: cloud keys + local Back Brain
+itsbob gui                       # opens the browser GUI at http://127.0.0.1:8765
+```
+
+Runs with **zero configuration** — no API keys, no local model download
+required. Missing pieces degrade gracefully exactly as the spec describes:
+no local model → the Gatekeeper's classifier falls back to a fast rule-based
+one; no cloud keys → Tier B/A calls fail over to the safe local default; the
+whole pipeline is exercised end to end either way.
+
+## The router pipeline
 
 ```
-  message ──► read persona.md + short_term.md + long_term.md, recall memories
+raw state ──► Ingestion & Compression (compress, truncate to last 20 events)
                  │
                  ▼
-            STRICT PROTOCOL CALL ──► 1TSB0B|<ACTION>|<6 tone axes>|<topic>
-                 │                        │
-                 │                   violation? one correction, then local
+        ┌── Gatekeeper.classify() ──┐
+        │  local model, or if       │──► GateDecision{tier, fingerprint, reasoning}
+        │  unreachable: heuristic   │
+        └────────────────────────────┘
+                 │
                  ▼
-            P00L ────► nearest line in tone-space (426 pre-written l33t lines)
-            C0MP0S3 ─► write one in that exact tone, forced to l33t
-            S1L3NC3 ─► say nothing (a real veto on spending credits)
+        semantic cache check (fingerprint-keyed, 5 min TTL)
+                 │  hit ──────────────────────────────► replay cached actions
+                 ▼  miss
+        ┌─────────────────────────────────────────────┐
+        │ D → execute named script directly            │
+        │ C → local model generation head (paraphrase)  │
+        │ B → cheap cloud API, cost-aware prompt         │
+        │ A → premium cloud API, cost-aware prompt        │
+        │ S → halt, alert the user (needs_user=true)       │
+        └─────────────────────────────────────────────┘
+                 │
+        cloud call times out / returns nothing usable?
+                 ▼
+        downgrade to local model's safe pick, then to
+        MAINTAIN_FORMATION (hardcoded safe default), then Tier S
+                 │
+                 ▼
+        Script name validated against the registry and executed —
+        never free-form code, only a name the registry already knows.
 ```
 
-## Start here
+### Where each piece of the spec lives
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-
-cp .env.example .env        # paste in whichever free API keys you have
-itsbob init                 # creates data/ — persona, memories, pool
-itsbob serve --open         # he's live; the browser opens with your token
-```
-
-No keys? Still runs. The local decision path covers everything and the pool
-supplies the words, so he is never mute and never out of character.
-
-## Commands
-
-```bash
-itsbob serve                       # always-on: web UI + the outreach loop
-itsbob serve --tunnel              # ...and publish a public URL
-itsbob chat                        # terminal, shows the tone of every reply
-itsbob pool --tone 0,8,9.5,0,2,9   # what he'd say at that mood
-itsbob pool --category sarcasm     # browse by declared category
-itsbob credits                     # balance, standing, why he can't message you
-itsbob traits                      # his learned personality and what it earns him
-itsbob doctor --probe              # which providers answer right now
-itsbob models                      # what each provider will actually try
-itsbob memory --query boats        # what he remembers
-```
-
-## The six axes
-
-Every pool line is tagged, in leet, with where it sits on:
-
-```
-[P0s1t1v1ty: 8.4] [N3g4t1v1ty: 0.3] [H0st1l1ty: 0.0]
-[C0m3dy: 7.5] [S4rc4sm: 1.0] [H0n3sty: 7.0]
-```
-
-The **first tag is the declared category** — that is how the shipped pool
-breaks down:
-
-| category | lines |
-|---|---|
-| comedy | 95 |
-| positivity | 89 |
-| honesty | 71 |
-| negativity | 64 |
-| sarcasm | 55 |
-| hostility | 52 |
-
-(Category comes from tag *order*, not the largest number. Honesty is rated high
-on nearly every line, so taking the max would file 100 of them under "honesty".)
-
-Selection trades off three things, because nearest-tone alone is not enough:
-
-- **tone** — distance in six-dimensional mood space, the dominant term;
-- **relevance** — lexical overlap with what you actually said, so the reply is
-  about something rather than merely correctly-moody;
-- **recency** — a penalty on lines used lately, or the pool repeats
-  itself in an afternoon.
-
-Variety comes from sampling among lines *close to* the best, never from a flat
-top-K — otherwise a badly-toned line gets picked exactly when the pool is
-thinnest.
-
-## L33t
-
-`a→4 e→3 i→1 o→0`, encoded on the way out, decoded for matching so "h3ll0" and
-"hello" are the same word to retrieval. Composed replies are re-encoded rather
-than trusted to the model, because models drift out of leet constantly.
-
-Real numbers survive: a lone `1` is "i", but `100,000` stays `100,000`.
-
-## The economy
-
-| | |
-|---|---|
-| **credits** | Spendable. Accrue with time, consumed by outreach. |
-| **standing** | Reputation, 0–1. Scales earn rate, gates outreach, and **colours his voice** — a Bob who's been told off gets audibly sourer. |
-
-| What you do | Credits | Standing |
+| Spec section | Module | What it does |
 |---|---|---|
-| Approve a message | +6 | +0.10 |
-| Reply to it | +3 | +0.05 |
-| Turn it down | −8 | −0.20 |
-| Ignore it for 6 hours | −3 | −0.08 |
+| §1 Local Back Brain (1.5B-3B, Ollama/llama.cpp) | `itsbob/llm/local.py` — `OllamaProvider` | Talks to `ollama serve`'s native `/api/chat`. `is_ollama_running()` is the liveness probe `doctor` and the GUI use. |
+| §2 Complexity Classification Taxonomy (S/A/B/C/D) | `itsbob/router/tiers.py` — `Tier`, `GateDecision` | The tier enum and the tag→tier map (`SCRIPT`/`LOCAL_SUM`/`CLOUD_B`/`CLOUD_A`). |
+| §3 Ingestion & Compression (truncate to last 20 events) | `itsbob/router/ingestion.py` — `compress()`, `GameState` | Accepts raw dict/JSON, keeps only the most recent `event_window` events. |
+| §3 The Gatekeeper classifier prompt | `itsbob/router/gatekeeper.py` — `Gatekeeper` | The exact system prompt from the spec, JSON tag + fingerprint out. Falls back to a rule-based classifier (reasoning-depth / data-volume / action-risk heuristics) when no local model answers. |
+| §3 Execution Handshake (SCRIPT→run, LOCAL_SUM→generate, CLOUD_B/A→API) | `itsbob/router/pipeline.py` — `ComplexityRouter._dispatch()` | Routes a `GateDecision` to the matching tier handler. |
+| §4 Cost-aware system prompt ("respond in 30 words, strict JSON array") | `itsbob/router/pipeline.py` — `CLOUD_SYSTEM_PREFIX` | Prepended to every Tier B/A call. |
+| §4 Semantic caching (fingerprint hash, ~5 min) | `itsbob/router/cache.py` — `SemanticCache` | TTL cache keyed on a normalized fingerprint hash; `itsbob route` and the GUI show hit/miss + hit rate. |
+| §4 Async batch processing | *not implemented* | The pipeline is synchronous/per-call today; batching non-urgent Tier B work is listed under [Not yet built](#not-yet-built). |
+| §5 Phase 0 — hard-coded classifier, no free text | `Gatekeeper.classify()` | Always asks for a tag + fingerprint only (`json_mode=True`, 60 max tokens); never lets the local model narrate. |
+| §5 Phase 1 — Cold Cloud Router, 3 tactical scripts, <1.8s budget | `itsbob/router/pipeline.py` — `END_TO_END_LATENCY_BUDGET_MS`, `RouteResult.within_budget` | Every route reports total latency and whether it stayed under budget. |
+| §5 Phase 2 — Timeout monitor → downgrade to local → Tier S | `ComplexityRouter._escalate_to_local()`, `_tier_s()` | A Tier B/A call that fails, times out, or names no known script downgrades to the local model's safe pick, then to `MAINTAIN_FORMATION`, then to Tier S. |
+| §5 Phase 3 — predictive pre-fetching (background loop, pre-cache) | *not implemented* | Listed under [Not yet built](#not-yet-built) — the `SemanticCache` it would pre-populate already exists. |
+| §6 Golden Rule (cloud/local only ever *name* an action) | `itsbob/router/scripts.py` — `ScriptRegistry` | `ComplexityRouter` only ever calls `registry.execute(name, ...)` with a name the model returned; unregistered names are dropped before execution, never run. |
 
-Silence counts. Unanswered outreach is swept as *ignored* — the mechanism that
-stops him learning that sending more messages is free.
+## Setup
 
-Even with credits he won't message you if he's grounded (standing under 0.15),
-within 45 minutes of his last, over the daily cap of 8, in quiet hours
-(23:00–08:00), or already holding an unanswered message. And the protocol can
-return `S1L3NC3`, which is a real veto — deciding not to speak costs nothing.
+Requires Python ≥ 3.10.
 
-## Personality he earns
-
-He starts with a disposition and it moves. Approve a hostile line and hostility
-becomes native. Turn his sarcasm down enough times and it drains out. **None of
-this costs an API call** — it is arithmetic over verdicts and memory, so it keeps
-working when every free tier is rate limited.
-
-```
-   you approve  ──► disposition pulls toward the tone that worked
-   you turn down ─► disposition pushes toward its opposite (harder than approval pulls)
-   you reply     ─► a weaker pull — engaging is the outcome he wants
-   you ignore    ─► a weaker push, and patience erodes
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,gui]"      # drop ",gui" if you only want the CLI/library
 ```
 
-Five traits fall out of that, all derived rather than stored:
+### The local Back Brain (Tier C) — optional but recommended
 
-| trait | what it measures |
+```bash
+# install Ollama: https://ollama.com/download
+ollama serve                      # runs on 127.0.0.1:11434
+ollama pull qwen2.5:1.5b          # ~1GB, the default model this repo asks for
+# or: ollama pull phi3.5:3.8b-mini-instruct-q4_K_M
+```
+
+`itsbob doctor` and the GUI's status strip both report whether Ollama is
+reachable. If it isn't (not installed, not running, or a different port),
+**nothing breaks** — `Gatekeeper` transparently falls back to a rule-based
+classifier so Tier C/B/A routing still works, just less accurately than a
+tuned local model would. Pin a different model or point at Ollama on another host/port:
+
+```bash
+export ITSBOB_OLLAMA_MODEL=phi3.5:3.8b-mini-instruct-q4_K_M
+export ITSBOB_OLLAMA_URL=http://127.0.0.1:11434    # default; change if Ollama runs elsewhere
+```
+
+### Cloud providers (Tier B / Tier A) — optional
+
+All three speak the OpenAI-compatible `/chat/completions` format:
+
+```bash
+export GROQ_API_KEY=...          # https://console.groq.com — fast, generous free tier
+export GOOGLE_API_KEY=...        # https://aistudio.google.com — Gemini Flash
+export OPENROUTER_API_KEY=...    # https://openrouter.ai — dozens of `:free` models
+```
+
+**Using Google?** Getting a key, picking a specific Gemini model (Flash vs.
+Pro, pinning a model id, finding current model names), rate limits, and
+Google-specific troubleshooting are all in
+**[docs/GOOGLE_SETUP.md](docs/GOOGLE_SETUP.md)** — the two-line env var above
+is enough to get going, that doc is for everything past that.
+
+Or copy `.env.example` to `.env` and fill it in — every CLI command and the
+GUI load it automatically:
+
+```bash
+cp .env.example .env
+```
+
+### Google-tiered mode — Google answers every cloud tier itself
+
+By default (`mode="priority"`) Tier B and Tier A share the same pool of
+cloud providers, tried in `ITSBOB_PROVIDER_ORDER`. If you'd rather **Google
+alone** answer both cloud tiers — at two different Gemini models, cheap for
+Tier B and stronger for Tier A — with Groq/OpenRouter only as a backup that's
+tried *after* Google rather than before it, use **google-tiered** mode:
+
+```bash
+export ITSBOB_ROUTER_MODE=google-tiered
+itsbob doctor            # now shows Tier B and Tier A as two separate Gemini chains
+itsbob route '{"facts": {"stamina": 15}}'
+itsbob gui                # the status strip shows the same split
+```
+
+or per-call, without changing the env:
+
+```bash
+itsbob route '{"facts": {"stamina": 15}}' --mode google-tiered
+```
+
+The ladder, in cheapest-to-strongest order:
+
+| Tier | Default model | Falls back to |
+|---|---|---|
+| B (standard cloud) | `gemini-3.1-flash-lite` | `gemini-3.5-flash-lite` → `gemini-3.6-flash` |
+| A (premium cloud) | `gemini-3.6-flash` | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` |
+
+Only `GOOGLE_API_KEY` is required. If Groq/OpenRouter keys are *also* set,
+they're appended behind Google on both tiers as low-tier backups — reached
+only once every Gemini model tried has failed or hit quota, never tried
+first. Set them or leave them unset independently; nothing here requires
+them. To go fully Google-only with no Groq/OpenRouter involved at all:
+
+```python
+from itsbob.router import build_google_tiered_router
+from itsbob.config import Settings
+
+router = build_google_tiered_router(Settings.from_env(), low_tier_backup=False)
+```
+
+Pin different Gemini model ids (if your account's model access differs)
+directly on the call:
+
+```python
+router = build_google_tiered_router(
+    Settings.from_env(),
+    tier_b_model="gemini-3.1-flash-lite",
+    tier_a_model="gemini-3.6-flash",
+    fallback_model="gemini-3.5-flash-lite",
+)
+```
+
+See [docs/GOOGLE_SETUP.md](docs/GOOGLE_SETUP.md) for getting the key itself
+and finding which Gemini model ids your account currently has access to
+(the exact names above may not match what's live for you).
+
+### Wiring in a different Tier A provider entirely
+
+`google-tiered` mode is the built-in way to split Tier B/A between two
+models. If you want Tier A answered by a non-Google, non-free model
+(GPT-4o-class, say) instead, build `ComplexityRouter` directly:
+
+```python
+from itsbob.router import ComplexityRouter, Gatekeeper, default_registry, SemanticCache
+from itsbob.factory import build_router
+from itsbob.config import Settings, ProviderConfig
+
+settings = Settings.from_env()
+cheap = build_router(settings)                       # Groq / Gemini Flash / OpenRouter free
+expensive = build_router(replace_with_gpt4o_settings)  # your own Settings pointing at an
+                                                         # OpenAI-compatible GPT-4o-class endpoint
+router = ComplexityRouter(
+    registry=default_registry(),
+    gatekeeper=Gatekeeper(registry=default_registry()),
+    cloud_router=cheap,
+    premium_router=expensive,
+    cache=SemanticCache(),
+)
+```
+
+### Optional tuning env vars
+
+| Variable | Effect |
 |---|---|
-| **attunement** | share of judged messages that landed, smoothed while the sample is small |
-| **rapport** | shared history — grows with what he actually *remembers* about you |
-| **warmth** | how warm the things you approve of are |
-| **volatility** | how much his temperament has been swinging |
-| **patience** | tolerance for being ignored; rapport buys it |
+| `ITSBOB_ROUTER_MODE` | `priority` (default) or `google-tiered` — see [Google-tiered mode](#google-tiered-mode--google-answers-every-cloud-tier-itself) |
+| `ITSBOB_PROVIDER_ORDER` | comma-separated cloud try-order, e.g. `groq,google,openrouter` (ignored in `google-tiered` mode) |
+| `ITSBOB_GROQ_MODEL` / `ITSBOB_GOOGLE_MODEL` / `ITSBOB_OPENROUTER_MODEL` | pin a cloud model id (old default becomes a fallback, never dropped) |
+| `ITSBOB_MAX_ATTEMPTS` | total cloud provider attempts per call (default 4) |
+| `ITSBOB_ALLOW_OFFLINE` | set `false` to make missing cloud keys a hard error instead of the offline `EchoProvider` |
+| `ITSBOB_OLLAMA_MODEL` | pin the local Back Brain's model id (default `qwen2.5:1.5b`; old default becomes a fallback) |
+| `ITSBOB_OLLAMA_URL` | Ollama server URL (default `http://127.0.0.1:11434`) |
+| `ITSBOB_MEMORY_DB` | SQLite path for the character simulation's long-term memory |
+| `ITSBOB_SEED` | RNG seed, for reproducible simulation runs |
 
-**Rewards are literally more credits.** Attunement and rapport set an earn-rate
-multiplier from x0.4 to x1.8, so judgement you keep approving compounds and
-judgement you keep rejecting starves. Standing (fast, forgiving) and the trait
-multiplier (slow, earned) move on different timescales rather than
-double-counting one good day.
-
-The disposition then biases every reply — protocol decisions *and* the local
-floor — weakly at first and more strongly as rapport grows. It never replaces
-the decision; the situation still leads.
+## Launching it
 
 ```bash
-itsbob traits
+# What's configured — cloud keys AND the local Back Brain
+itsbob doctor
+itsbob doctor --probe                          # + one real request per cloud provider
+
+# Classify only — see the tier + fingerprint, nothing executed
+itsbob classify '{"facts": {"stamina": 15, "minute": 60}}'
+
+# Full pipeline: classify, cache-check, route, execute
+itsbob route '{"facts": {"stamina": 15, "minute": 60}}'
+itsbob route @path/to/state.json --goal "win the league"
+itsbob route '{"facts": {"stamina": 15}}' --mode google-tiered   # Google alone, two Gemini models — see below
+
+# The GUI
+itsbob gui                                     # http://127.0.0.1:8765, opens a browser tab
+itsbob gui --port 9000 --no-browser
 ```
 
-```
-after you approve 8 hostile messages
-  disposition  pos 1.2, neg 6.8, hos 7.1, com 1.4, sar 6.3, hon 8.8
-  attunement 0.83   rapport 0.32
-  credit rate  x1.46
-
-after you then turn down 10 of them
-  disposition  pos 9.1, neg 2.5, hos 1.7, com 9.1, sar 3.3, hon 1.8
-  credit rate  x1.09
-```
-
-One thing to know: disapproval reflects *every* axis of the rejected tone, not
-just the loud one. Turning down a hostile-but-honest line teaches him to be
-less honest too. That is the simple, predictable rule; retune `_PULL`/`_PUSH` in
-`traits.py` if you want something more surgical.
-
-Delete `data/traits.json` and he reverts to his starting temperament.
-
-## The files are the interface
-
-| File | What it is |
-|---|---|
-| `data/persona.md` | Who he is. Read on every response — edit it and his next message changes. |
-| `data/memory/short_term.md` | The last ~20 turns. Rewritten automatically. |
-| `data/memory/long_term.md` | What he knows about you. **Source of truth** — delete a line and he forgets it. |
-| `data/pool.txt` | The 426 tone-tagged lines. Add your own. |
-| `data/traits.json` | His learned personality. Delete it to reset him. |
-| `data/responses.json` | Intent-matched lines, used as the last-resort floor. |
-
-All reloaded on change. No restart.
-
-Behind the markdown, `memory/` keeps a SQLite store doing ranked retrieval so
-recall works past what fits in a prompt. Handwritten long-term lines survive
-every sync, and important disclosures are written immediately rather than
-waiting for eviction.
-
-## Reaching him from anywhere
-
-`itsbob serve` binds to `127.0.0.1` and every API call needs a token (generated
-into `data/token.txt`). To reach him off your laptop:
+## The GUI
 
 ```bash
-itsbob serve --tunnel            # cloudflared or ngrok, whichever is installed
+pip install -e ".[gui]"     # one extra dependency: Flask
+itsbob gui                  # opens http://127.0.0.1:8765 in your browser automatically
 ```
 
-It prints a public URL with the token in it. **Treat that link as a password.**
-If no tunnel client is installed it says so and carries on locally.
+Two panels, side by side:
 
-## Examples
+**Left — chat.** Type a message and hit Send (or Enter). Paste JSON
+(`{"facts": {"stamina": 15, "minute": 60}}`) if you want to test a specific
+state, or just type plain text — anything that isn't valid JSON is
+automatically wrapped into `{"facts": {"message": "<your text>"}}` so you
+can talk to it conversationally without hand-writing a state object every
+time. Click one of the `example N` links under the input to load a ready
+state. itsbob's reply appears as a chat bubble; a Tier S response (nothing
+could parse the state) renders as a highlighted red bubble — "Unrecognized
+state. Manual override required." — exactly where the spec says the system
+should halt and ask you. Check **classify only** above the input to see how
+something would be tagged without executing anything.
 
-```bash
-python examples/01_talk_to_bob.py          # replies, with the decision behind each
-python examples/02_credits_and_feedback.py # earning, spending, discipline
-python examples/03_router_only.py          # the failover router by itself
-python examples/04_memory_only.py          # the memory bank by itself
-python examples/05_the_protocol.py         # what's accepted, rejected, and why
-python examples/06_personality.py          # feedback becoming personality, offline
+Click **+ add context** to reveal a separate **Context** field: background
+state (JSON or plain text) merged in before the message on every send, so a
+message's facts win on overlap. Mainly for testing — hold a scenario fixed
+in Context and vary only the Message across sends, or the reverse, rather
+than retyping the whole state every time. Either field works alone; leaving
+Context empty behaves exactly as before.
+
+**Right — live processing.** Every message you send appends a trace card
+here, newest on top, so you can *watch it think* rather than read logs:
+
+- the tier badge (color-coded D/C/B/A/S) and, if it downgraded, what tier it
+  escalated from
+- the Gatekeeper's reasoning, its fingerprint, and its own latency
+- **which model actually got called** — provider + model name, or "—
+  (script/local/none)" when nothing needed to be
+- whether it was served from the semantic cache, and the running cache hit
+  rate
+- which scripts executed
+- total latency against the 1.8s budget, flagged if it went over
+- a collapsed **raw JSON** section per card with everything `itsbob route`
+  itself would print, for anyone who wants the full detail
+
+The **status strip** at the top shows the active router mode
+(`priority`/`google-tiered`), the local Back Brain's reachability, and every
+configured cloud provider — split into Tier B/Tier A when in google-tiered
+mode — refreshed on load.
+
+It binds to `127.0.0.1` only (not exposed to your network) and has no
+authentication — it's a local development tool, not a deployed service.
+Nothing about it requires the character simulation to be running. The old
+single-shot `/api/route` and `/api/classify` endpoints are still there
+unchanged, if you're scripting against the GUI's backend directly (`curl`,
+a notebook, etc.) rather than using the page.
+
+## Using the router as a library
+
+```python
+from itsbob.router import build_complexity_router
+from itsbob.config import Settings
+
+router = build_complexity_router(Settings.from_env(), goal="win the league")
+
+result = router.route({
+    "facts": {"score": "1-0", "minute": 78, "opponent_formation": "4-4-2", "morale": "low"},
+    "events": ["68' Yellow card", "74' Corner won"],
+})
+print(result.tier, result.actions, result.note)
 ```
+
+`ComplexityRouter`, `Gatekeeper`, `ScriptRegistry`, and `SemanticCache` are
+each independently constructible (see `itsbob/router/pipeline.py`) if you
+want to swap in your own script macros, a different local model, or a
+custom cache backend.
+
+### Registering your own scripts (the actuation layer)
+
+```python
+from itsbob.router import ScriptRegistry, ScriptResult
+
+registry = ScriptRegistry()
+registry.register(
+    "HIGH_PRESS",
+    lambda state, params: ScriptResult(ok=True, action="HIGH_PRESS", detail="pressed high"),
+    description="Aggressive high-press tactical macro.",
+    trigger=None,  # or a callable(GameState) -> bool for a Tier-D auto-trigger
+)
+```
+
+Only names registered here can ever execute — see the Golden Rule row in
+the spec-mapping table above.
+
+## Not yet built
+
+Per the spec's own phasing, these are real gaps, not oversights:
+
+- **Phase 0's LoRA fine-tuning** — training a tiny LoRA on historical
+  game logs to make the local classifier hyper-accurate. The heuristic
+  fallback and the raw Ollama classifier prompt exist; the training loop
+  doesn't.
+- **§4 Asynchronous batch processing** — buffering non-urgent Tier B work
+  and firing it every 10 minutes in one batch call. `ComplexityRouter.route()`
+  is synchronous, one state in, one result out.
+- **Phase 3 predictive pre-fetching** — a continuous background loop
+  simulating the next few minutes and pre-warming the semantic cache before
+  a high-risk event happens. `SemanticCache` is ready to be pre-populated;
+  nothing populates it proactively yet.
+- **A real screen-scraper** — nothing in this repo reads a game window. You
+  provide `raw_state` as JSON (from wherever your scraper lives); `compress()`
+  is the ingestion boundary it should feed into.
+- **Tier A on a genuinely separate, non-Google premium provider** (a real
+  GPT-4o-class endpoint, say) — `google-tiered` mode covers Tier A on a
+  stronger *Gemini* model out of the box; a different vendor entirely still
+  needs the manual `ComplexityRouter(...)` wiring in
+  [Wiring in a different Tier A provider entirely](#wiring-in-a-different-tier-a-provider-entirely).
+
+## Troubleshooting
+
+**A `--probe` run with some `!!` lines is normal, not broken.** `itsbob
+doctor --probe` tries every model on every configured provider and reports
+each attempt — a `!!` next to a specific model just means *that model* is
+gone or blocked; the router already walks past it to the next one
+automatically during a real call. What matters is that **at least one
+provider shows `ok`** on at least one model. If Groq or Google (or Ollama)
+answers, the router works end to end — you do not need OpenRouter, or every
+model listed, to be green.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `itsbob: command not found` | venv not active, or install didn't register the entry point | `source .venv/bin/activate`; re-run `pip install -e ".[dev,gui]"` |
+| Every OpenRouter model — including one you just pinned yourself — 404s with `"This model is unavailable"` or `"No endpoints available matching your guardrail restrictions and data policy"` | **Not a code or key problem.** OpenRouter's own account-level Privacy setting blocks all `:free` models from routing until you opt in. | Go to [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy) and enable the free-model / prompt-training data policy toggle (OpenRouter requires this before any `:free` model will serve a request to a new key). Also clear any "Allowed Providers" / "Ignored Providers" restriction under [openrouter.ai/settings/preferences](https://openrouter.ai/settings/preferences) — an over-restricted provider list produces the same 404. Re-run `itsbob doctor --probe` after saving. |
+| `ITSBOB_GROQ_MODEL=llama-3.1-8b-instruct` (or another hand-typed id) still 404s | a typo, or that exact id doesn't exist on Groq (`instruct` vs. the real `instant`) | `itsbob doctor --probe` first to see which ids actually answer for your key, then pin one of *those* — don't guess a model id from memory |
+| `itsbob route '...'` crashes with a `JSONDecodeError` traceback | you passed the literal `'...'` from a README example — it's a placeholder, not real input | pass actual JSON: `itsbob route '{"facts": {"stamina": 15}}'`. Newer versions print a friendly error instead of a traceback here; update if you still see the raw traceback |
+| `ollama serve` prints `address already in use` | Ollama is already running (often auto-started as a background service on install) | that's fine, nothing to fix — `itsbob doctor` will still show it reachable; you don't need to run `ollama serve` yourself in that case |
+| Flask prints `Tip: install python-dotenv to use them` when you run `itsbob gui` | Flask's own unrelated `.env` auto-loading feature noticing a `.env` file exists | harmless — itsbob loads `.env` itself (`config.load_dotenv`) before Flask ever starts; ignore the tip or `pip install python-dotenv` to silence it |
+| Browser console/log shows `GET /favicon.ico 404` | no favicon route | harmless, cosmetic only |
+| Gatekeeper trace says `local model failed (ProviderUnavailable)` and falls back to the heuristic even though `itsbob doctor` shows `ollama: reachable` | `ITSBOB_OLLAMA_MODEL` (or the built-in default `qwen2.5:1.5b`) points at a model you haven't actually pulled — Ollama's `/api/chat` 404s for any model not in `ollama list` | `itsbob doctor` now prints which models are actually pulled vs. which itsbob wants and flags the mismatch; run `ollama pull <the missing one>`, or unset `ITSBOB_OLLAMA_MODEL` so it falls back to whatever you do have pulled |
+| A Tier B/A cloud response gets discarded with `"downgraded to hardcoded safe default: ... did not return JSON"`, and the raw text in the trace card looks like valid JSON cut off mid-array (e.g. `{"actions": ["WING_`) | the model's response was truncated by `max_tokens` before the JSON object closed | fixed as of this version (the cloud request budget was raised, and a truncated JSON reply is now treated as a retryable failure so the router tries the next model instead of accepting the fragment) — if you still see it, the model needs even more headroom; it isn't something you did wrong |
+| GUI trace shows `Tier D → gatekeeper — local model tagged [SCRIPT]` immediately followed by `S · Critical Fallback` / `"unknown script None"`, over and over, with an otherwise-healthy local Back Brain | fixed as of this version — the Gatekeeper's prompt didn't ask the local model *which* registered script applied when it tagged `[SCRIPT]`, so Tier D had nothing to execute and fell all the way to a user-facing halt for what was really just a classification miss | now the prompt names the registered scripts and asks the model to pick one; if it still doesn't (or names one that isn't registered), the pipeline degrades the same graceful way a bad Tier B/A reply does — local safe pick, then `MAINTAIN_FORMATION` — rather than jumping straight to Tier S |
+| `itsbob gui` prints an error about Flask | the `gui` extra wasn't installed | `pip install -e ".[gui]"` |
+| `itsbob route ...` always returns Tier S | both the local Back Brain and every cloud provider are unavailable | `itsbob doctor`; you need at least one of Ollama running or a cloud key set, or Tier D/C-only states, to avoid the halt |
+| `itsbob doctor` shows `ollama -- not reachable` | Ollama isn't installed or `ollama serve` isn't running | `ollama serve` in another terminal, and `ollama pull qwen2.5:1.5b`; re-run `itsbob doctor` |
+| Every `classify` result has `"source": "heuristic"` | same as above — the Gatekeeper is using its rule-based fallback, not a model | start Ollama; the fallback is intentional degraded behavior, not a bug |
+| Tier B/A results always say `"downgraded to hardcoded safe default"` | no cloud provider configured (falls to the offline echo, which can't produce a valid actions array), or the model named scripts that aren't registered | `itsbob doctor` to check cloud keys; check `ScriptRegistry.names()` matches what your cloud prompt is allowed to say |
+| `itsbob doctor` shows only `echo` as `ok` under cloud providers | no API keys in the environment or `.env` | export a key or add it to `.env`; re-run `itsbob doctor` |
+| `RateLimited` / lots of `429` in `--probe` output | free-tier quota hit | wait, reorder providers with `ITSBOB_PROVIDER_ORDER`, or add another key |
+| `BadRequest` naming a model | the hardcoded default model was retired/renamed by the vendor | pin a live one: `ITSBOB_GROQ_MODEL=...` etc., or call `itsbob.llm.catalog.discover_openrouter_free_models()` |
+| GUI's status strip shows a provider as `no key` even though you set it | shell env var set after the GUI process started, or `.env` not in the working directory you launched `itsbob gui` from | restart `itsbob gui` from the repo root after exporting/creating `.env` |
+| GUI's Route call is slow / times out | a cloud provider is hanging near its own timeout before failing over | check `itsbob doctor --probe` for which provider is slow; lower `ITSBOB_MAX_ATTEMPTS` so it fails over faster |
+| `itsbob run` (the character simulation) — see its own troubleshooting | this is the older, separate subsystem the router is built on top of | see [Troubleshooting the character simulation](#troubleshooting-the-character-simulation) below |
+
+## The character simulation (the original foundation)
+
+Before the router existed, this repo already had a tick-based character
+simulation whose "character" decides, every tick, whether a choice is worth
+spending scarce energy to think about with an LLM, or cheap enough to decide
+on instinct alone. The router (`itsbob/router/`) is layered on top of the
+same `itsbob/llm/` stack this simulation uses, but the two run
+independently — the simulation doesn't call the router, and the router
+doesn't need the simulation running.
+
+```
+itsbob run --ticks 20 --policy hybrid          # hybrid is the default
+itsbob run --ticks 20 --policy heuristic       # never calls an LLM
+itsbob run --ticks 20 --policy llm             # always deliberates when affordable
+itsbob run --ticks 20 --offline                # force the EchoProvider, ignore any keys
+itsbob run --ticks 20 --json                   # machine-readable output
+itsbob run --ticks 20 --db data/memory.sqlite  # persist long-term memory
+
+itsbob ask "What's the fastest way to calm down a frustrated star player?"
+itsbob memory data/memory.sqlite --query boats --limit 10
+```
+
+Every tick, `Simulation`:
+
+1. advances the `World` and lets `Character.needs` drift upward (rest,
+   sustenance, social, curiosity, purpose all creep toward "unmet"),
+2. recalls relevant memories from the two-tier `MemoryBank`,
+3. asks a `DecisionPolicy` to pick one `Action`:
+   - **`HeuristicPolicy`** — free, deterministic-ish scoring by need-relief
+     vs. energy price. Always available, always the fallback.
+   - **`LLMPolicy`** — spends `deliberation_cost` energy, calls the
+     `LLMRouter` for a JSON decision, falls back to the heuristic if
+     unaffordable, unavailable, or the model hallucinates an action name.
+   - **`HybridPolicy`** — deliberates only when need pressure is high,
+     curiosity/energy allow it, or a trait-weighted random roll says so.
+4. runs the chosen `Action`, pays its energy cost, updates mood/needs/memory.
+
+### Troubleshooting the character simulation
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every decision comes from `instinct`/`fallback`, never `deliberation` | no cloud provider configured, or energy too low to deliberate | `itsbob doctor`; check `ITSBOB_ENERGY_*` if keys *are* set |
+| A run raises `RuntimeError: no LLM providers configured` | no keys **and** `ITSBOB_ALLOW_OFFLINE=false` | unset `ITSBOB_ALLOW_OFFLINE`, pass `--offline` deliberately, or add a key |
+| Long-term memory is empty after a run | no `--db` was passed, so it used the in-memory (`:memory:`) SQLite store, gone on exit | re-run with `itsbob run --db data/memory.sqlite ...` |
+| `itsbob memory <db>` errors that the file doesn't exist | wrong path, or the earlier run never persisted (see above) | check the path you passed to `--db` on the run that created it |
+| `pytest` finds nothing / warns "No files were found in testpaths" | there is no `tests/` directory in this snapshot despite `pyproject.toml` pointing at one | add tests under `tests/` as you build on this foundation |
 
 ## Repository map
 
 ```
+docs/GOOGLE_SETUP.md  getting a key, picking a specific Gemini model, rate limits
+pyproject.toml     deps: openai>=1.40 (base); pytest (dev); flask (gui); langchain (optional)
 src/itsbob/
-  protocol.py      the strict control-line spec, validator, and fallback
-  tone.py          the six axes: parsing, distance, blending
-  pool.py          the tone-tagged pool and its selection
-  leet.py          a→4 e→3 i→1 o→0, both directions
-  bob.py           reply() and consider_outreach()
-  credits.py       the economy: balance, standing, the outreach gate
-  traits.py        learned personality, and the credit reward loop
-  persona.py       reads/writes persona.md and the memory files
-  conversation.py  the message log
-  server.py        HTTP API + the always-on outreach loop
-  ui.py            the browser page, showing each reply's tone
-  tunnel.py        cloudflared / ngrok
-  llm/             failover router over the free providers
-  memory/          two-tier memory behind the markdown files
-  templates/       the shipped pool
-tests/             212 tests, no network required
+  __init__.py       public API (build_complexity_router, ComplexityRouter, build_simulation, ...)
+  cli.py            itsbob run | doctor | ask | memory | classify | route | gui
+  config.py         Settings, ProviderConfig, MemorySettings, EnergySettings, load_dotenv
+  factory.py        build_router / build_character / build_simulation (the cloud LLMRouter + simulation)
+
+  router/           the complexity-tier router (this spec)
+    tiers.py           Tier enum (S/A/B/C/D), GateDecision
+    ingestion.py       compress() — truncate/normalize raw state
+    gatekeeper.py       Gatekeeper — classify(), local model + heuristic fallback
+    cache.py            SemanticCache — fingerprint-keyed, TTL
+    scripts.py          ScriptRegistry, default_registry() — the Golden Rule's name→macro map
+    pipeline.py          ComplexityRouter — dispatch, cost-aware prompts, timeout escalation
+    google_tiered.py      build_google_tiered_router() — Google-only, two Gemini models, one per tier
+
+  gui/               browser GUI (needs the `gui` extra)
+    app.py             Flask app: /, /api/status, /api/route, /api/classify
+
+  llm/               provider-agnostic LLM access, shared by the router and the simulation
+    base.py             Message/LLMRequest/LLMResponse/Provider contract
+    local.py             OllamaProvider — the local Back Brain
+    providers.py         OpenRouter, Groq, Google (OpenAI-compatible) + EchoProvider
+    catalog.py            default model IDs per provider, env overrides
+    router.py             LLMRouter — failover, rate limiting, circuit breaker, usage tracking
+
+  character/         the original foundation's simulation pieces
+    state.py, energy.py, actions.py, decisions.py
+  engine/             World, EventBus, Simulation, TickReport
+  memory/             ShortTermMemory, LongTermMemory (SQLite), MemoryBank facade
 ```
-
-## Tests
-
-```bash
-pytest
-```
-
-212 tests, no network, no API keys. The protocol tests pin every rejection case
-individually — preamble, missing decimal, wrong sentinel, two lines, fenced
-output — because "highly strict" is only true if it's enforced. One test asserts
-the whole trait engine makes exactly zero API calls. Tests named as
-regressions pin behaviour that was actually broken once.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Every reply says `source: local` | no provider answering, or none complying | `itsbob doctor --probe` |
-| Replies feel off-tone | the pool has nothing near that mood | add lines, or retune vectors in `data/pool.txt` |
-| He never messages first | working as designed — he declines most ticks | `itsbob credits` names the gate that's blocking him |
-| He's suddenly sour | low standing, or a learned disposition | `itsbob traits`; approve a few, or delete `data/traits.json` |
-| He earns credits oddly fast/slow | the trait multiplier | `itsbob traits` shows it; it follows your approvals |
-| Replies aren't in leet | a composed line drifted | it's re-encoded automatically; report it if you see plain text |
-| Forgot the token | | `cat data/token.txt` |
-| Want him to forget something | | delete the line from `data/memory/long_term.md` |
-
-## A note on privacy
-
-`data/` holds your access token, the whole conversation, and everything he has
-concluded about you. It's gitignored. Behind a tunnel, the link is the only
-thing standing between that and anyone who has it.

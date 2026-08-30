@@ -113,12 +113,17 @@ class OpenAICompatibleProvider(Provider):
                 completion_tokens=completion.usage.completion_tokens or 0,
             )
 
-        if not text.strip() and finish_reason == "length":
-            # Reasoning models burn max_tokens on hidden thinking and return an
-            # empty body. Surfacing it as retryable lets the router move on.
+        if finish_reason == "length" and (not text.strip() or request.json_mode):
+            # Either a reasoning model burned max_tokens on hidden thinking and
+            # returned an empty body, or (json_mode) the response got cut off
+            # mid-object — e.g. '{"actions": ["WING_' with no closing brace.
+            # Both are unusable: surfacing them as retryable, rather than
+            # handing truncated JSON to the caller to fail parsing on, lets
+            # the router move on to the next model/provider instead of
+            # accepting garbage as if it were a real answer.
             raise ProviderUnavailable(
-                f"{self.name}/{model}: token budget exhausted before any output "
-                f"(raise LLMRequest.max_tokens, currently {request.max_tokens})"
+                f"{self.name}/{model}: token budget exhausted before a complete "
+                f"answer (raise LLMRequest.max_tokens, currently {request.max_tokens})"
             )
 
         return LLMResponse(

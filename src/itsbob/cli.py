@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Sequence
 
 from .config import Settings, load_dotenv
 from .factory import build_router, build_simulation
 from .llm.base import AllProvidersFailed, LLMRequest, user
+from .llm.local import is_ollama_running
 from .memory.long_term import LongTermMemory
+from .router import build_complexity_router
 
 __all__ = ["main"]
 
@@ -31,12 +34,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "doctor": _cmd_doctor,
         "ask": _cmd_ask,
         "memory": _cmd_memory,
+        "classify": _cmd_classify,
+        "route": _cmd_route,
+        "gui": _cmd_gui,
     }[args.command]
     try:
         return handler(args)
     except KeyboardInterrupt:  # pragma: no cover - interactive
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except json.JSONDecodeError as exc:
+        state_arg = getattr(args, "state", None)
+        print(f"error: '{state_arg}' is not valid JSON ({exc})", file=sys.stderr)
+        print(
+            "  hint: pass a real JSON object, e.g. "
+            '\'{"facts": {"stamina": 15, "minute": 60}}\', or @path/to/file.json '
+            "for a file. The README's `'...'` in an example command is a placeholder, "
+            "not something to paste literally.",
+            file=sys.stderr,
+        )
+        return 2
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -85,7 +102,39 @@ def _build_parser() -> argparse.ArgumentParser:
     memory.add_argument("--query", default=None)
     memory.add_argument("--limit", type=int, default=20)
 
+    classify = sub.add_parser(
+        "classify", help="run only the Gatekeeper: tier + fingerprint, no execution"
+    )
+    classify.add_argument("state", help="JSON game state, or @path/to/file.json")
+
+    route = sub.add_parser(
+        "route", help="full complexity-router pipeline: classify, route, execute"
+    )
+    route.add_argument("state", help="JSON game state, or @path/to/file.json")
+    route.add_argument("--goal", default="win the league")
+    route.add_argument(
+        "--mode",
+        default=None,
+        choices=("priority", "google-tiered"),
+        help="cloud wiring: 'priority' tries every configured provider; "
+        "'google-tiered' uses Google alone, at two Gemini models "
+        "(overrides ITSBOB_ROUTER_MODE for this call)",
+    )
+
+    gui = sub.add_parser("gui", help="launch the browser GUI (requires the 'gui' extra)")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", type=int, default=8765)
+    gui.add_argument(
+        "--no-browser", action="store_true", help="don't auto-open a browser tab"
+    )
+
     return parser
+
+
+def _load_state_arg(raw: str) -> str:
+    if raw.startswith("@"):
+        return open(raw[1:], encoding="utf-8").read()
+    return raw
 
 
 # --------------------------------------------------------------------------
@@ -137,12 +186,59 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     settings = Settings.from_env(dotenv=None)
-    router = build_router(settings)
+    router_mode = os.environ.get("ITSBOB_ROUTER_MODE", "priority").strip() or "priority"
+    print(f"router mode: {router_mode}  (ITSBOB_ROUTER_MODE; 'priority' or 'google-tiered')\n")
 
-    print("configured providers (in try-order):")
-    for row in router.describe():
-        mark = "ok " if row["configured"] else "-- "
-        print(f"  {mark}{row['provider']:<12} rpm={row['rpm']:<4} models={row['models']}")
+    if router_mode == "google-tiered":
+        from .router import build_google_tiered_router
+
+        complexity_router = build_google_tiered_router(settings)
+        print("Tier B (cheap Gemini, in try-order):")
+        for row in complexity_router.cloud_router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} models={row['models']}")
+        print("\nTier A (premium Gemini, in try-order):")
+        for row in complexity_router.premium_router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} models={row['models']}")
+        router = complexity_router.cloud_router
+    else:
+        router = build_router(settings)
+        print("configured providers (in try-order):")
+        for row in router.describe():
+            mark = "ok " if row["configured"] else "-- "
+            print(f"  {mark}{row['provider']:<12} rpm={row['rpm']:<4} models={row['models']}")
+
+    print("\nlocal Back Brain (Tier C, the Gatekeeper's classifier engine):")
+    if is_ollama_running():
+        from .llm.local import default_ollama_config, list_ollama_models
+
+        print(f"  ok  ollama       reachable at {default_ollama_config().base_url}")
+        pulled = list_ollama_models()
+        wanted = default_ollama_config().models()
+        missing = [m for m in wanted if m not in pulled]
+        if pulled:
+            print(f"      pulled models: {pulled}")
+        else:
+            print("      no models pulled yet")
+        if missing == list(wanted):
+            print(
+                f"      !! none of itsbob's configured models ({list(wanted)}) are "
+                f"pulled — every local classify/summarize call will 404. Run "
+                f"`ollama pull {wanted[0]}`, or `ollama pull <one of {pulled}>` "
+                "and `export ITSBOB_OLLAMA_MODEL=<that one>`."
+            )
+        elif missing:
+            print(
+                f"      note: {missing} not pulled — itsbob will fall through "
+                f"to whichever of {list(wanted)} is pulled, which is fine, but "
+                "`ollama pull` the missing one(s) to stop wasting the first attempt(s)."
+            )
+    else:
+        print(
+            "  --  ollama       not reachable — Tier C/gatekeeper classification "
+            "falls back to the rule-based heuristic (see README: Local Back Brain)"
+        )
 
     if not args.probe:
         print("\n(pass --probe to send a real one-token request to each)")
@@ -150,7 +246,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     print("\nprobing:")
     answered = 0
-    for provider in router.providers:
+    probe_providers = router.providers
+    if router_mode == "google-tiered":
+        # Tier A's premium model is a *different* Google provider instance
+        # than Tier B's — probe both, de-duplicated by (name, model tuple).
+        seen = {(p.name, p.models) for p in probe_providers}
+        probe_providers = list(probe_providers) + [
+            p for p in complexity_router.premium_router.providers
+            if (p.name, p.models) not in seen
+        ]
+    for provider in probe_providers:
         if not provider.is_configured():
             print(f"  -- {provider.name:<12} no API key")
             continue
@@ -213,6 +318,40 @@ def _cmd_memory(args: argparse.Namespace) -> int:
     for record in records:
         print(f"  [{record.importance:.2f}] {record.render()}")
     store.close()
+    return 0
+
+
+def _cmd_classify(args: argparse.Namespace) -> int:
+    from .router import Gatekeeper, compress, default_registry
+    from .llm.local import OllamaProvider
+
+    state = compress(_load_state_arg(args.state))
+    local = OllamaProvider() if is_ollama_running() else None
+    gatekeeper = Gatekeeper(registry=default_registry(), local_provider=local)
+    decision = gatekeeper.classify(state)
+    print(json.dumps(decision.as_dict(), indent=2))
+    return 0
+
+
+def _cmd_route(args: argparse.Namespace) -> int:
+    settings = Settings.from_env(dotenv=None)
+    router = build_complexity_router(settings, goal=args.goal, mode=args.mode)
+    result = router.route(_load_state_arg(args.state))
+    print(json.dumps(result.as_dict(), indent=2))
+    return 0 if result.ok else 1
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    try:
+        from .gui.app import run_gui
+    except ImportError as exc:
+        print(
+            "error: the GUI needs Flask — install it with `pip install -e \".[gui]\"`\n"
+            f"({exc})",
+            file=sys.stderr,
+        )
+        return 1
+    run_gui(host=args.host, port=args.port, open_browser=not args.no_browser)
     return 0
 
 

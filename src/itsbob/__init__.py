@@ -35,6 +35,8 @@ from .memory.bank import MemoryBank
 from .memory.base import MemoryKind, MemoryRecord
 from .memory.long_term import LongTermMemory
 from .memory.short_term import ShortTermMemory
+from .router import ComplexityRouter, RouteResult, ScriptRegistry, Tier, build_complexity_router
+from .router import default_registry as default_script_registry
 
 __version__ = "0.1.0"
 
@@ -43,6 +45,7 @@ __all__ = [
     "ActionRegistry",
     "ActionResult",
     "Character",
+    "ComplexityRouter",
     "Decision",
     "EnergyLedger",
     "EnergySettings",
@@ -63,9 +66,12 @@ __all__ = [
     "Message",
     "Needs",
     "ProviderConfig",
+    "RouteResult",
+    "ScriptRegistry",
     "Settings",
     "ShortTermMemory",
     "Simulation",
+    "Tier",
     "TickReport",
     "TokenCostModel",
     "Traits",
@@ -74,9 +80,11 @@ __all__ = [
     "World",
     "__version__",
     "build_character",
+    "build_complexity_router",
     "build_policy",
     "build_router",
     "build_simulation",
     "default_registry",
+    "default_script_registry",
     "load_dotenv",
 ]
