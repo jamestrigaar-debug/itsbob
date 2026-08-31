@@ -437,6 +437,34 @@ class LongTermMemory:
             self.forget(record_id)
         return len(doomed)
 
+    #: A short-horizon row recalled this many times has proved it matters.
+    #: Two rather than one: surfacing once can be the query being vague.
+    promote_after_recalls: int = 2
+    #: Or written down as clearly mattering in the first place.
+    promote_above_importance: float = 0.85
+
+    def consolidate(self, *, now: float | None = None) -> list[str]:
+        """Promote short-horizon rows that have earned permanence.
+
+        Being recalled *again* is the signal, and it is a good one: something
+        that surfaced in a later conversation is being used, which is the only
+        evidence available that a memory was worth keeping. The alternative —
+        deciding at write time — is what fills a store with forty rows nobody
+        ever reads, because at write time everything looks like it might matter.
+
+        Run once per turn, before pruning, so a row about to be dropped gets its
+        chance first.
+        """
+        rows = self._db.query(
+            "SELECT id FROM memories WHERE horizon = 'short' "
+            "AND (access_count >= ? OR importance >= ?)",
+            (self.promote_after_recalls, self.promote_above_importance),
+        )
+        promoted = [row["id"] for row in rows]
+        for record_id in promoted:
+            self.promote(record_id)
+        return promoted
+
     def promote(self, record_id: str, *, importance: float | None = None) -> bool:
         """Move a short-horizon row into long-term memory.
 

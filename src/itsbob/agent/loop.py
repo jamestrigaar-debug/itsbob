@@ -347,12 +347,15 @@ class Agent:
         if store is None:
             return
         try:
+            # Promote before pruning, so a row that has earned permanence is
+            # not dropped by the working set on the same pass.
+            kept = store.consolidate() if hasattr(store, "consolidate") else []
             expired = store.expire() if hasattr(store, "expire") else 0
             dropped = store.prune_short_term() if hasattr(store, "prune_short_term") else 0
         except Exception:  # noqa: BLE001 - housekeeping must never fail a turn
             return
-        if expired or dropped:
-            emit("memory", expired=expired, pruned=dropped)
+        if kept or expired or dropped:
+            emit("memory", promoted=len(kept), expired=expired, pruned=dropped)
 
     def _run_steps(
         self,

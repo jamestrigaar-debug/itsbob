@@ -373,6 +373,13 @@ class DiscordBridge:
     #: Set when Discord returned messages whose content was blank — the
     #: signature of a bot without the Message Content intent.
     content_warning: str | None = None
+    #: The cross-process claim on this channel. Without it, `itsbob serve` and
+    #: the browser's continuous mode both poll and both answer — two turns, two
+    #: replies, one of them pure waste. ``None`` disables the check.
+    lease: Any = None
+    #: True while another process holds the lease. Still polling the clock, not
+    #: the channel, so a crash over there is picked up here.
+    standby: bool = False
     _thread: Any = field(default=None, repr=False)
     _stop: Any = field(default_factory=threading.Event, repr=False)
 
@@ -396,6 +403,10 @@ class DiscordBridge:
     def stop(self) -> None:
         self.running = False
         self._stop.set()
+        if self.lease is not None:
+            # Released rather than left to expire, so the other process picks
+            # the channel up on its next poll instead of in ninety seconds.
+            self.lease.release()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -410,6 +421,19 @@ class DiscordBridge:
     def poll_once(self) -> int:
         """One poll. Returns how many messages were submitted as turns."""
         self.polls += 1
+        if self.lease is not None and not self.lease.hold():
+            # Someone else is answering this channel. Stand by rather than
+            # exit: if they stop renewing, the next poll takes over.
+            if not self.standby:
+                self.last_error = f"standing by — {self.lease.held_by} is answering Discord"
+            self.standby = True
+            # The cursor still advances, so taking over does not mean replaying
+            # everything said while the other process was in charge.
+            self.after = self.client.latest_id() or self.after
+            return 0
+        if self.standby:
+            self.standby = False
+            self.last_error = None
         rows = self.client.fetch(after=self.after)
         submitted = 0
         if rows:
@@ -428,12 +452,20 @@ class DiscordBridge:
             content = self._clean(row)
             if not content:
                 continue
+            message_id_check = str(row.get("id") or "")
+            if self.lease is not None and self.lease.already_answered(message_id_check):
+                # Answered by whoever held the lease before this one did. The
+                # handover window is the only way to get here, and re-answering
+                # is exactly what this whole mechanism exists to prevent.
+                continue
             author = str((row.get("author") or {}).get("username") or "someone")
             self.handled += 1
             if tagged:
                 self.mentions += 1
             submitted += 1
-            message_id = str(row.get("id") or "")
+            message_id = message_id_check
+            if self.lease is not None:
+                self.lease.mark_answered(message_id)
             self.submit(
                 content,
                 source="discord",
@@ -535,20 +567,35 @@ class DiscordBridge:
             "errors": self.errors,
             "last_error": self.last_error or self.client.last_error,
             "content_warning": self.content_warning,
+            "standby": self.standby,
+            "lease": self.lease.describe() if self.lease is not None else None,
             **self.client.describe(),
         }
 
     @classmethod
     def from_env(
-        cls, submit: Callable[..., Any], env: Mapping[str, str] | None = None
+        cls,
+        submit: Callable[..., Any],
+        env: Mapping[str, str] | None = None,
+        *,
+        home: Any = None,
+        role: str = "unknown",
     ) -> "DiscordBridge | None":
         env = os.environ if env is None else env
         client = DiscordClient.from_env(env)
         if client is None:
             return None
+        lease = None
+        if home is not None:
+            from pathlib import Path
+
+            from .lease import DiscordLease
+
+            lease = DiscordLease(path=Path(home) / "discord.lease", role=role)
         return cls(
             client=client,
             submit=submit,
+            lease=lease,
             mention_only=str(env.get("ITSBOB_DISCORD_MENTION_ONLY", "")).strip().lower()
             in ("1", "true", "yes", "on"),
             allowed_users=frozenset(

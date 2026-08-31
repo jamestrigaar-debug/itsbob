@@ -177,8 +177,11 @@ def memory_tools() -> list[Tool]:
                     "horizon": {
                         "type": "string",
                         "description": (
-                            "'long' to keep it for good, 'short' for the current thread "
-                            "only (dropped after a few hours). Default long."
+                            "Default 'short': it joins the working set and is dropped "
+                            "in a few hours unless it earns its place by being recalled "
+                            "again. Pass 'long' only for something that should still be "
+                            "true in a year — a standing preference, a decision and its "
+                            "reason, where something lives. Most things are short."
                         ),
                     },
                     "kind": {"type": "string", "description": f"One of: {kinds}. Default fact. Near-misses are accepted."},

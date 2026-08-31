@@ -164,14 +164,30 @@ assistant. Recalled memories are shown grouped by subject, and a sentence that
 gives itself away ("I liked …") overrides a wrong label — a model that writes
 that and files it under `user` has contradicted itself in one line.
 
-### Short term and long term
+### Permanence is earned
 
-Memories also carry a **horizon**. Short-horizon rows are the working set —
-what is being worked on today, a state the machine is in, a thread still open.
-They are capped by count *and* by clock and pruned at the end of every turn, so
-a busy hour cannot quietly become the corpus and a row from last Tuesday cannot
-sit there forever. Long-horizon rows are what should still be true in a year.
-`keep_memory` promotes one that turned out to matter after all.
+Memories carry a **horizon**, and **short is the default** — everything starts
+in the working set. That default is the whole policy: writing everything down
+permanently is not a good memory, it is a transcript. After a few weeks recall
+is choosing between forty near-identical rows that all surface with equal
+confidence, and the one you wanted is no likelier than the rest.
+
+A memory earns permanence three ways:
+
+- **By being recalled again.** Twice, not once — surfacing once can be a vague
+  query, twice is being used. This is the only evidence available that a memory
+  was worth keeping, and it beats deciding at write time, when everything looks
+  like it might matter.
+- **By being written down as mattering** — importance above 0.85.
+- **By being kept on purpose** — `keep_memory` from a conversation, or the
+  *keep* button next to any short-term row in the memory panel.
+
+Promotion runs once per turn, before pruning, so a row that has just earned its
+place is not dropped by the working set on the same pass. Short-horizon rows are
+capped by count *and* by clock, so a busy hour cannot quietly become the corpus
+and a row from last Tuesday cannot sit there forever. **Forgetting works on
+either horizon** and is always available — `forget` in conversation, or the
+button in the panel.
 
 Memory lives in `~/.itsbob/memory.sqlite`. Set `ITSBOB_EMBED_OFFLINE=true` to
 keep every memory on the machine — recall degrades to keyword plus a
@@ -461,6 +477,15 @@ that exists for talking to it. `ITSBOB_DISCORD_MENTION_ONLY=1` makes it stay
 quiet until tagged — for a shared channel — and `ITSBOB_DISCORD_USERS=id,id`
 limits who may drive it at all.
 
+**Only one process ever answers.** `itsbob serve` and the browser's continuous
+mode both poll the channel, and with both running each used to see every message,
+run its own turn and post its own reply — two answers to everything, and not even
+the same answer, since they are separate turns with separate state. They now
+share a lease file in `~/.itsbob`: whoever holds it answers, everyone else stands
+by. A holder that dies stops renewing and the standby takes over within ninety
+seconds; a clean stop hands over immediately. The status strip shows `standby`
+and names who is holding it, so a quiet bridge does not look like a broken one.
+
 One Discord setting has no error message and is worth knowing about: without
 **Message Content Intent** (Developer Portal → your app → Bot), Discord returns
 empty text for every message that does not tag the bot. The symptom is an
@@ -736,6 +761,7 @@ src/itsbob/
     shaping.py      payloads into complete lines, so nothing is truncated away
     briefing.py     weather + news + the condensed daily report
     discord.py      the channel as a two-way workspace
+    lease.py        one process answers the channel, whichever one is up
   scripts/        what it can do to this machine — drop a file in to add one
     system_monitor.py, network_checker.py, process_manager.py,
     file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py
@@ -770,7 +796,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            541 tests, none of which touch the network
+tests/            551 tests, none of which touch the network
 ```
 
 ## The original simulation

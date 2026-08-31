@@ -60,13 +60,17 @@ _SYSTEM = (
     "Never turn something Bob said about himself into a fact about the user. "
     "That is the single worst mistake you can make here.\n\n"
     "## How long it lasts\n"
-    '- horizon "long" — still true and still useful in a year: stable '
-    "preferences, decisions and their reasons, people and relationships, "
-    "recurring problems, where things live, standing constraints, commitments "
-    "with dates.\n"
-    '- horizon "short" — true for now and worth carrying a few more replies, '
-    "but not forever: what is being worked on today, a state the machine is in, "
-    "a thread that is still open.\n\n"
+    'Default to "short". Almost everything is short. A memory does not need to '
+    "be permanent to be useful, and it can be promoted later if it turns out to "
+    "matter — being recalled again is what earns that. Writing everything down "
+    "forever does not make a good memory, it makes a transcript nobody can "
+    "search.\n"
+    '- horizon "short" — the working set: what is being worked on, a state the '
+    "machine is in, a thread still open, anything you are unsure about.\n"
+    '- horizon "long" — reserved for what will still be true and still be useful '
+    "in a year: a standing preference, a decision and its reason, a person and "
+    "their relationship, where something lives, a commitment with a date. If you "
+    'have to think about whether it qualifies, it is "short".\n\n'
     "## Do not write\n"
     "Restatements of the conversation, tool output, anything already listed as "
     "known below, or anything that would still be obvious without writing it.\n\n"
@@ -87,7 +91,7 @@ class ExtractedMemory:
     content: str
     kind: MemoryKind = MemoryKind.FACT
     subject: Subject = Subject.USER
-    horizon: Horizon = Horizon.LONG
+    horizon: Horizon = Horizon.SHORT
     importance: float = 0.6
     tags: tuple[str, ...] = ()
 

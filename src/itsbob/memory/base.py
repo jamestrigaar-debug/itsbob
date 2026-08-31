@@ -76,12 +76,21 @@ class Horizon(str, Enum):
 
     @classmethod
     def coerce(cls, value: "str | Horizon | None") -> "Horizon":
+        """Unstated means short.
+
+        This default is the whole policy. Writing everything down permanently
+        is not a good memory, it is a transcript: after a few weeks recall is
+        picking between forty near-identical rows, each surfacing with equal
+        confidence, and the one you wanted is no likelier than the rest. So a
+        memory starts in the working set and *earns* permanence — by being
+        recalled again, by being marked important, or by being kept on purpose.
+        """
         if isinstance(value, cls):
             return value
-        text = str(value or "long").strip().lower()
-        if text in ("short", "short_term", "short-term", "working", "temporary", "temp"):
-            return cls.SHORT
-        return cls.LONG
+        text = str(value or "").strip().lower()
+        if text in ("long", "long_term", "long-term", "permanent", "durable", "forever"):
+            return cls.LONG
+        return cls.SHORT
 
 
 class MemoryKind(str, Enum):
@@ -185,8 +194,9 @@ class MemoryRecord:
     #: the default is exactly what the extractor must not be allowed to coast
     #: on — see :class:`Subject`.
     subject: Subject = Subject.USER
-    #: Working set or corpus. Short-horizon rows are pruned by count and clock.
-    horizon: Horizon = Horizon.LONG
+    #: Working set or corpus. Short-horizon rows are pruned by count and clock,
+    #: and the default, because permanence is earned rather than assumed.
+    horizon: Horizon = Horizon.SHORT
     #: Wall-clock expiry, or ``None`` to keep until explicitly forgotten.
     expires_at: float | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)

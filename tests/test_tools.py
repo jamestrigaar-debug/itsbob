@@ -315,11 +315,17 @@ def test_remember_records_whose_memory_it_is(box):
     assert mine.data["subject"] == "bob"
     theirs = box.call("remember", content="prefers dark roast")
     assert theirs.data["subject"] == "user"  # the default, since most are
-    # A short-horizon memory carries an expiry; a long-horizon one does not.
-    short = box.call("remember", content="working on the router today", horizon="short")
-    assert short.data["horizon"] == "short"
-    assert box.memory.get(short.data["id"]).expires_at is not None
-    assert box.memory.get(theirs.data["id"]).expires_at is None
+
+    # Permanence is earned, not assumed: an unqualified memory joins the
+    # working set and carries an expiry.
+    assert theirs.data["horizon"] == "short"
+    assert box.memory.get(theirs.data["id"]).expires_at is not None
+
+    # Asking for long-term is what makes it permanent.
+    durable = box.call("remember", content="the fuse box is behind the coats",
+                       horizon="long")
+    assert durable.data["horizon"] == "long"
+    assert box.memory.get(durable.data["id"]).expires_at is None
 
 
 # -- API catalog -----------------------------------------------------------
