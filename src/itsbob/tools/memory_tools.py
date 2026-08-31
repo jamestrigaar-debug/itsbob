@@ -183,7 +183,17 @@ def memory_tools() -> list[Tool]:
                     },
                     "kind": {"type": "string", "description": f"One of: {kinds}. Default fact. Near-misses are accepted."},
                     "importance": {"type": "number", "description": "0-1. Default 0.6."},
-                    "tags": {"type": "array", "description": "Short lowercase labels."},
+                    "tags": {
+                        "type": "array",
+                        "description": (
+                            "Short lowercase labels. The tag `style` is special: "
+                            "anything tagged with it becomes a standing rule about "
+                            "how to answer (length, format, how much detail) and is "
+                            "put in front of you on every turn. Use it when the user "
+                            "tells you how they want replies — 'always list every "
+                            "match', 'keep it to a paragraph'."
+                        ),
+                    },
                 },
                 "required": ["content"],
             },

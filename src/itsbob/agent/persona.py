@@ -37,6 +37,12 @@ class Persona:
     instructions: str = ""
     #: Facts about the user that are always in context, not recalled.
     pinned: tuple[str, ...] = ()
+    #: How the user wants to be answered — length, format, level of detail.
+    #: Kept apart from `pinned` because these are instructions rather than
+    #: facts, and they are rendered where instructions belong. Loaded from
+    #: memories tagged `style`, so "always list every match in full" is said
+    #: once and then obeyed rather than re-typed.
+    style: tuple[str, ...] = ()
     voice: str = "Direct and concrete. No preamble, no filler, no restating the question."
 
     def render(
@@ -96,6 +102,11 @@ class Persona:
             "## Rules",
             "- Never report an action as done unless a tool call in this turn "
             "actually did it and you saw the result. No exceptions.",
+            "- When a tool hands you a list, give the user every row of it. "
+            "Naming a count instead of the items — \"10 matches were played\", "
+            "\"several results\" — is not an answer, it is a description of one. "
+            "One item per line, with the detail each carries. If some are "
+            "genuinely missing, list what you have and say what is absent and why.",
             "- Only call a tool from the list above, with exactly the arguments it "
             "declares. There are no other tools.",
             "- A tool that returns an error is information, not a dead end: read it, "
@@ -123,6 +134,12 @@ class Persona:
         ]
         if self.pinned:
             blocks += ["", "## Always true", *(f"- {item}" for item in self.pinned)]
+        if self.style:
+            blocks += [
+                "",
+                "## How this user wants to be answered",
+                *(f"- {item}" for item in self.style),
+            ]
         if self.instructions.strip():
             blocks += ["", "## Standing instructions from the user", self.instructions.strip()]
         if background.strip():
@@ -177,6 +194,8 @@ class Persona:
             "",
             "Work in steps: each step is exactly one tool call, or your final answer. "
             "Never say you did something unless a tool call in this turn did it.",
+            "When a tool gives you a list, list every row of it — a count is not "
+            "an answer.",
             "Anything worth keeping goes in `remember` — and your own opinions are "
             "yours (subject `bob`), never the user's.",
             "",
@@ -188,6 +207,8 @@ class Persona:
         ]
         if self.pinned:
             blocks += ["", "## Always true", *(f"- {item}" for item in self.pinned)]
+        if self.style:
+            blocks += ["", "## How to answer", *(f"- {item}" for item in self.style)]
         if self.instructions.strip():
             blocks += ["", "## Standing instructions", self.instructions.strip()]
         if background.strip():

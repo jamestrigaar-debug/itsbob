@@ -359,6 +359,17 @@ def _call_api(catalog: ApiCatalog):
         result = _summarize(status, payload, url)
         result.data["api"] = name
         result.data["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        if result.ok:
+            # Shaped before the model sees it. Measured: ten Premier League
+            # matches are ~11,000 characters of JSON, the loop clips one
+            # observation to ~3,000, and eight of the ten never arrived. The
+            # shaped form is ~600 characters and carries all ten.
+            from ..integrations.shaping import shape
+
+            shaped = shape(name, str(path), result.data.get("json"))
+            if shaped:
+                result.output = shaped
+                result.data["shaped"] = True
         if not result.ok:
             hint = _hint(spec, path, status)
             if hint:

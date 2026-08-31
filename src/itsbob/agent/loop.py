@@ -62,13 +62,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from ..llm.base import AllProvidersFailed, LLMRequest, system
+from ..llm.base import AllProvidersFailed, LLMRequest, assistant, system
 from ..router.gatekeeper import Gatekeeper
 from ..router.ingestion import Snapshot, compress
 from ..router.tiers import Tier
 from ..tools import ToolCall, Toolbox
 from .brain import TieredBrain
 from .budget import FeasibilityCheck, SpendGuard, Verdict
+from .completeness import REWRITE_INSTRUCTION, inspect as inspect_completeness
 from .context import Conversation, Step, Turn, build_messages
 from .persona import Persona
 from .writer import MemoryWriter
@@ -233,6 +234,7 @@ class Agent:
             emit("final", text=turn.final, tier=tier.value, steps=0, refused=True)
             return turn
 
+        self._load_style()
         memories = self._recall(message)
         if memories:
             emit("memory", recalled=[h.as_dict() for h in memories])
@@ -247,6 +249,7 @@ class Agent:
             emit=emit,
         )
 
+        answer = self._pay_out_the_list(answer, turn, tier, emit)
         turn.final = answer
         turn.tier = tier.value
         turn.duration_ms = (time.perf_counter() - started) * 1000
@@ -273,6 +276,51 @@ class Agent:
 
         self._tidy_memory(emit)
         return turn
+
+    def _pay_out_the_list(
+        self, answer: str, turn: Turn, tier: Tier, emit: Callable[..., None]
+    ) -> str:
+        """Rewrite an answer that announced a list and then did not give one.
+
+        Checked for free on the finished text, and only rewritten when a tool
+        this turn actually returned several rows *and* the answer stood in a
+        count or a hedge for them. Both together are rare, so the second call
+        is rare — which is the point: a verification pass on every turn would
+        double the bill to catch a minority of turns.
+        """
+        shortfall = inspect_completeness(answer, [s.observation for s in turn.steps])
+        if not shortfall.short:
+            return answer
+
+        emit("incomplete", **shortfall.as_dict())
+        messages = build_messages(
+            persona=self.persona,
+            tools="(answer from what you already have; no tools for this step)",
+            snapshot_text=turn.message,
+            conversation=self.conversation,
+            steps=turn.steps,
+            full_observations=len(turn.steps) or 1,
+            observation_chars=6000,
+        )
+        messages.append(assistant(answer))
+        messages.append(system(f"{REWRITE_INSTRUCTION}\n\nHere, {shortfall.note()}."))
+        try:
+            payload, result = self.brain.complete_json(
+                tier,
+                LLMRequest(messages=messages, temperature=0.2, max_tokens=2500),
+                purpose="agent.enumerate",
+                default={},
+            )
+            turn.tokens += result.response.usage.total_tokens
+            self.guard.add(result.response.usage.total_tokens)
+        except AllProvidersFailed:
+            return answer
+        rewritten = str(payload.get("final") or "").strip()
+        if not rewritten:
+            return answer
+        turn.rewritten_for_completeness = True
+        emit("rewritten", listed=shortfall.listed, available=shortfall.available)
+        return rewritten
 
     def _feasible(self, message: str, tier: Tier, emit: Callable[..., None]) -> Verdict:
         """Screen an expensive turn before paying for it."""
@@ -523,6 +571,31 @@ class Agent:
             if extra.text and extra.text != snapshot.text:
                 snapshot.text = f"{extra.text}\n\n{snapshot.text}".strip()
         return snapshot
+
+    #: How often standing style preferences are re-read from memory. They
+    #: change rarely, and a query per turn to find that out is a query wasted.
+    STYLE_TTL = 120.0
+
+    def _load_style(self) -> None:
+        """Put the user's standing answer-style preferences into the prompt.
+
+        A preference like "always list every match, never summarise" is exactly
+        the sort of thing that has to be said once and then hold. Storing it as
+        an ordinary memory means it is only recalled when the *query* happens
+        to look similar — which for a rule about formatting it never does. So
+        memories tagged `style` are loaded directly into the persona instead.
+        """
+        if self.memory is None:
+            return
+        now = time.time()
+        if now - getattr(self, "_style_read_at", 0.0) < self.STYLE_TTL:
+            return
+        self._style_read_at = now
+        try:
+            found = self.memory.by_tag("style", limit=8)
+        except Exception:  # noqa: BLE001 - a preference is an assist, never a dependency
+            return
+        self.persona.style = tuple(dict.fromkeys(r.content.strip() for r in found if r.content.strip()))
 
     def _recall(self, query: str) -> list[Any]:
         if self.memory is None or not query.strip():

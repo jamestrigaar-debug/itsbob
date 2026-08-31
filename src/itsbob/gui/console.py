@@ -559,7 +559,8 @@ function drawActivity(){
 
 async function drawMemory(){
   $("mini").hidden = false;
-  $("mini").innerHTML = `<input id="mq" placeholder="search, or type something to remember…">
+  $("mini").innerHTML = `<input id="mq"
+      placeholder="search, or type something to remember (prefix «style:» for a standing rule)…">
     <button class="x" onclick="drawMemory()">Search</button>
     <button class="x" onclick="addMemory()">Remember</button>`;
   $("mq").onkeydown = e => { if(e.key === "Enter") drawMemory(); };
@@ -578,9 +579,16 @@ async function drawMemory(){
        where something lives, a decision and why.</p>`;
 }
 async function addMemory(){
-  const box = $("mq"); const v = box.value.trim();
+  const box = $("mq"); let v = box.value.trim();
   if(!v) return;
-  try{ await post("/api/memory", {content: v}); }catch(e){ return alert(e.message); }
+  // "style: always list every match in full" becomes a standing rule that goes
+  // into the prompt on every turn, rather than a fact waiting to be recalled.
+  const style = /^style\s*:/i.test(v);
+  if(style) v = v.replace(/^style\s*:\s*/i, "");
+  try{
+    await post("/api/memory", {content: v, tags: style ? ["style"] : [],
+                               kind: style ? "preference" : "fact"});
+  }catch(e){ return alert(e.message); }
   box.value = ""; drawMemory(); refresh();
 }
 async function forget(id){

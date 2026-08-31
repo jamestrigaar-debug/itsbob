@@ -282,6 +282,30 @@ discarded afterwards unless you pass `keep`. `look_at_window` does the focused
 window, `look_at_image` reads a picture already on disk. All three need
 `GOOGLE_API_KEY`, and say so *before* taking a screenshot nobody could read.
 
+**Tool output is shaped before the model sees it.** Not for tidiness — for
+completeness. Ten Premier League matches are ~11,000 characters of JSON, one
+observation is clipped to about 3,000, and eight of the ten never reached the
+model at all. It reported "10 matches were played" and named two, which looked
+like a model being lazy and was actually a model being honest about data it did
+not have. Shaped, the same ten matches are ~700 characters: one line each, every
+row present, the crest URLs and referee nationalities dropped. Complete *and*
+fourteen times cheaper. Unrecognised payloads still get one line per item from
+whatever fields they have — raw JSON is the last resort, not the default.
+
+**An answer that promises a list and does not give one is rewritten.** The check
+is deterministic and free: it fires only when a tool returned several rows *and*
+the reply stood a count or a hedge in for them ("10 matches were played",
+"among others"). Both together are rare, so the extra call is rare — a
+verification pass on every turn would double the bill to catch a minority of
+turns. A genuinely short answer is left alone; brevity is only a fault when
+something was promised.
+
+**Standing preferences about *how* to answer live in memory.** Tag a memory
+`style` — "always list every match in full, never summarise" — and it goes into
+the prompt on every turn rather than waiting to be recalled. That distinction
+matters: a rule about formatting is never semantically similar to the question
+being asked, so ordinary recall would never surface it.
+
 **Web search needs no key at all.** `web_search` uses `ddgr` or `googler` if
 either is installed (`sudo apt install ddgr`), and falls back to DuckDuckGo's
 HTML endpoint otherwise. It is a separate tool rather than a `run_shell`
@@ -668,6 +692,7 @@ src/itsbob/
     persona.py      the system prompt, full and dieted
     writer.py       post-turn extraction, with attribution and horizon
     budget.py       the spend ceiling and the can-it-be-done check
+    completeness.py catching an answer that announced a list and did not give it
     initiative.py   what it does when nobody has asked it anything
   memory/         hybrid recall
     long_term.py    SQLite + FTS5 + vectors, score fusion, migration
@@ -686,6 +711,7 @@ src/itsbob/
     audit.py        append-only JSONL, credentials redacted
   integrations/   the outside world
     apis.py         built-in specs: weather, news, gnews, football
+    shaping.py      payloads into complete lines, so nothing is truncated away
     briefing.py     weather + news + the condensed daily report
     discord.py      the channel as a two-way workspace
   scripts/        what it can do to this machine — drop a file in to add one
@@ -722,7 +748,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            508 tests, none of which touch the network
+tests/            531 tests, none of which touch the network
 ```
 
 ## The original simulation

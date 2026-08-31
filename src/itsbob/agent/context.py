@@ -73,6 +73,8 @@ class Turn:
     extensions: int = 0
     #: Why the turn ended, when it was not the model choosing to answer.
     stopped_because: str | None = None
+    #: Set when the answer announced a list and had to be asked to pay it out.
+    rewritten_for_completeness: bool = False
 
     @property
     def tools_used(self) -> list[str]:
@@ -92,6 +94,7 @@ class Turn:
             "refused": self.refused,
             "extensions": self.extensions,
             "stopped_because": self.stopped_because,
+            "rewritten_for_completeness": self.rewritten_for_completeness,
         }
 
 
