@@ -37,7 +37,13 @@ from typing import Any, Mapping
 
 from .base import Risk, Tool, ToolContext, ToolError, ToolResult
 
-__all__ = ["vision_tools", "describe_image", "pillow_available"]
+__all__ = [
+    "vision_tools",
+    "describe_image",
+    "prepare_image",
+    "vision_models",
+    "pillow_available",
+]
 
 #: Refused outright above this, since it is being uploaded.
 MAX_BYTES = 20 * 1024 * 1024
@@ -79,8 +85,12 @@ def _resolve(path: str, ctx: ToolContext) -> Path:
     return resolved
 
 
-def _prepare(path: Path) -> tuple[bytes, str]:
-    """Image bytes ready to send, and their mime type."""
+def prepare_image(path: Path) -> tuple[bytes, str]:
+    """Image bytes ready to send, and their mime type.
+
+    Public because :mod:`itsbob.scripts.screen_reader` needs exactly this and
+    reimplementing the downscale there would mean two size ceilings that drift.
+    """
     size = path.stat().st_size
     raw = path.read_bytes()
     mime = _MIME.get(path.suffix.lower(), "image/jpeg")
@@ -172,7 +182,8 @@ def describe_image(
     raise ToolError("no vision model answered — " + "; ".join(problems)[:400])
 
 
-def _models(env: Mapping[str, str]) -> tuple[str, ...]:
+def vision_models(env: Mapping[str, str]) -> tuple[str, ...]:
+    """The vision ladder, with ``ITSBOB_VISION_MODEL`` promoted to the front."""
     override = str(env.get("ITSBOB_VISION_MODEL", "")).strip()
     if not override:
         return VISION_MODELS
@@ -186,13 +197,13 @@ def _describe(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
         raise ToolError("GOOGLE_API_KEY is not set, so there is no vision model to ask")
 
     path = _resolve(params["path"], ctx)
-    data, mime = _prepare(path)
+    data, mime = prepare_image(path)
     question = str(params.get("question") or "").strip() or (
         "Describe this image. If it contains text, transcribe it accurately. Be "
         "specific and concrete; do not speculate about anything you cannot see."
     )
     answer, model = describe_image(
-        data=data, mime=mime, prompt=question, api_key=api_key, models=_models(env)
+        data=data, mime=mime, prompt=question, api_key=api_key, models=vision_models(env)
     )
     return ToolResult(
         ok=True,

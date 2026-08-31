@@ -105,7 +105,7 @@ def _build_agent(args: argparse.Namespace, *, interactive: bool = True):
         mode=getattr(args, "mode", None),
         confirm=_confirmer(getattr(args, "yes", False)) if interactive else None,
         persona=persona,
-        max_steps=getattr(args, "max_steps", 8),
+        max_steps=getattr(args, "max_steps", 10),
         embeddings=not getattr(args, "no_embeddings", False),
     )
 
@@ -836,13 +836,23 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_setup(args: argparse.Namespace) -> int:
-    from .setup_wizard import run_setup
+    from .setup_wizard import SERVICE_KEYS, run_setup
 
     keys = {}
     for name in ("google", "groq", "openrouter"):
         value = getattr(args, f"{name}_key", None)
         if value:
             keys[f"{name.upper()}_API_KEY"] = value.strip()
+    # The capability keys take the same route, so an unattended install can set
+    # everything up in one command rather than the providers here and the rest
+    # by hand in `.env`.
+    for service in SERVICE_KEYS:
+        for env in (service.env, service.also):
+            if not env:
+                continue
+            value = getattr(args, env.lower(), None)
+            if value:
+                keys[env] = str(value).strip()
     return run_setup(
         home=_home(args),
         keys=keys or None,
@@ -965,13 +975,33 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--groq-key", help="set GROQ_API_KEY without being prompted")
     setup.add_argument("--openrouter-key", help="set OPENROUTER_API_KEY without being prompted")
     setup.add_argument("--no-verify", action="store_true", help="skip the live API check")
+    # One flag per optional capability, derived from the same list the wizard
+    # prompts from, so adding a service never means remembering to add a flag.
+    from .setup_wizard import SERVICE_KEYS as _SERVICES
+
+    for _service in _SERVICES:
+        setup.add_argument(
+            f"--{_service.env.lower().replace('_', '-')}",
+            dest=_service.env.lower(),
+            help=f"set {_service.env} without being prompted ({_service.label})",
+        )
+        if _service.also:
+            setup.add_argument(
+                f"--{_service.also.lower().replace('_', '-')}",
+                dest=_service.also.lower(),
+                help=f"set {_service.also} without being prompted",
+            )
     setup.set_defaults(handler=_cmd_setup)
 
     # chat
     chat = with_mode(add("chat", "Interactive conversation."))
     chat.add_argument("-v", "--verbose", action="store_true", help="show tiers and tool results")
     chat.add_argument("-y", "--yes", action="store_true", help="approve every tool without asking")
-    chat.add_argument("--max-steps", type=int, default=8)
+    chat.add_argument(
+        "--max-steps", type=int, default=10,
+        help="steps before the budget checks whether it is getting anywhere "
+             "(it extends itself while it is, up to 60)",
+    )
     chat.add_argument("--no-embeddings", action="store_true", help="keyword-only recall, no API calls")
     chat.set_defaults(handler=_cmd_chat)
 
@@ -981,7 +1011,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument("-v", "--verbose", action="store_true")
     ask.add_argument("-y", "--yes", action="store_true")
     ask.add_argument("--json", action="store_true", help="machine-readable turn record")
-    ask.add_argument("--max-steps", type=int, default=8)
+    ask.add_argument("--max-steps", type=int, default=10)
     ask.add_argument("--no-embeddings", action="store_true")
     ask.set_defaults(handler=_cmd_ask)
 

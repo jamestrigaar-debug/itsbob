@@ -56,6 +56,7 @@ from typing import Any, Callable
 
 from ..agent import Agent, build_agent
 from ..agent.context import Conversation
+from ..agent.initiative import Initiative
 from ..memory.base import MemoryKind, MemoryRecord
 from .notify import Notification, NoticeGate, default_sink
 from .tasks import Task, TaskRun, TaskStore
@@ -98,6 +99,7 @@ class Daemon:
         defer_seconds: float = 600.0,
         max_defers: int = 6,
         discord: Any = None,
+        initiative: Any = None,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -127,6 +129,10 @@ class Daemon:
         #: consumer for the agent, so a chat message and a scheduled task can
         #: never interleave into each other's conversation.
         self.discord = discord
+        #: Speaking first when nothing is due. ``False`` turns it off.
+        self.initiative = (
+            Initiative.from_env() if initiative is None else (initiative or None)
+        )
         self._inbox: queue.Queue = queue.Queue(maxsize=50)
         self._stop = threading.Event()
         self._abandoned = 0
@@ -146,8 +152,10 @@ class Daemon:
         self._emit("started", tasks=len(self.tasks), policy=self.agent.toolbox.policy.mode.value)
         try:
             while not self._stop.is_set():
-                self.tick()
+                ran = self.tick()
                 self.drain_inbox()
+                if not ran:
+                    self.maybe_speak()
                 if self._stop.is_set():
                     break
                 # Capped when Discord is listening: a person waiting on a reply
@@ -171,6 +179,38 @@ class Daemon:
         else:
             self._emit("discord_failed", error=self.discord.last_error or "unknown")
             self.discord = None
+
+    def maybe_speak(self, now: float | None = None) -> bool:
+        """Say something unprompted, if it is idle and enough time has passed.
+
+        Deliberately only when nothing else ran this tick. An initiative turn is
+        the lowest-priority work in the system and must never sit in front of a
+        scheduled task or a message someone is waiting on.
+        """
+        now = time.time() if now is None else now
+        if self.initiative is None or not self.initiative.due(now):
+            return False
+        prompt = self.initiative.fire(now)
+        self._emit("initiative", prompt=prompt.name)
+        try:
+            turn = self._run_prompt(prompt.text)
+        except Exception as exc:  # noqa: BLE001 - never end the loop over this
+            self._emit("initiative_failed", error=f"{type(exc).__name__}: {exc}"[:200])
+            return False
+        answer = (turn.final or "").strip() if turn is not None else ""
+        if not self.initiative.record(answer):
+            self._emit("initiative_quiet", prompt=prompt.name)
+            return False
+        self._deliver(
+            Notification(
+                title=f"itsbob: {prompt.name.replace('_', ' ')}",
+                body=answer,
+                task="initiative",
+                source="initiative",
+                urgency="low",
+            )
+        )
+        return True
 
     def submit_message(self, text: str, **extra: Any) -> bool:
         """Queue an outside message (from Discord) to run between ticks."""
@@ -450,6 +490,7 @@ class Daemon:
             "abandoned_runs": self._abandoned,
             "task_timeout_s": self.task_timeout,
             "health_gate": self.health_gate,
+            "initiative": self.initiative.status() if self.initiative else {"enabled": False},
             "deferred_now": {name: count for name, count in self._defers.items() if count},
             "policy_mode": policy.mode.value,
             "can_run_commands": (

@@ -15,6 +15,12 @@ goes ahead of pending scheduled work; and a task's steps stream into the same
 activity panel as everything else, so "what is it doing right now" has one
 answer.
 
+It also does the thing a schedule cannot: when there is nothing due and nothing
+being typed, it occasionally lets itsbob speak first (see
+:mod:`itsbob.agent.initiative`). That is the difference between an assistant and
+company, and it is deliberately rare, idle-only, and biased hard toward saying
+nothing.
+
 The costs are real and worth stating. Closing the tab does not stop the work,
 but quitting the server does — this is not a substitute for ``itsbob serve``
 under systemd, it is the interactive version of it. And a long task delays your
@@ -26,6 +32,8 @@ from __future__ import annotations
 import threading
 import time
 from typing import Any
+
+from ..agent.initiative import Initiative
 
 __all__ = ["Autonomous"]
 
@@ -43,6 +51,7 @@ class Autonomous:
         poll_seconds: float = 15.0,
         health_gate: bool = True,
         defer_seconds: float = 600.0,
+        initiative: Any = None,
     ) -> None:
         self.session = session
         self.tasks = tasks
@@ -51,6 +60,10 @@ class Autonomous:
         self.poll_seconds = poll_seconds
         self.health_gate = health_gate
         self.defer_seconds = defer_seconds
+        #: Speaking first when idle. ``False`` disables it outright.
+        self.initiative = (
+            Initiative.from_env() if initiative is None else (initiative or None)
+        )
 
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -101,6 +114,7 @@ class Autonomous:
             "next_due": self.tasks.next_due_at(),
             "health_gate": self.health_gate,
             "last_reason": self.last_reason,
+            "initiative": self.initiative.status() if self.initiative else {"enabled": False},
         }
 
     # -- the loop ----------------------------------------------------------
@@ -126,7 +140,58 @@ class Autonomous:
                 continue
             if self._submit(task, now=now):
                 submitted.append(task.name)
+        if not submitted and self._maybe_speak(now):
+            submitted.append("(initiative)")
         return submitted
+
+    def _maybe_speak(self, now: float) -> bool:
+        """Let itsbob start something, if it is genuinely idle and time is up.
+
+        Idle means *idle*: nothing due, nothing in flight, nothing queued and no
+        turn running. An initiative turn that lands behind a person's question
+        would delay the answer they are waiting for, to say something nobody
+        asked for — which is the wrong way round.
+        """
+        if self.initiative is None or self._in_flight or self.session.busy:
+            return False
+        if self.session.queued_messages():
+            return False
+        if not self.initiative.due(now):
+            return False
+
+        prompt = self.initiative.fire(now)
+        result = self.session.submit(
+            prompt.text,
+            source="initiative",
+            label=f"on its own: {prompt.name}",
+            on_done=lambda turn, error: self._spoke(prompt, turn, error),
+        )
+        if result["accepted"]:
+            self.session.emit("initiative", prompt=prompt.name)
+        return bool(result["accepted"])
+
+    def _spoke(self, prompt: Any, turn: Any, error: str | None) -> None:
+        """Deliver an initiative turn — but only when it actually said something."""
+        if error or turn is None:
+            self.last_reason = error or "initiative produced no turn"
+            return
+        answer = (turn.final or "").strip()
+        if not self.initiative.record(answer):
+            # The expected outcome most of the time, and the reason this can be
+            # left on: a quiet turn costs one cheap call and reaches nobody.
+            self.session.emit("initiative_quiet", prompt=prompt.name)
+            return
+        from ..daemon.notify import Notification
+
+        self._deliver(
+            Notification(
+                title=f"itsbob: {prompt.name.replace('_', ' ')}",
+                body=answer,
+                task="initiative",
+                source="initiative",
+                urgency="low",
+            )
+        )
 
     def _health_hold(self, task: Any) -> str | None:
         if not self.health_gate or task.metadata.get("ignore_health"):

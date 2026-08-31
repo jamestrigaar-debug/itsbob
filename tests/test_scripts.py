@@ -132,9 +132,17 @@ def test_a_kernel_thread_is_refused():
 
 
 def test_another_users_process_is_refused():
-    from itsbob.scripts.process_manager import ProcessInfo, refusal_reason
+    from itsbob.scripts.process_manager import (
+        ProcessInfo,
+        _own_process_group,
+        refusal_reason,
+    )
 
-    info = ProcessInfo(pid=4243, name="thing", command="/bin/thing",
+    # A pid that cannot collide with this test runner's own process group —
+    # a hardcoded one did, but only when the whole suite ran, which is the
+    # worst way to find out.
+    pid = max(_own_process_group()) + 1000
+    info = ProcessInfo(pid=pid, name="thing", command="/bin/thing",
                        user="somebody-else", age_seconds=99999)
     assert "belongs to" in (refusal_reason(info) or "")
 

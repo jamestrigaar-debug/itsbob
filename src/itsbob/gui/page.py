@@ -222,8 +222,24 @@ const TIERVAR = {D:"--D",C:"--C",B:"--B",A:"--A",S:"--S"};
 const state = {panel:"activity", cards:[], live:null, status:null, pending:new Map(),
                busy:false, queue:[]};
 
-async function api(url, opts){
-  const r = await fetch(url, opts);
+// Every request is bounded. A server that accepts a connection and then never
+// answers is indistinguishable from a slow one to `fetch`, which waits forever
+// — so the page sat on "connecting…" with no error and nothing to retry. It was
+// a deadlock in the status endpoint that put it there, and that is fixed, but a
+// UI that can hang silently on one bad response will find another way to.
+async function api(url, opts, timeoutMs = 12000){
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), timeoutMs);
+  let r;
+  try{
+    r = await fetch(url, {...(opts || {}), signal: stop.signal});
+  }catch(e){
+    throw new Error(e.name === "AbortError"
+      ? `no answer in ${timeoutMs / 1000}s — the server accepted the request but never replied`
+      : e.message);
+  }finally{
+    clearTimeout(timer);
+  }
   let body = {};
   try { body = await r.json(); } catch { /* empty body is fine */ }
   if(!r.ok) throw new Error(body.error || `${r.status} ${r.statusText}`);
@@ -243,7 +259,7 @@ function ago(ts){
 
 async function refresh(){
   try{
-    const s = await api("/api/status"); state.status = s;
+    const s = await api("/api/status"); state.status = s; state.statusErrors = 0;
     const bits = [];
     for(const [tier, info] of Object.entries(s.tiers)){
       const on = !!info.model;
@@ -277,8 +293,11 @@ async function refresh(){
     $("chips").innerHTML = bits.join("");
     $("nmem").textContent = m.records ?? "";
     $("ntask").textContent = s.tasks?.length || "";
-    const live = (s.apis || []).filter(a => a.configured).length;
-    $("napi").textContent = s.apis?.length ? `${live}/${s.apis.length}` : "";
+    const services = apiRows(s);
+    $("napi").textContent = `${services.filter(a => a.configured).length}/${services.length}`;
+    if(Object.keys(s.problems || {}).length)
+      bits.push(`<span class="chip bad" title="${esc(JSON.stringify(s.problems))}"
+        >${Object.keys(s.problems).length} subsystem(s) failing</span>`);
     const unread = $("unread");
     unread.textContent = s.unread || "";
     unread.className = s.unread ? "on" : "";
@@ -287,7 +306,15 @@ async function refresh(){
     paintAuto(s.autonomous);
     if(!state.busy) setDot("live");
   }catch(e){
-    $("chips").innerHTML = `<span class="chip bad">${esc(e.message)}</span>`;
+    // Named plainly, with the one thing worth trying. "connecting…" forever
+    // tells you nothing; this tells you where it broke.
+    state.statusErrors = (state.statusErrors || 0) + 1;
+    $("chips").innerHTML =
+      `<span class="chip bad" title="${esc(e.message)}">status unavailable</span>` +
+      `<span class="chip act" onclick="refresh()">retry</span>` +
+      (state.statusErrors > 2
+        ? `<span class="chip">${state.statusErrors} attempts — check the terminal running itsbob</span>`
+        : "");
     setDot("down");
   }
 }
@@ -588,31 +615,62 @@ async function drawScripts(){
     || `<p class="empty">No scripts registered.</p>`;
 }
 
+// The registered catalog and the built-ins, merged. On its own the catalog
+// only holds APIs whose key is already set, so it can show what works and not
+// what you could switch on — which is the more useful half when something is
+// missing.
+function apiRows(s){
+  const rows = new Map();
+  for(const service of s.services || [])
+    rows.set(service.name, {name:service.name, configured:!!service.configured,
+                            key_env:service.key_env, description:service.description,
+                            base_url:"", builtin:true});
+  for(const api of s.apis || []){
+    const existing = rows.get(api.name) || {};
+    rows.set(api.name, {...existing, ...api, configured:!!api.configured,
+                        description:api.description || existing.description});
+  }
+  // Capabilities that are real but live outside the API catalog.
+  rows.set("web search", {name:"web search", configured:true, key_env:"",
+    description:`No key needed — via ${s.search_backend || "duckduckgo"}. ` +
+                (s.search_backend === "duckduckgo-html"
+                  ? "Install ddgr for structured results." : "")});
+  rows.set("discord", {name:"discord", configured:!!s.discord?.configured,
+    key_env:"DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID",
+    description:s.discord?.running
+      ? "Watching the channel — it can post to you unprompted."
+      : "Post to your channel unprompted, and take messages back."});
+  rows.set("vision", {name:"vision", configured:!!s.vision?.pillow, key_env:"pip install -e '.[vision]'",
+    description:"describe_image reads screenshots and photos. Needs pillow to resize first."});
+  return [...rows.values()].sort((a, b) =>
+    (b.configured - a.configured) || a.name.localeCompare(b.name));
+}
+
 async function drawApis(){
   const s = state.status || await api("/api/status");
-  const apis = s.apis || [];
-  const live = apis.filter(a => a.configured).length;
+  const rows = apiRows(s);
+  const live = rows.filter(a => a.configured).length;
   // The point of this panel is answering "can I schedule a task that uses X?"
   // before writing the task, rather than at 07:00 tomorrow when it fails.
   const head = `<div class="card"><div class="body"><div class="note">
-      ${live} of ${apis.length} configured. A task can only use an API that is live —
-      set the missing key in <code>~/.itsbob/.env</code> and restart.
-      ${s.search_backend ? `Web search works with no key at all (via ${esc(s.search_backend)}).` : ""}
+      <b>${live} of ${rows.length}</b> ready. A task can only use something that is live —
+      put the missing key in <code>~/.itsbob/.env</code> and restart itsbob.
     </div></div></div>`;
-  $("right").innerHTML = head + (apis.map(a => `<div class="row">
+  $("right").innerHTML = head + rows.map(a => `<div class="row">
       <div class="grow">
         <div>${esc(a.name)}
           <span class="pill" style="border-color:var(${a.configured ? "--C" : "--S"});
-                color:var(${a.configured ? "--C" : "--S"})">${a.configured ? "live" : "no key"}</span>
+                color:var(${a.configured ? "--C" : "--S"})">${a.configured ? "live" : "not set up"}</span>
         </div>
-        <div class="sub">${esc(a.description || a.base_url)}</div>
-        <div class="sub">${esc(a.base_url)}${a.key_env ? " · needs " + esc(a.key_env) : ""}</div>
+        <div class="sub">${esc(a.description || a.base_url || "")}</div>
+        ${a.configured
+          ? (a.base_url ? `<div class="sub">${esc(a.base_url)}</div>` : "")
+          : `<div class="sub">needs <code>${esc(a.key_env || "configuration")}</code></div>`}
       </div>
-      ${a.configured
+      ${a.configured && a.base_url
         ? `<button class="x" onclick="taskFromApi('${esc(a.name)}')">schedule…</button>`
         : ""}
-    </div>`).join("")
-    || `<p class="empty">No APIs configured.</p>`);
+    </div>`).join("");
 }
 
 function taskFromApi(name){

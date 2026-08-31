@@ -113,7 +113,8 @@ def build_agent(
     toolbox: Toolbox | None = None,
     brain: TieredBrain | None = None,
     extra_tools: Sequence[Tool] = (),
-    max_steps: int = 8,
+    max_steps: int = 10,
+    hard_max_steps: int = 60,
     embeddings: bool = True,
     env: Mapping[str, str] | None = None,
 ) -> Agent:
@@ -151,5 +152,8 @@ def build_agent(
         toolbox=toolbox,
         memory=memory,
         persona=persona or Persona(),
+        # A checkpoint rather than a wall: a turn that is getting somewhere
+        # extends itself up to `hard_max_steps`. See `Agent._extend`.
         max_steps=max_steps,
+        hard_max_steps=hard_max_steps,
     )

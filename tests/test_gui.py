@@ -369,3 +369,67 @@ def test_the_page_links_to_the_messages_window(client):
     body = client.get("/").data
     assert b"/messages" in body
     assert b'data-panel="apis"' in body
+
+
+# -- the header must never sit on "connecting…" ----------------------------
+
+
+def test_the_autonomous_endpoint_does_not_deadlock_against_itself(client):
+    """A real hang, reported as a page stuck on "connecting…".
+
+    `autonomous()` needed the task store and the notification sink, both built
+    behind the same lock it had already taken. A plain `threading.Lock` is not
+    reentrant, so the first request to reach it blocked forever *holding the
+    lock* — and every later request touching any other lazily-built subsystem
+    blocked behind it. `/api/status` was one of those, so the header never got
+    its first answer, while chat and the event stream (which take no such lock)
+    carried on working perfectly and made it look like a front-end bug.
+    """
+    import threading
+
+    for path in ("/api/autonomous", "/api/status", "/api/autonomous"):
+        outcome: list[int] = []
+
+        def call(p=path, into=outcome):
+            into.append(client.get(p).status_code)
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=15)
+        assert outcome, f"{path} never answered — the lock deadlocked again"
+        assert outcome[0] == 200
+
+
+def test_one_broken_subsystem_does_not_blank_the_whole_panel(client, monkeypatch):
+    """Status feeds the header, the chips, the tools and the tasks at once."""
+    from itsbob.gui import app as app_module
+
+    def explode():
+        raise RuntimeError("the disk fell off")
+
+    problems: dict[str, str] = {}
+    assert app_module._safe(problems, "memory", explode, {"fallback": True}) == {
+        "fallback": True
+    }
+    assert "the disk fell off" in problems["memory"]
+
+    body = client.get("/api/status").get_json()
+    assert body["problems"] == {}
+    # Everything the header needs is present even on a bare install.
+    assert {"tiers", "policy", "tools", "memory", "apis", "services"} <= set(body)
+
+
+def test_status_names_what_you_could_switch_on_not_only_what_is_on(client):
+    """The catalog holds only APIs whose key is set, so it cannot show the rest."""
+    body = client.get("/api/status").get_json()
+    names = {s["name"] for s in body["services"]}
+    assert {"weather", "news", "gnews", "football"} <= names
+    for service in body["services"]:
+        assert service["key_env"], "a service with no named variable cannot be enabled"
+
+
+def test_the_page_bounds_its_requests(client):
+    """`fetch` waits forever by default, which is how a hang became a silent one."""
+    body = client.get("/").data
+    assert b"AbortController" in body
+    assert b"status unavailable" in body  # a named failure, not "connecting…"

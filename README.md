@@ -265,6 +265,15 @@ itsbob task add pl "Use the football API (competitions/PL/matches) for today's \
 The weather location defaults to Hull, UK and moves with
 `ITSBOB_WEATHER_PLACE`, `ITSBOB_WEATHER_LAT` and `ITSBOB_WEATHER_LON`.
 
+**It can look at its own screen.** `look_at_screen` captures and reads in a
+single tool call — "what does that error say", "is the build finished yet",
+"what's this chart showing". Doing it as two tools (screenshot, then vision on
+the path) works and is still available, but costs two model calls where one
+does; and the PNG is an implementation detail of the question, so it is
+discarded afterwards unless you pass `keep`. `look_at_window` does the focused
+window, `look_at_image` reads a picture already on disk. All three need
+`GOOGLE_API_KEY`, and say so *before* taking a screenshot nobody could read.
+
 **Web search needs no key at all.** `web_search` uses `ddgr` or `googler` if
 either is installed (`sudo apt install ddgr`), and falls back to DuckDuckGo's
 HTML endpoint otherwise. It is a separate tool rather than a `run_shell`
@@ -479,7 +488,71 @@ works" are different claims, and only the second is worth being told. Because
 they live in the home directory rather than the working directory, the daemon
 and the GUI find them wherever they are started from.
 
+It then offers each optional capability in turn — Discord, OpenWeather,
+NewsAPI, GNews, football-data — saying what each one actually gives you before
+asking for its key. They used to be *reported* at the end instead, which meant
+finding out a capability existed just after deciding you had finished
+configuring. Everything there is skippable, and none of it is verified with a
+live call: they are not providers, and a wizard that spends five API calls
+proving keys that are allowed to be absent is one people learn to skip.
+
+Every one of them also has a flag, so an unattended install is one command:
+
+```bash
+itsbob setup --google-key … --openweather-api-key … --newsapi-key … \
+             --discord-bot-token … --discord-channel-id …
+```
+
 `make help` lists the shortcuts for working *on* itsbob rather than with it.
+
+### Everything you can put in `~/.itsbob/.env`
+
+Only the first line is needed. Everything else adds a capability, and anything
+absent is reported as absent rather than breaking something — `itsbob doctor`
+lists what is on and what each missing piece would give you.
+
+```bash
+# Thinking. One key covers all four tiers.
+GOOGLE_API_KEY=…
+GROQ_API_KEY=…                  # backups, tried only after every Gemini model fails
+OPENROUTER_API_KEY=…
+
+# Services. Base URL and auth ship built in; the key is the whole setup.
+OPENWEATHER_API_KEY=…           # the `weather` tool and half of `daily_briefing`
+NEWSAPI_KEY=…                   # the `news` tool and the other half
+GNEWS_API_KEY=…                 # second news source, and the rate-limit fallback
+FOOTBALL_DATA_KEY=…             # fixtures, standings and scorers via call_api
+
+# Discord: the channel becomes a two-way workspace.
+DISCORD_BOT_TOKEN=…
+DISCORD_CHANNEL_ID=…
+
+# Where the weather is. Defaults to Hull, UK.
+ITSBOB_WEATHER_PLACE="Hull, UK"
+ITSBOB_WEATHER_LAT=53.7767
+ITSBOB_WEATHER_LON=-0.3274
+
+# Speaking first when idle. `off` disables it; hours between attempts; waking hours.
+ITSBOB_INITIATIVE=on
+ITSBOB_INITIATIVE_HOURS=3
+ITSBOB_INITIATIVE_WAKING=8-22
+
+# The local model. Keep the default unless you have pulled something else.
+ITSBOB_OLLAMA_MODEL=qwen2.5:1.5b
+ITSBOB_OLLAMA_URL=http://127.0.0.1:11434
+
+# Safety. `guarded` (default) asks before anything outside the workspace.
+ITSBOB_TOOL_MODE=guarded
+ITSBOB_AUTO_ALLOW=                # tools to run without asking. Leave empty.
+ITSBOB_ALLOWED_HOSTS=             # empty means any host; a list narrows it
+ITSBOB_SCRIPTS_DIR=~/.itsbob/scripts
+```
+
+`ITSBOB_AUTO_ALLOW=run_shell` is worth naming, because it is the one people
+reach for. It gives the model unattended shell on your machine for the life of
+the process, and it is not needed for web search — `web_search` is its own
+NETWORK-gated tool precisely so that looking something up does not require
+opening that door.
 
 ### Running in the background
 
@@ -554,6 +627,7 @@ src/itsbob/
     persona.py      the system prompt, full and dieted
     writer.py       post-turn extraction, with attribution and horizon
     budget.py       the spend ceiling and the can-it-be-done check
+    initiative.py   what it does when nobody has asked it anything
   memory/         hybrid recall
     long_term.py    SQLite + FTS5 + vectors, score fusion, migration
     base.py         MemoryRecord, Subject, Horizon, and scoring
@@ -575,7 +649,7 @@ src/itsbob/
     discord.py      the channel as a two-way workspace
   scripts/        what it can do to this machine — drop a file in to add one
     system_monitor.py, network_checker.py, process_manager.py,
-    file_cleaner.py, screenshot.py, scheduler.py
+    file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py
   daemon/         the always-on half
     schedule.py     schedules in words
     tasks.py        SQLite task store and run history
@@ -605,7 +679,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            437 tests, none of which touch the network
+tests/            468 tests, none of which touch the network
 ```
 
 ## The original simulation
