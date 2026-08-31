@@ -176,11 +176,17 @@ def build_agent(
             env=env,
         )
 
+    from .delegation import DelegatePolicy
+
     return Agent(
         brain=brain,
         toolbox=toolbox,
         memory=memory,
         persona=persona or Persona(),
+        # Off unless ITSBOB_DEEPSEEK is set and there is a browser to drive.
+        # `from_env` returns a disabled policy rather than raising, so a
+        # missing browser costs nothing but the free path.
+        delegation=DelegatePolicy.from_env(env, formatter=_shaper(brain)),
         # A checkpoint rather than a wall: a turn that is getting somewhere
         # extends itself up to `hard_max_steps`. See `Agent._extend`.
         max_steps=max_steps,

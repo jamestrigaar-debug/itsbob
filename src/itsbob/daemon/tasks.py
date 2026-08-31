@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..router.tiers import Tier
 from ..store import Database
 from .schedule import Schedule, parse_schedule
 
@@ -42,7 +43,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     fail_count   INTEGER NOT NULL DEFAULT 0,
     notify       INTEGER NOT NULL DEFAULT 1,
     max_runs     INTEGER,
-    metadata     TEXT NOT NULL DEFAULT '{}'
+    metadata     TEXT NOT NULL DEFAULT '{}',
+    grade        TEXT NOT NULL DEFAULT 'auto',
+    effort       TEXT NOT NULL DEFAULT 'full',
+    attempts     INTEGER NOT NULL DEFAULT 2
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_next ON tasks(next_run);
 
@@ -63,6 +67,10 @@ CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id, started_at);
 #: disabled instead of failing forever, and the daemon says so once.
 MAX_CONSECUTIVE_FAILURES = 5
 
+#: Grades a task may be set to, cheapest first. "auto" is the absence of one.
+_TIER_BY_LETTER = {t.value: t for t in (Tier.C, Tier.B, Tier.A, Tier.S)}
+GRADES = ("auto", *_TIER_BY_LETTER)
+
 
 @dataclass
 class Task:
@@ -82,7 +90,26 @@ class Task:
     #: to agree it is worth saying.
     notify: bool = True
     max_runs: int | None = None
+    #: The floor on how hard this task is allowed to think. A scheduled task is
+    #: not a chat message: nobody is watching to say "no, properly this time",
+    #: so a classifier that decides "this looks like a quick one" has nobody to
+    #: correct it. "auto" leaves the decision to the classifier; a tier letter
+    #: says never below this.
+    grade: str = "auto"
+    #: "full" (the default) or "quick". Full means the step budget and the
+    #: instruction to finish the job rather than sketch it.
+    effort: str = "full"
+    #: How many times a run may be retried at a higher grade when the result
+    #: does not actually answer the prompt. 1 disables escalation.
+    attempts: int = 2
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def graded(self) -> "Tier | None":
+        """The tier floor, or ``None`` for "let the classifier decide"."""
+        return _TIER_BY_LETTER.get(str(self.grade or "").strip().upper())
+
+    def thorough(self) -> bool:
+        return str(self.effort or "full").strip().lower() != "quick"
 
     def parsed(self) -> Schedule:
         return parse_schedule(self.schedule)
@@ -107,13 +134,20 @@ class Task:
             "run_count": self.run_count,
             "fail_count": self.fail_count,
             "notify": self.notify,
+            "grade": self.grade,
+            "effort": self.effort,
+            "attempts": self.attempts,
         }
 
     def describe(self) -> str:
         state = "on " if self.enabled else "off"
         when = time.strftime("%a %H:%M", time.localtime(self.next_run)) if self.next_run else "—"
         status = self.last_status or "never run"
-        return f"[{state}] {self.id}  {self.name:<24} {self.schedule:<22} next {when:<10} {status}"
+        grade = self.grade if self.grade != "auto" else "auto"
+        return (
+            f"[{state}] {self.id}  {self.name:<24} {self.schedule:<22} "
+            f"next {when:<10} {grade:<5} {status}"
+        )
 
 
 @dataclass
@@ -134,6 +168,23 @@ class TaskStore:
     def __init__(self, database: str | Path = ":memory:") -> None:
         self._db = Database(database, schema=_SCHEMA)
         self.database = self._db.path
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the original schema.
+
+        CREATE TABLE IF NOT EXISTS will not touch a table that already exists,
+        so an upgrade has to add these by hand or every insert fails on a task
+        list that was working yesterday.
+        """
+        existing = self._db.columns("tasks")
+        for column, ddl in (
+            ("grade", "ALTER TABLE tasks ADD COLUMN grade TEXT NOT NULL DEFAULT 'auto'"),
+            ("effort", "ALTER TABLE tasks ADD COLUMN effort TEXT NOT NULL DEFAULT 'full'"),
+            ("attempts", "ALTER TABLE tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 2"),
+        ):
+            if column not in existing:
+                self._db.execute(ddl)
 
     def add(self, task: Task, *, now: float | None = None, first: bool = False) -> Task:
         if task.next_run is None:
@@ -142,12 +193,14 @@ class TaskStore:
         self._db.execute(
             "INSERT OR REPLACE INTO tasks (id, name, prompt, schedule, enabled, created_at, "
             "next_run, last_run, last_status, last_output, run_count, fail_count, notify, "
-            "max_runs, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "max_runs, metadata, grade, effort, attempts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 task.id, task.name, task.prompt, task.schedule, int(task.enabled),
                 task.created_at, task.next_run, task.last_run, task.last_status,
                 task.last_output, task.run_count, task.fail_count, int(task.notify),
                 task.max_runs, json.dumps(task.metadata),
+                task.grade, task.effort, task.attempts,
             ),
         )
         return task
@@ -202,6 +255,37 @@ class TaskStore:
             task.next_run = task.parsed().next_after(now)
         self.add(task)
         return True
+
+    def update(self, task_id: str, **fields: Any) -> "Task | None":
+        """Patch one task in place, returning it as stored.
+
+        Kept to the fields it makes sense to change after the fact. Run
+        counters and timestamps are the store's own bookkeeping and are not in
+        the list — a task whose history can be edited is a task whose history
+        means nothing.
+        """
+        task = self.get(task_id)
+        if task is None:
+            return None
+        allowed = {"name", "prompt", "schedule", "grade", "effort",
+                   "attempts", "notify", "max_runs", "enabled"}
+        changed = False
+        for key, value in fields.items():
+            if key not in allowed or value is None:
+                continue
+            if key == "schedule":
+                parse_schedule(str(value))  # a typo must fail here, not at 07:00
+                task.next_run = parse_schedule(str(value)).next_after(time.time())
+            if key == "grade":
+                value = str(value).strip()
+                value = value.upper() if value.upper() in _TIER_BY_LETTER else "auto"
+            if key == "effort":
+                value = "quick" if str(value).strip().lower() == "quick" else "full"
+            setattr(task, key, value)
+            changed = True
+        if changed:
+            self.add(task)
+        return task
 
     def remove(self, task_id: str) -> bool:
         with self._db.transaction() as conn:
@@ -273,4 +357,10 @@ def _from_row(row: sqlite3.Row) -> Task:
         notify=bool(row["notify"]),
         max_runs=row["max_runs"],
         metadata=json.loads(row["metadata"] or "{}"),
+        # .keys() rather than a bare lookup: a task list written by an older
+        # itsbob has no such column until _migrate runs, and a task list that
+        # will not open is a worse failure than one that runs on defaults.
+        grade=(row["grade"] if "grade" in row.keys() else "auto") or "auto",
+        effort=(row["effort"] if "effort" in row.keys() else "full") or "full",
+        attempts=int((row["attempts"] if "attempts" in row.keys() else 2) or 2),
     )

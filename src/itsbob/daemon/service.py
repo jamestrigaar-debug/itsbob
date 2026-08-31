@@ -60,6 +60,8 @@ from ..agent import Agent, build_agent
 from ..agent.context import Conversation
 from ..agent.initiative import Initiative
 from ..memory.base import MemoryKind, MemoryRecord
+from ..router.tiers import Tier
+from .completion import CompletionCheck, next_grade
 from .notify import Notification, NoticeGate, default_sink
 from .tasks import Task, TaskRun, TaskStore
 
@@ -102,6 +104,7 @@ class Daemon:
         max_defers: int = 6,
         discord: Any = None,
         initiative: Any = None,
+        completion: Any = None,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -135,6 +138,11 @@ class Daemon:
         self.initiative = (
             Initiative.from_env() if initiative is None else (initiative or None)
         )
+        #: Whether a finished task actually did what it was asked. Runs on the
+        #: local model, so it is free; pass ``False`` to turn it off entirely.
+        self.completion = (
+            CompletionCheck(brain=agent.brain) if completion is None else (completion or None)
+        )
         self._inbox: queue.Queue = queue.Queue(maxsize=50)
         self._stop = threading.Event()
         self._abandoned = 0
@@ -142,6 +150,7 @@ class Daemon:
         self._defer_notified: set[str] = set()
         self.started_at: float | None = None
         self.runs_completed = 0
+        self.escalations = 0
         self.notifications_sent = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -384,7 +393,7 @@ class Daemon:
 
         status, output, tools = "ok", "", ()
         try:
-            turn = self._run_bounded(task)
+            turn = self._attempt(task)
             output = turn.final
             tools = tuple(turn.tools_used)
             if turn.error:
@@ -437,7 +446,77 @@ class Daemon:
         task = self.tasks.find(needle)
         return None if task is None else self.run_task(task)
 
-    def _run_bounded(self, task: Task):
+    @staticmethod
+    def _tier_of(turn: Any) -> Tier | None:
+        """What a finished turn actually ran at, so the next try goes above it.
+
+        Not the floor it was given: the classifier may have started higher on
+        its own, and escalating from the floor would re-run at a tier already
+        tried.
+        """
+        try:
+            return Tier(str(getattr(turn, "tier", "") or "").upper())
+        except ValueError:
+            return None
+
+    def _attempt(self, task: Task):
+        """Run the task, and run it again at a higher grade if it did not land.
+
+        The check is the point. A scheduled run has nobody to read a thin
+        answer and say "no, all of them" — so a task that summarises a list it
+        was asked to produce is recorded as ok and is wrong every morning until
+        somebody notices. Asking once, on the free local model, is cheap enough
+        to do after every run.
+
+        Escalation carries the previous attempt forward rather than starting
+        over. The first try is usually most of the answer, and re-deriving it
+        pays twice to reach the same place.
+        """
+        floor = task.graded()
+        thorough = task.thorough()
+        attempts = max(1, task.attempts)
+        prompt = task.prompt
+        turn = None
+        # Retries fit *inside* the task's time, they do not multiply it. Two
+        # attempts at a ten-minute limit is still ten minutes of daemon held
+        # up, not twenty — the loop's promise is about the wall clock, and a
+        # second attempt is not a reason to break it.
+        spent = 0.0
+
+        for number in range(1, attempts + 1):
+            began = time.perf_counter()
+            turn = self._run_bounded(task, prompt=prompt, min_tier=floor, thorough=thorough)
+            spent += time.perf_counter() - began
+            if self.completion is None or number == attempts:
+                break
+            if self.task_timeout and spent >= self.task_timeout * 0.5:
+                # Not enough left for a second attempt to finish, and half an
+                # answer from a truncated retry is worse than the whole one
+                # already in hand.
+                break
+            status = "failed" if turn.error else "ok"
+            verdict = self.completion.judge(
+                prompt=task.prompt, output=turn.final, status=status
+            )
+            if verdict.complete:
+                break
+            self._emit(
+                "escalating",
+                task=task.name,
+                id=task.id,
+                attempt=number,
+                missing=verdict.missing,
+                to=(next_grade(floor or Tier.B)).value,
+            )
+            self.escalations += 1
+            prompt = verdict.carry_forward(task.prompt, turn.final)
+            # A grade the task did not have yet: whatever it ran at, go above
+            # it. Reusing the same tier would repeat the same shortfall.
+            floor = next_grade(self._tier_of(turn) or floor or Tier.B)
+        return turn
+
+    def _run_bounded(self, task: Task, *, prompt: str | None = None,
+                     min_tier: Any = None, thorough: bool = False):
         """Run one task with a hard deadline, on its own thread.
 
         A fresh thread per run, not a shared worker pool. With a pool of one, a
@@ -447,14 +526,15 @@ class Daemon:
         just moves the ceiling. Daemon threads, so an abandoned run never keeps
         the process alive at exit.
         """
+        prompt = task.prompt if prompt is None else prompt
         if not self.task_timeout:
-            return self._run_prompt(task.prompt)
+            return self._run_prompt(prompt, min_tier=min_tier, thorough=thorough)
 
         box: dict[str, Any] = {}
 
         def target() -> None:
             try:
-                box["value"] = self._run_prompt(task.prompt)
+                box["value"] = self._run_prompt(prompt, min_tier=min_tier, thorough=thorough)
             except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
                 box["error"] = exc
 
@@ -469,7 +549,7 @@ class Daemon:
             raise box["error"]
         return box["value"]
 
-    def _run_prompt(self, prompt: str):
+    def _run_prompt(self, prompt: str, *, min_tier: Any = None, thorough: bool = False):
         # A fresh conversation per run: a nightly task should not inherit
         # yesterday's context. Long-term memory is shared, so it still can.
         self.agent.conversation = Conversation()
@@ -481,7 +561,12 @@ class Daemon:
         current = getattr(self.agent, "max_seconds", None)
         if self.task_timeout and isinstance(current, (int, float)):
             self.agent.max_seconds = min(current, self.task_timeout * 0.9)
-        return self.agent.chat(prompt)
+        # kwargs, because the agent is injectable and a stand-in in the tests
+        # need not accept the newer arguments.
+        try:
+            return self.agent.chat(prompt, min_tier=min_tier, thorough=thorough)
+        except TypeError:
+            return self.agent.chat(prompt)
 
     def _deliver(self, notification: Notification) -> bool:
         try:

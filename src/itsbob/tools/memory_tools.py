@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..memory.base import Horizon, MemoryKind, MemoryRecord, Subject
+from ..memory.base import SHORT_TTL_SECONDS as _SHORT_TTL_SECONDS
+from ..memory.base import Horizon, MemoryKind, MemoryRecord, Subject, short_ttl_for
 from .base import Risk, Tool, ToolContext, ToolError, ToolResult
 
 __all__ = ["memory_tools"]
@@ -29,7 +30,9 @@ def _store(ctx: ToolContext):
 
 
 #: A short-horizon memory written by hand lasts this long unless promoted.
-SHORT_TTL_SECONDS = 6 * 3600.0
+#: Re-exported so callers that import it from here keep working; the rule that
+#: scales it by importance lives in one place, next to the reasoning for it.
+SHORT_TTL_SECONDS = _SHORT_TTL_SECONDS
 
 
 def _remember(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -47,7 +50,9 @@ def _remember(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
         subject=subject,
         horizon=horizon,
         expires_at=(
-            time.time() + SHORT_TTL_SECONDS if horizon is Horizon.SHORT else None
+            time.time() + short_ttl_for(float(params.get("importance", 0.6)))
+            if horizon is Horizon.SHORT
+            else None
         ),
         importance=float(params.get("importance", 0.6)),
         tags=tuple(params.get("tags") or ()),

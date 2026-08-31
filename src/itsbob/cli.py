@@ -328,21 +328,36 @@ def _cmd_task(args: argparse.Namespace) -> int:
             state = "on " if task.enabled else "off"
             print(
                 f"[{state}] {task.id}  {task.name:<22} {task.schedule:<20} "
-                f"next {when:<10} runs={task.run_count} {task.last_status or ''}"
+                f"next {when:<10} {task.grade:<4} {task.effort:<5} "
+                f"runs={task.run_count} {task.last_status or ''}"
             )
         return 0
 
     if action == "add":
         task = store.create(
-            args.name, args.prompt, args.schedule, notify=not args.quiet, max_runs=args.max_runs
+            args.name, args.prompt, args.schedule, notify=not args.quiet,
+            max_runs=args.max_runs, grade=args.grade,
+            effort="quick" if args.quick else "full",
+            attempts=1 if args.no_retry else 2,
         )
         print(f"added {task.id}  {task.name}  ({task.schedule}), next {_ago(task.next_run)}")
+        print(f"      grade {task.grade}, {task.effort} effort, "
+              + ("no retry" if task.attempts <= 1 else f"up to {task.attempts} attempts"))
         return 0
 
     task = store.find(args.name)
     if task is None:
         print(f"no task named or numbered {args.name!r}", file=sys.stderr)
         return 1
+
+    if action == "set":
+        updated = store.update(
+            task.id, grade=args.grade, effort=args.effort,
+            schedule=args.schedule, prompt=args.prompt, attempts=args.attempts,
+        )
+        print(f"{updated.name}: grade {updated.grade}, {updated.effort} effort, "
+              f"{updated.schedule}, next {_ago(updated.next_run)}")
+        return 0
 
     if action == "remove":
         store.remove(task.id)
@@ -751,7 +766,14 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"      xdotool:    {browsers['xdotool']['why']}")
 
     if deepseek_on():
+        from .agent.delegation import DelegatePolicy
+
+        policy = DelegatePolicy.from_env()
         print(f"  ok {'deepseek':<10} on — hard questions go to the browser, free")
+        print(
+            f"      only Tier S, only when no tool is needed, at most "
+            f"{policy.per_hour}/hour and never under {policy.min_chars} characters"
+        )
         if not preferred:
             print("      !! but there is no browser to drive, so every call will fail")
     else:
@@ -1123,6 +1145,19 @@ def _build_parser() -> argparse.ArgumentParser:
     add_task.add_argument("schedule", help="'every 30m', 'weekdays at 08:30', 'at 2026-09-01T06:00'")
     add_task.add_argument("--quiet", action="store_true", help="never notify, whatever it finds")
     add_task.add_argument("--max-runs", type=int, help="retire after this many runs")
+    add_task.add_argument(
+        "--grade", default="auto", choices=("auto", "C", "B", "A", "S"),
+        help="floor on how hard to think. auto classifies each run; S for work that must be right",
+    )
+    add_task.add_argument(
+        "--quick", action="store_true",
+        help="a one-line check rather than the full job (the default is full)",
+    )
+    add_task.add_argument(
+        "--no-retry", action="store_true",
+        help="do not re-run at a higher grade when a run does not do what was asked",
+    )
+
     add_task.set_defaults(handler=_cmd_task)
     for name, help_text in (
         ("remove", "delete a task"),
@@ -1133,6 +1168,16 @@ def _build_parser() -> argparse.ArgumentParser:
         sub = task_subs.add_parser(name, help=help_text)
         sub.add_argument("name", help="task id or name")
         sub.set_defaults(handler=_cmd_task)
+    set_task = task_subs.add_parser(
+        "set", help="change a task's grade, effort, schedule or instruction"
+    )
+    set_task.add_argument("name", help="task id or name")
+    set_task.add_argument("--grade", choices=("auto", "C", "B", "A", "S"))
+    set_task.add_argument("--effort", choices=("full", "quick"))
+    set_task.add_argument("--schedule")
+    set_task.add_argument("--prompt")
+    set_task.add_argument("--attempts", type=int, help="tries at a higher grade; 1 disables")
+    set_task.set_defaults(handler=_cmd_task)
     run_task = with_mode(task_subs.add_parser("run", help="run a task now, off-schedule"))
     run_task.add_argument("name")
     run_task.set_defaults(handler=_cmd_task)

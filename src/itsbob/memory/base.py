@@ -12,6 +12,10 @@ from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 
 __all__ = [
     "Horizon",
+    "SHORT_TTL_SECONDS",
+    "VITAL_GRACE",
+    "VITAL_IMPORTANCE",
+    "short_ttl_for",
     "MemoryKind",
     "MemoryRecord",
     "Subject",
@@ -83,7 +87,9 @@ class Horizon(str, Enum):
         picking between forty near-identical rows, each surfacing with equal
         confidence, and the one you wanted is no likelier than the rest. So a
         memory starts in the working set and *earns* permanence — by being
-        recalled again, by being marked important, or by being kept on purpose.
+        recalled again, or by being kept on purpose with an explicit
+        ``remember``. Being *scored* important at the moment of writing is not
+        one of the ways: see :func:`short_ttl_for`.
         """
         if isinstance(value, cls):
             return value
@@ -91,6 +97,41 @@ class Horizon(str, Enum):
         if text in ("long", "long_term", "long-term", "permanent", "durable", "forever"):
             return cls.LONG
         return cls.SHORT
+
+
+#: How long an ordinary short-horizon memory lives before the working set
+#: drops it. Long enough to carry a conversation, short enough that a busy
+#: afternoon does not become the corpus.
+SHORT_TTL_SECONDS = 6 * 3600.0
+
+#: Scored at least this highly at the moment of writing.
+VITAL_IMPORTANCE = 0.85
+
+#: ...and so given this much longer to prove it. Six hours becomes seven days.
+VITAL_GRACE = 28.0
+
+
+def short_ttl_for(importance: float) -> float:
+    """How long a short-horizon memory gets before the working set drops it.
+
+    Importance buys *time*, never permanence. That distinction is the whole
+    design, and it exists because the two obvious rules are both wrong.
+
+    Promoting on a high score alone means the writer decides permanence at the
+    one moment it is least able to: everything just said looks like it matters,
+    and a model asked to rate what it has written says so nearly every time.
+    That is what fills the store with rows nobody reads.
+
+    But expiring everything at six hours regardless is worse in a rarer and
+    more costly way. "Allergic to penicillin" scored 0.95 and never asked about
+    again that afternoon is gone by evening, and the one memory whose loss
+    actually matters is the one thrown away.
+
+    So a high score does not make a memory permanent — it keeps it alive long
+    enough to be recalled, and being recalled is what earns permanence. If it
+    is never useful in a week, it was not worth keeping.
+    """
+    return SHORT_TTL_SECONDS * (VITAL_GRACE if importance >= VITAL_IMPORTANCE else 1.0)
 
 
 class MemoryKind(str, Enum):

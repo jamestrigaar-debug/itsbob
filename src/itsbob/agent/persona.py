@@ -57,6 +57,7 @@ class Persona:
         background: str = "",
         brief: bool = False,
         continuing: bool = False,
+        thorough: bool = False,
     ) -> str:
         """The system prompt for one step.
 
@@ -66,6 +67,10 @@ class Persona:
         actions, and every one of them is billed on every step. The output
         contract, the tool list and the memory-attribution rule always survive,
         because those are the three things that break silently when they go.
+
+        ``thorough`` is for work nobody is watching. A scheduled task has no
+        one to read a three-line answer and say "no, properly" — so the request
+        to do it properly has to be in the prompt from the start.
         """
         if brief:
             return self._render_brief(
@@ -171,6 +176,20 @@ class Persona:
             if tool_names
             else ""
         )
+        if thorough:
+            blocks += [
+                "",
+                "## This one is not a chat message",
+                "Nobody is waiting on this and nobody will read it and ask for more. "
+                "Whatever you produce is the finished thing, so finish it.",
+                "- Take the steps it needs. Look things up rather than reasoning from "
+                "what you happen to know, and check a second source where one exists.",
+                "- Asked for a report, a summary or a review: write the whole thing. "
+                "Sections, every item found and not a count of them, the figures "
+                "themselves, and what they mean. Length is not the goal; completeness is.",
+                "- If part of it could not be done, say which part and why, in the "
+                "answer. Do not quietly narrow the job to the part that worked.",
+            ]
         blocks += [
             "",
             "## Output format",

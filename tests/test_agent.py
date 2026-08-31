@@ -759,3 +759,135 @@ def test_standing_style_preferences_reach_every_prompt(tmp_path):
     )
     assert "Always list every match in full" in system
     assert "How this user wants to be answered" in system or "How to answer" in system
+
+
+def test_automatic_extraction_never_writes_straight_to_long_term():
+    """Whatever the model says, and it says "long" often.
+
+    Extraction happens at the one moment least suited to judging permanence:
+    everything just said looks like it matters. So the horizon it proposes is
+    ignored outright, and permanence is earned afterwards by being recalled.
+    """
+    from itsbob.memory.base import Horizon
+
+    store = LongTermMemory(":memory:", embedder=None)
+    brain = FakeBrain(
+        [
+            {
+                "memories": [
+                    {"content": "the user commutes from Reading", "subject": "user",
+                     "horizon": "long", "importance": 0.9},
+                    {"content": "the user prefers tea", "subject": "user",
+                     "horizon": "permanent", "importance": 0.99},
+                ]
+            }
+        ]
+    )
+    written = MemoryWriter(brain=brain, store=store).write(
+        message="I commute from Reading and I only drink tea", answer="Noted."
+    )
+
+    assert len(written) == 2
+    for record in written:
+        assert record.horizon is Horizon.SHORT
+        assert record.expires_at is not None, "a short memory with no clock never expires"
+    assert store.counts_by("horizon") == {"short": 2}
+
+
+def test_an_explicit_remember_may_still_write_long_term(tmp_path):
+    """The user asking for something to be kept is a different act entirely."""
+    from itsbob.memory.base import Horizon
+
+    store = LongTermMemory(":memory:", embedder=None)
+    toolbox = build_toolbox(memory=store, workspace=tmp_path / "ws", mode=Mode.TRUSTED, env={})
+    toolbox.call(
+        "remember", content="the wifi password is on the router", horizon="long"
+    )
+    kept = store.all()[0]
+    assert kept.horizon is Horizon.LONG
+    assert kept.expires_at is None
+
+
+# -- the expensive turn that did not cost anything --------------------------
+
+
+def _fixed_tier(tier):
+    """A gatekeeper that always lands on one tier, so the test is about routing."""
+    from itsbob.router.tiers import GateDecision
+
+    class Fixed:
+        def classify(self, snapshot):
+            return GateDecision(tier=tier, fingerprint="test", source="test")
+
+    return Fixed()
+
+
+def test_a_hard_thinking_turn_is_answered_free_and_never_reaches_the_tier(tmp_path):
+    from itsbob.agent.delegation import DelegatePolicy
+    from itsbob.integrations.delegate import Delegation
+
+    class Free:
+        def ask(self, question, context=""):
+            return Delegation(
+                question=question,
+                answer="Renting keeps you liquid; buying builds equity. Over ten years...",
+                ok=True,
+                source="deepseek",
+            )
+
+    hard = (
+        "Talk me through the trade-offs between renting and buying somewhere to "
+        "live over a ten year horizon, assuming rates stay roughly where they "
+        "are and I might move cities once in that time."
+    )
+    agent = _agent(tmp_path, [{"final": "the paid tier answered"}])
+    agent.delegation = DelegatePolicy(delegate=Free())
+    agent.gatekeeper = _fixed_tier(Tier.S)
+
+    turn = agent.chat(hard)
+    assert turn.final.startswith("Renting keeps you liquid")
+    assert turn.delegated is True
+    # The point of the exercise: no step ran, so no premium tokens were spent.
+    assert turn.steps == [] and turn.tokens == 0
+
+
+def test_when_the_free_path_fails_the_turn_runs_exactly_as_it_would_have(tmp_path):
+    """The failure mode is "you paid for the answer", never a worse one."""
+    from itsbob.agent.delegation import DelegatePolicy
+
+    class Broken:
+        def ask(self, question, context=""):
+            raise RuntimeError("the site is asking for a login")
+
+    hard = (
+        "Talk me through the trade-offs between renting and buying somewhere to "
+        "live over a ten year horizon, assuming rates stay roughly where they "
+        "are and I might move cities once in that time."
+    )
+    agent = _agent(tmp_path, [{"final": "the paid tier answered"}])
+    agent.delegation = DelegatePolicy(delegate=Broken())
+    agent.gatekeeper = _fixed_tier(Tier.S)
+
+    turn = agent.chat(hard)
+    assert turn.final == "the paid tier answered"
+    assert turn.delegated is False
+    assert len(turn.steps) == 1
+
+
+def test_a_turn_that_needs_a_tool_is_never_handed_out(tmp_path):
+    from itsbob.agent.delegation import DelegatePolicy
+
+    class NeverCalled:
+        def ask(self, question, context=""):
+            raise AssertionError("sent a tool question to something with no tools")
+
+    agent = _agent(tmp_path, [{"final": "read it myself"}])
+    agent.delegation = DelegatePolicy(delegate=NeverCalled())
+    agent.gatekeeper = _fixed_tier(Tier.S)
+
+    turn = agent.chat(
+        "Read through the build log in the workspace and work out which step "
+        "first failed, then tell me what the underlying cause actually was."
+    )
+    assert turn.final == "read it myself"
+    assert turn.delegated is False

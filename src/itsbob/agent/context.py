@@ -75,6 +75,9 @@ class Turn:
     stopped_because: str | None = None
     #: Set when the answer announced a list and had to be asked to pay it out.
     rewritten_for_completeness: bool = False
+    #: Set when a free reasoner answered instead of the tier this was routed
+    #: to. Recorded because "that one was free" is the number worth watching.
+    delegated: bool = False
 
     @property
     def tools_used(self) -> list[str]:
@@ -95,6 +98,7 @@ class Turn:
             "extensions": self.extensions,
             "stopped_because": self.stopped_because,
             "rewritten_for_completeness": self.rewritten_for_completeness,
+            "delegated": self.delegated,
         }
 
 
@@ -192,6 +196,7 @@ def build_messages(
     memory_limit: int = 6,
     tool_names: Sequence[str] = (),
     brief: bool = False,
+    thorough: bool = False,
     continuing: bool = False,
     full_observations: int = 3,
     observation_chars: int = 3000,
@@ -238,6 +243,7 @@ def build_messages(
                 tool_names=tuple(tool_names),
                 background=background,
                 brief=brief,
+                thorough=thorough,
                 continuing=continuing,
             )
         )
