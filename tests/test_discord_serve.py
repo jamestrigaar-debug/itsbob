@@ -390,3 +390,203 @@ def test_an_unwritable_home_answers_rather_than_going_quiet(tmp_path):
     lease = DiscordLease(path=tmp_path / "nope" / "x" / "discord.lease", role="daemon")
     lease.path = tmp_path / "\0bad" / "discord.lease"  # unwritable by construction
     assert lease.hold() is True
+
+
+# -- the intent, which is what "seen sometimes" actually means ---------------
+
+
+def _gagged(discord, text, *, mentions_bot=False, author_id="U1"):
+    """A message as a bot without the Message Content intent receives it.
+
+    Discord still sends the envelope — id, author, mentions — and removes the
+    text, unless the message tags the bot, in which case it arrives intact.
+    That split is the whole bug: the channel works when you @ it.
+    """
+    with discord.lock:
+        discord.inbox.append(
+            {
+                "id": f"MSG{len(discord.inbox) + 1}",
+                "content": (f"<@BOT1> {text}" if mentions_bot else ""),
+                "author": {"id": author_id, "username": "james"},
+                "mentions": [{"id": "BOT1"}] if mentions_bot else [],
+            }
+        )
+
+
+def test_a_message_with_nothing_in_it_at_all_cannot_be_real(discord):
+    from itsbob.integrations.discord import content_withheld
+
+    # Discord refuses to post one of these, so receiving one means the text
+    # was taken out on the way. Anything that could have carried the message
+    # instead is a real, empty-texted message and must not be flagged.
+    assert content_withheld({"content": "", "author": {"id": "U1"}}) is True
+    assert content_withheld({"content": "   ", "author": {"id": "U1"}}) is True
+    for carrier in ("attachments", "embeds", "sticker_items", "poll"):
+        assert content_withheld(
+            {"content": "", "author": {"id": "U1"}, carrier: [{"x": 1}]}
+        ) is False
+    assert content_withheld({"content": "hello", "author": {"id": "U1"}}) is False
+    # The bot's own posts are not evidence of anything.
+    assert content_withheld({"content": "", "author": {"id": "B", "bot": True}}) is False
+
+
+def test_the_intent_warning_fires_when_only_some_messages_are_readable(discord):
+    """The case the old check could not see.
+
+    It required *every* message from a person to be blank. But a bot without
+    the intent reads the tagged ones perfectly, so in any real channel some
+    always have content — and the warning that would have explained the whole
+    problem sat there never firing.
+    """
+    submitted = []
+    bridge = _bridge(discord, submitted)
+    _gagged(discord, "what is the weather")               # unreadable
+    _gagged(discord, "and the score", mentions_bot=True)  # readable, because tagged
+
+    assert bridge.poll_once() == 1
+    assert [text for text, _ in submitted] == ["and the score"]
+
+    assert bridge.content_warning is not None
+    assert "MESSAGE CONTENT INTENT" in bridge.content_warning
+    assert "developers" in bridge.content_warning
+    # And it says what the person actually observed, so they recognise it.
+    assert "sometimes and not others" in bridge.content_warning
+
+
+def test_unreadable_messages_are_counted_not_silently_dropped(discord):
+    submitted = []
+    bridge = _bridge(discord, submitted)
+    _gagged(discord, "one")
+    _gagged(discord, "two")
+    _gagged(discord, "three", mentions_bot=True)
+    bridge.poll_once()
+
+    assert bridge.withheld == 2
+    assert bridge.status()["withheld"] == 2
+    # Dropping them in silence is what made a permission problem look like
+    # flakiness; the count is what shows it is still happening.
+    assert len(submitted) == 1
+
+
+def test_a_single_unreadable_message_is_enough_to_warn(discord):
+    submitted = []
+    bridge = _bridge(discord, submitted)
+    _gagged(discord, "hello")
+    bridge.poll_once()
+    assert bridge.content_warning is not None
+
+
+def test_the_check_separates_reaching_the_channel_from_reading_it(discord):
+    """`doctor` reported the first and called it the second."""
+    client = DiscordClient(token="t", channel_id="CHAN1")
+
+    ok, detail = client.check()
+    assert ok is True
+    # It must no longer claim it can read what people type — that is the
+    # sentence that made this look configured while it was broken.
+    assert "can read it" not in detail
+
+    # Nothing to go on yet: no opinion, rather than a wrong one.
+    readable, why = client.intent_check()
+    assert readable is None and "no recent messages" in why
+
+    _gagged(discord, "what is the weather")
+    readable, why = client.intent_check()
+    assert readable is False
+    assert "1 of 1" in why and "MESSAGE CONTENT INTENT" in why
+
+
+def test_the_check_passes_once_the_intent_is_on(discord):
+    client = DiscordClient(token="t", channel_id="CHAN1")
+    discord.human("what is the weather")
+    discord.human("and the score", mentions_bot=True)
+
+    readable, why = client.intent_check()
+    assert readable is True
+    assert "2 recent message" in why
+
+
+# -- handover, the other way a message goes missing -------------------------
+
+
+def test_standby_follows_the_holder_instead_of_the_clock(discord, tmp_path):
+    """A takeover must not skip what the previous holder never answered.
+
+    Standby used to jump its cursor to the newest message on every poll. That
+    cost an API call per poll from a process doing nothing, and — worse — it
+    stepped over everything the holder had not got to yet. A holder that died
+    mid-turn took those messages with it, and nobody ever answered them.
+    """
+    from itsbob.integrations.lease import DiscordLease
+
+    submitted_a, submitted_b = [], []
+    holder = _bridge(discord, submitted_a)
+    holder.lease = DiscordLease(path=tmp_path / "lease", role="daemon")
+    standby = _bridge(discord, submitted_b)
+    standby.lease = DiscordLease(path=tmp_path / "lease", role="browser")
+
+    discord.human("first question")
+    assert holder.poll_once() == 1          # the holder takes the lease
+    assert standby.poll_once() == 0         # and the other stands by
+    assert standby.standby is True
+
+    # Three more arrive. The holder dies before it polls again, so it never
+    # sees them — which is exactly when the handover has to be lossless.
+    discord.human("second question")
+    discord.human("third question")
+    discord.human("fourth question")
+    assert standby.poll_once() == 0         # still in standby, lease still fresh
+    holder.lease.release()
+
+    assert standby.poll_once() == 3
+    assert [text for text, _ in submitted_b] == [
+        "second question", "third question", "fourth question",
+    ]
+
+
+def test_a_takeover_does_not_re_answer_what_the_holder_already_did(discord, tmp_path):
+    from itsbob.integrations.lease import DiscordLease
+
+    submitted_a, submitted_b = [], []
+    holder = _bridge(discord, submitted_a)
+    holder.lease = DiscordLease(path=tmp_path / "lease", role="daemon")
+    standby = _bridge(discord, submitted_b)
+    standby.lease = DiscordLease(path=tmp_path / "lease", role="browser")
+
+    discord.human("answered by the first one")
+    holder.poll_once()
+    standby.poll_once()
+    holder.lease.release()
+
+    assert standby.poll_once() == 0
+    assert submitted_b == []
+
+
+def test_the_lease_remembers_how_far_the_holder_got(tmp_path):
+    from itsbob.integrations.lease import DiscordLease
+
+    lease = DiscordLease(path=tmp_path / "lease", role="daemon")
+    assert lease.last_answered() is None
+    lease.mark_answered("MSG1")
+    lease.mark_answered("MSG2")
+    assert lease.last_answered() == "MSG2"
+    # It is a high-water mark, so re-marking something older does not move it.
+    lease.mark_answered("MSG1")
+    assert lease.last_answered() == "MSG2"
+
+
+def test_standing_by_costs_no_discord_calls(discord, tmp_path):
+    from itsbob.integrations.lease import DiscordLease
+
+    holder = _bridge(discord, [])
+    holder.lease = DiscordLease(path=tmp_path / "lease", role="daemon")
+    standby = _bridge(discord, [])
+    standby.lease = DiscordLease(path=tmp_path / "lease", role="browser")
+
+    discord.human("hello")
+    holder.poll_once()
+
+    before = standby.client.received
+    for _ in range(5):
+        standby.poll_once()
+    assert standby.client.received == before, "a standby process is polling Discord"
