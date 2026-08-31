@@ -447,11 +447,11 @@ def test_duckduckgo_markup_is_unwrapped_into_real_urls():
 
 def test_an_image_is_downscaled_before_it_is_uploaded(tmp_path):
     pillow = pytest.importorskip("PIL.Image")
-    from itsbob.tools.vision import MAX_EDGE, _prepare
+    from itsbob.tools.vision import MAX_EDGE, prepare_image
 
     big = tmp_path / "big.png"
     pillow.new("RGB", (3000, 2000), "red").save(big)
-    data, mime = _prepare(big)
+    data, mime = prepare_image(big)
     assert mime == "image/jpeg"
     with pillow.open(__import__("io").BytesIO(data)) as shrunk:
         assert max(shrunk.size) <= MAX_EDGE
@@ -663,3 +663,189 @@ def test_initiative_never_gets_in_front_of_a_person(tmp_path):
     initiative.due()
     runner = Autonomous(BusySession(), Tasks(), initiative=initiative)
     assert runner._poll() == []
+
+
+# -- looking at the screen -------------------------------------------------
+
+
+def _ctx(tmp_path, **env):
+    from itsbob.tools import build_toolbox
+
+    return build_toolbox(
+        workspace=tmp_path / "ws", mode="trusted", env={"GOOGLE_API_KEY": "k", **env}
+    ).context()
+
+
+def _fake_capture(monkeypatch, note=""):
+    """Stand in for the native screenshot binary, which no CI box has."""
+    from pathlib import Path
+
+    from itsbob.scripts import screen_reader
+    from itsbob.scripts.screenshot import Capture
+
+    def capture(destination, *, window=False, env=None):
+        Path(destination).parent.mkdir(parents=True, exist_ok=True)
+        Path(destination).write_bytes(b"pretend-png")
+        return Capture(
+            path=Path(destination), backend="grim", window=window, bytes=11, note=note
+        )
+
+    monkeypatch.setattr(screen_reader, "capture", capture)
+
+
+def test_looking_at_the_screen_is_one_step_not_two(tmp_path, monkeypatch):
+    """Capture, then read the path out, then call vision, is two model calls."""
+    from itsbob.scripts import screen_reader
+
+    _fake_capture(monkeypatch)
+    monkeypatch.setattr(screen_reader, "prepare_image", lambda p: (b"jpeg", "image/jpeg"))
+    asked = {}
+
+    def describe(*, data, mime, prompt, api_key, models):
+        asked.update(prompt=prompt, key=api_key)
+        return "A terminal showing a failing test.", models[0]
+
+    monkeypatch.setattr(screen_reader, "describe_image", describe)
+
+    result = screen_reader.tools()[0].run({}, _ctx(tmp_path))
+    assert result.ok
+    assert "A terminal showing a failing test." in result.output
+    assert "transcribe" in asked["prompt"]  # the default question asks for text
+    assert asked["key"] == "k"
+
+
+def test_the_captured_image_is_cleaned_up_unless_you_ask_to_keep_it(tmp_path, monkeypatch):
+    """'What does that dialog say' is not a question about a PNG."""
+    from pathlib import Path
+
+    from itsbob.scripts import screen_reader
+
+    _fake_capture(monkeypatch)
+    monkeypatch.setattr(screen_reader, "prepare_image", lambda p: (b"x", "image/jpeg"))
+    monkeypatch.setattr(
+        screen_reader, "describe_image", lambda **kw: ("something", "gemini-3.5-flash")
+    )
+    shots = Path(tmp_path / "ws" / "screenshots")
+
+    screen_reader.look(_ctx(tmp_path))
+    assert list(shots.glob("*.png")) == []
+
+    sight = screen_reader.look(_ctx(tmp_path), keep=True)
+    assert sight.kept and sight.path.is_file()
+    assert sight.as_dict()["path"] == str(sight.path)
+
+
+def test_a_failed_look_does_not_leave_litter(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from itsbob.scripts import screen_reader
+    from itsbob.tools.base import ToolError
+
+    _fake_capture(monkeypatch)
+    monkeypatch.setattr(screen_reader, "prepare_image", lambda p: (b"x", "image/jpeg"))
+
+    def boom(**kw):
+        raise ToolError("no vision model answered")
+
+    monkeypatch.setattr(screen_reader, "describe_image", boom)
+    with pytest.raises(ToolError):
+        screen_reader.look(_ctx(tmp_path))
+    assert list(Path(tmp_path / "ws" / "screenshots").glob("*.png")) == []
+
+
+def test_a_missing_vision_key_is_caught_before_the_screenshot(tmp_path, monkeypatch):
+    """Capturing an image nobody can read wastes the capture and explains nothing."""
+    from itsbob.scripts import screen_reader
+    from itsbob.tools.base import ToolError
+
+    def must_not_run(*a, **k):
+        raise AssertionError("captured before checking it could be read")
+
+    monkeypatch.setattr(screen_reader, "capture", must_not_run)
+    ctx = _ctx(tmp_path)
+    ctx.env = {}
+    with pytest.raises(ToolError, match="GOOGLE_API_KEY"):
+        screen_reader.look(ctx)
+
+
+def test_a_window_fallback_is_reported_in_the_answer(tmp_path, monkeypatch):
+    from itsbob.scripts import screen_reader
+
+    _fake_capture(monkeypatch, note="(active-window capture is not available)")
+    monkeypatch.setattr(screen_reader, "prepare_image", lambda p: (b"x", "image/jpeg"))
+    monkeypatch.setattr(screen_reader, "describe_image", lambda **kw: ("a browser", "m"))
+    result = screen_reader.tools()[1].run({}, _ctx(tmp_path))
+    assert "not available" in result.output
+
+
+def test_looking_at_a_saved_image_stays_inside_the_workspace(tmp_path, monkeypatch):
+    from itsbob.scripts import screen_reader
+    from itsbob.tools.base import ToolDenied
+
+    monkeypatch.setattr(screen_reader, "prepare_image", lambda p: (b"x", "image/jpeg"))
+    monkeypatch.setattr(screen_reader, "describe_image", lambda **kw: ("a chart", "m"))
+
+    (tmp_path / "ws").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ws" / "chart.png").write_bytes(b"png")
+    assert "a chart" in screen_reader.read_image(_ctx(tmp_path), path="chart.png").answer
+
+    outside = tmp_path / "private.png"
+    outside.write_bytes(b"png")
+    with pytest.raises(ToolDenied):
+        screen_reader.read_image(_ctx(tmp_path), path=str(outside))
+
+
+def test_the_screen_tools_are_registered_and_described(tmp_path):
+    from itsbob.scripts import describe_scripts, script_tools
+
+    names = [t.name for t in script_tools({})]
+    assert {"look_at_screen", "look_at_window", "look_at_image"} <= set(names)
+    row = next(r for r in describe_scripts({}) if r["name"] == "screen_reader")
+    assert row["summary"].startswith("Look at the screen")
+    assert len(row["tools"]) == 3
+
+
+# -- setup asks for the optional capabilities ------------------------------
+
+
+def test_setup_offers_every_capability_with_the_variable_that_enables_it():
+    from itsbob.setup_wizard import SERVICE_KEYS
+
+    named = {s.env for s in SERVICE_KEYS}
+    assert {
+        "DISCORD_BOT_TOKEN", "OPENWEATHER_API_KEY", "NEWSAPI_KEY",
+        "GNEWS_API_KEY", "FOOTBALL_DATA_KEY",
+    } <= named
+    for service in SERVICE_KEYS:
+        assert service.gives and service.url.startswith("https://")
+    discord = next(s for s in SERVICE_KEYS if s.env == "DISCORD_BOT_TOKEN")
+    assert discord.also == "DISCORD_CHANNEL_ID"
+
+
+def test_half_a_two_part_credential_is_dropped(monkeypatch):
+    """A bot token with no channel id does nothing, so it is not written."""
+    from itsbob import setup_wizard
+
+    monkeypatch.setattr(setup_wizard, "_confirm", lambda p, default=True: "Discord" in p or default)
+    answers = iter(["a-token", ""])  # token given, channel id skipped
+    monkeypatch.setattr(setup_wizard, "_ask", lambda *a, **k: next(answers, ""))
+    monkeypatch.setattr(setup_wizard, "_say", lambda *a, **k: None)
+    for service in setup_wizard.SERVICE_KEYS:
+        monkeypatch.delenv(service.env, raising=False)
+
+    collected = setup_wizard._ask_for_services()
+    assert "DISCORD_BOT_TOKEN" not in collected
+    assert "DISCORD_CHANNEL_ID" not in collected
+
+
+def test_setup_skips_what_is_already_configured(monkeypatch):
+    from itsbob import setup_wizard
+
+    for service in setup_wizard.SERVICE_KEYS:
+        monkeypatch.setenv(service.env, "already-set")
+    monkeypatch.setattr(setup_wizard, "_say", lambda *a, **k: None)
+    monkeypatch.setattr(
+        setup_wizard, "_confirm",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked about a set key")),
+    )
+    assert setup_wizard._ask_for_services() == {}

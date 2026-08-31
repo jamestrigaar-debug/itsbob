@@ -68,6 +68,7 @@ CURATED = (
     "process_manager",
     "file_cleaner",
     "screenshot",
+    "screen_reader",
     "scheduler",
 )
 

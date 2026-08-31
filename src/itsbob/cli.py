@@ -836,13 +836,23 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_setup(args: argparse.Namespace) -> int:
-    from .setup_wizard import run_setup
+    from .setup_wizard import SERVICE_KEYS, run_setup
 
     keys = {}
     for name in ("google", "groq", "openrouter"):
         value = getattr(args, f"{name}_key", None)
         if value:
             keys[f"{name.upper()}_API_KEY"] = value.strip()
+    # The capability keys take the same route, so an unattended install can set
+    # everything up in one command rather than the providers here and the rest
+    # by hand in `.env`.
+    for service in SERVICE_KEYS:
+        for env in (service.env, service.also):
+            if not env:
+                continue
+            value = getattr(args, env.lower(), None)
+            if value:
+                keys[env] = str(value).strip()
     return run_setup(
         home=_home(args),
         keys=keys or None,
@@ -965,6 +975,22 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--groq-key", help="set GROQ_API_KEY without being prompted")
     setup.add_argument("--openrouter-key", help="set OPENROUTER_API_KEY without being prompted")
     setup.add_argument("--no-verify", action="store_true", help="skip the live API check")
+    # One flag per optional capability, derived from the same list the wizard
+    # prompts from, so adding a service never means remembering to add a flag.
+    from .setup_wizard import SERVICE_KEYS as _SERVICES
+
+    for _service in _SERVICES:
+        setup.add_argument(
+            f"--{_service.env.lower().replace('_', '-')}",
+            dest=_service.env.lower(),
+            help=f"set {_service.env} without being prompted ({_service.label})",
+        )
+        if _service.also:
+            setup.add_argument(
+                f"--{_service.also.lower().replace('_', '-')}",
+                dest=_service.also.lower(),
+                help=f"set {_service.also} without being prompted",
+            )
     setup.set_defaults(handler=_cmd_setup)
 
     # chat

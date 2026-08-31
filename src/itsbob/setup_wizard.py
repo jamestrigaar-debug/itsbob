@@ -22,9 +22,18 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
+from dataclasses import dataclass
+
 from .config import find_dotenv, itsbob_home, load_dotenv
 
-__all__ = ["run_setup", "write_env", "verify_key", "key_looks_wrong", "DEFAULT_KEYS"]
+__all__ = [
+    "run_setup",
+    "write_env",
+    "verify_key",
+    "key_looks_wrong",
+    "DEFAULT_KEYS",
+    "SERVICE_KEYS",
+]
 
 #: Recognised providers, in the order they are offered. Google first because
 #: one key covers all three tiers, which nothing else does.
@@ -32,6 +41,63 @@ DEFAULT_KEYS = (
     ("GOOGLE_API_KEY", "Google AI Studio", "https://aistudio.google.com/apikey", True),
     ("GROQ_API_KEY", "Groq", "https://console.groq.com/keys", False),
     ("OPENROUTER_API_KEY", "OpenRouter", "https://openrouter.ai/keys", False),
+)
+
+@dataclass(frozen=True)
+class ServiceKey:
+    """One optional capability, and the variable that switches it on.
+
+    Separate from :data:`DEFAULT_KEYS` because the two are different in kind. A
+    provider key is what makes itsbob able to think at all; these each add one
+    capability and are all individually skippable. They are asked for anyway —
+    the previous setup only *reported* them at the end, which meant finding out
+    a capability existed after deciding you had finished configuring.
+    """
+
+    env: str
+    label: str
+    #: What it gives you, in the second person, one line.
+    gives: str
+    url: str
+    #: A second variable the capability also needs (Discord's channel id).
+    also: str = ""
+    also_label: str = ""
+
+
+#: Asked for during setup, in the order most people want them.
+SERVICE_KEYS: tuple[ServiceKey, ...] = (
+    ServiceKey(
+        "DISCORD_BOT_TOKEN",
+        "Discord",
+        "a channel itsbob can post to unprompted, and take messages back from",
+        "https://discord.com/developers/applications  → Bot → Reset Token",
+        also="DISCORD_CHANNEL_ID",
+        also_label="the channel id (right-click the channel → Copy Channel ID)",
+    ),
+    ServiceKey(
+        "OPENWEATHER_API_KEY",
+        "OpenWeather",
+        "the `weather` tool, and half of the daily briefing",
+        "https://openweathermap.org/api  (free tier is plenty)",
+    ),
+    ServiceKey(
+        "NEWSAPI_KEY",
+        "NewsAPI",
+        "the `news` tool, and the other half of the daily briefing",
+        "https://newsapi.org/register",
+    ),
+    ServiceKey(
+        "GNEWS_API_KEY",
+        "GNews",
+        "a second news source, and the fallback when NewsAPI rate-limits",
+        "https://gnews.io/register",
+    ),
+    ServiceKey(
+        "FOOTBALL_DATA_KEY",
+        "football-data.org",
+        "fixtures, standings and scorers",
+        "https://www.football-data.org/client/register",
+    ),
 )
 
 _TICK, _CROSS, _DOT, _WARN = "✓", "✗", "·", "!"
@@ -202,6 +268,59 @@ def write_env(values: Mapping[str, str], *, path: Path | None = None) -> Path:
     return target
 
 
+def _ask_for_services() -> dict[str, str]:
+    """Offer each optional capability once, with what it actually gives you.
+
+    Everything here is skippable and nothing is verified with a live call —
+    these are not providers, and a wizard that spends five API calls proving
+    keys that are allowed to be absent is a wizard people learn to skip.
+    """
+    collected: dict[str, str] = {}
+    pending = [s for s in SERVICE_KEYS if not os.environ.get(s.env, "").strip()]
+    already = [s for s in SERVICE_KEYS if os.environ.get(s.env, "").strip()]
+
+    _say()
+    _say("  Optional capabilities. Skip any of these — each one is independent,")
+    _say("  and itsbob says what is missing rather than breaking without it.")
+    _say()
+    for service in already:
+        _say(f"  {_TICK} {service.label}: already set")
+    if not pending:
+        return collected
+
+    if not _confirm("  Set any of these up now?", default=True):
+        _say(f"  {_DOT} skipped — add them to ~/.itsbob/.env any time, or re-run `itsbob setup`")
+        return collected
+
+    for service in pending:
+        _say()
+        _say(f"  {service.label} — {service.gives}")
+        if not _confirm("    Add it?", default=False):
+            continue
+        _say(f"     Get one at {service.url}")
+        value = _ask(f"     Paste your {service.env} (or press Enter to skip): ", secret=True)
+        if not value:
+            _say(f"     {_DOT} skipped")
+            continue
+        _say(f"     {_DOT} got {fingerprint(value)}")
+        collected[service.env] = value
+
+        if service.also:
+            # Asked for immediately rather than in a second pass: half of a
+            # two-part credential is the same as none of it, and someone who
+            # has just pasted the token has the other half in front of them.
+            second = _ask(f"     And {service.also_label}: ")
+            if second:
+                collected[service.also] = second
+            else:
+                collected.pop(service.env, None)
+                _say(
+                    f"     {_DOT} skipped {service.label} — it needs both "
+                    f"{service.env} and {service.also} to do anything"
+                )
+    return collected
+
+
 def run_setup(
     *,
     home: Path | None = None,
@@ -259,6 +378,12 @@ def run_setup(
                 collected[name] = value
             elif primary:
                 _say(f"     {_DOT} skipped — itsbob will run offline until you add one")
+
+    # 2b. The capability keys. Asked for, not just reported at the end: a
+    #     capability you find out about after you thought you had finished
+    #     configuring is one you will not go back and enable.
+    if interactive and not keys:
+        collected.update(_ask_for_services())
 
     if collected:
         target = write_env(collected)

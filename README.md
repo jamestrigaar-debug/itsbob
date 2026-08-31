@@ -265,6 +265,15 @@ itsbob task add pl "Use the football API (competitions/PL/matches) for today's \
 The weather location defaults to Hull, UK and moves with
 `ITSBOB_WEATHER_PLACE`, `ITSBOB_WEATHER_LAT` and `ITSBOB_WEATHER_LON`.
 
+**It can look at its own screen.** `look_at_screen` captures and reads in a
+single tool call — "what does that error say", "is the build finished yet",
+"what's this chart showing". Doing it as two tools (screenshot, then vision on
+the path) works and is still available, but costs two model calls where one
+does; and the PNG is an implementation detail of the question, so it is
+discarded afterwards unless you pass `keep`. `look_at_window` does the focused
+window, `look_at_image` reads a picture already on disk. All three need
+`GOOGLE_API_KEY`, and say so *before* taking a screenshot nobody could read.
+
 **Web search needs no key at all.** `web_search` uses `ddgr` or `googler` if
 either is installed (`sudo apt install ddgr`), and falls back to DuckDuckGo's
 HTML endpoint otherwise. It is a separate tool rather than a `run_shell`
@@ -479,6 +488,21 @@ works" are different claims, and only the second is worth being told. Because
 they live in the home directory rather than the working directory, the daemon
 and the GUI find them wherever they are started from.
 
+It then offers each optional capability in turn — Discord, OpenWeather,
+NewsAPI, GNews, football-data — saying what each one actually gives you before
+asking for its key. They used to be *reported* at the end instead, which meant
+finding out a capability existed just after deciding you had finished
+configuring. Everything there is skippable, and none of it is verified with a
+live call: they are not providers, and a wizard that spends five API calls
+proving keys that are allowed to be absent is one people learn to skip.
+
+Every one of them also has a flag, so an unattended install is one command:
+
+```bash
+itsbob setup --google-key … --openweather-api-key … --newsapi-key … \
+             --discord-bot-token … --discord-channel-id …
+```
+
 `make help` lists the shortcuts for working *on* itsbob rather than with it.
 
 ### Everything you can put in `~/.itsbob/.env`
@@ -625,7 +649,7 @@ src/itsbob/
     discord.py      the channel as a two-way workspace
   scripts/        what it can do to this machine — drop a file in to add one
     system_monitor.py, network_checker.py, process_manager.py,
-    file_cleaner.py, screenshot.py, scheduler.py
+    file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py
   daemon/         the always-on half
     schedule.py     schedules in words
     tasks.py        SQLite task store and run history
@@ -655,7 +679,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            454 tests, none of which touch the network
+tests/            468 tests, none of which touch the network
 ```
 
 ## The original simulation
