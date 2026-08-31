@@ -13,7 +13,7 @@ instead of reassembling the context each time.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -117,6 +117,11 @@ class Toolbox:
     memory: Any = None
     catalog: ApiCatalog | None = None
     env: Mapping[str, str] | None = None
+    #: Capabilities a tool may need but must not import — chiefly `shape_json`,
+    #: the cheap local model, which the delegation tools use to put someone
+    #: else's prose into a structure. Injected rather than imported so the tool
+    #: layer never reaches back up into the model ladder.
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def context(self, *, dry_run: bool = False, **extras: Any) -> ToolContext:
         return ToolContext(
@@ -126,7 +131,7 @@ class Toolbox:
             audit=self.audit,
             env=self.env if self.env is not None else os.environ,
             dry_run=dry_run,
-            extras=extras,
+            extras={**self.extras, **extras},
         )
 
     def invoke(self, call: ToolCall, *, dry_run: bool = False) -> ToolResult:
@@ -167,6 +172,7 @@ def build_toolbox(
     audit_path: str | Path | None = None,
     extra_tools: Sequence[Tool] = (),
     summarize: Any = None,
+    extras: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Toolbox:
     """Assemble the default toolbox, honouring ``ITSBOB_*`` environment settings.
@@ -203,5 +209,6 @@ def build_toolbox(
         audit=AuditLog(path=Path(audit_path)),
         memory=memory,
         catalog=catalog,
+        extras=dict(extras or {}),
         env=env,
     )
