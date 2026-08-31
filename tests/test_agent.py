@@ -759,3 +759,50 @@ def test_standing_style_preferences_reach_every_prompt(tmp_path):
     )
     assert "Always list every match in full" in system
     assert "How this user wants to be answered" in system or "How to answer" in system
+
+
+def test_automatic_extraction_never_writes_straight_to_long_term():
+    """Whatever the model says, and it says "long" often.
+
+    Extraction happens at the one moment least suited to judging permanence:
+    everything just said looks like it matters. So the horizon it proposes is
+    ignored outright, and permanence is earned afterwards by being recalled.
+    """
+    from itsbob.memory.base import Horizon
+
+    store = LongTermMemory(":memory:", embedder=None)
+    brain = FakeBrain(
+        [
+            {
+                "memories": [
+                    {"content": "the user commutes from Reading", "subject": "user",
+                     "horizon": "long", "importance": 0.9},
+                    {"content": "the user prefers tea", "subject": "user",
+                     "horizon": "permanent", "importance": 0.99},
+                ]
+            }
+        ]
+    )
+    written = MemoryWriter(brain=brain, store=store).write(
+        message="I commute from Reading and I only drink tea", answer="Noted."
+    )
+
+    assert len(written) == 2
+    for record in written:
+        assert record.horizon is Horizon.SHORT
+        assert record.expires_at is not None, "a short memory with no clock never expires"
+    assert store.counts_by("horizon") == {"short": 2}
+
+
+def test_an_explicit_remember_may_still_write_long_term(tmp_path):
+    """The user asking for something to be kept is a different act entirely."""
+    from itsbob.memory.base import Horizon
+
+    store = LongTermMemory(":memory:", embedder=None)
+    toolbox = build_toolbox(memory=store, workspace=tmp_path / "ws", mode=Mode.TRUSTED, env={})
+    toolbox.call(
+        "remember", content="the wifi password is on the router", horizon="long"
+    )
+    kept = store.all()[0]
+    assert kept.horizon is Horizon.LONG
+    assert kept.expires_at is None

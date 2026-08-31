@@ -16,10 +16,13 @@ mentioned any of them. The reply half of a turn is the assistant talking — its
 opinions belong to ``bob``, not to ``user``, and the prompt below says so in the
 one place a model will actually read it.
 
-**Durable, not momentary.** "I'm on the 14:05 train" is true for an hour;
-"I commute from Reading" is true for years. The first is not thrown away now —
-it becomes a short-horizon row that the working set expires on its own — but
-only the second earns a permanent one.
+**Everything written here starts short, without exception.** "I'm on the 14:05
+train" is true for an hour; "I commute from Reading" is true for years — but
+this is the worst possible moment to tell them apart, because it is the moment
+both were just said and both look like they matter. So nothing decided here is
+permanent: a row earns that later, by being recalled again when it turns out to
+be useful. An explicit ``remember`` call is different — that is somebody asking
+for something to be kept, and it may write straight to long-term.
 
 **Deduplicate against what is already known.** Recall runs first and the
 existing memories go into the extraction prompt, because the failure mode of
@@ -38,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from ..llm.base import LLMRequest, system, user
-from ..memory.base import Horizon, MemoryKind, MemoryRecord, Subject
+from ..memory.base import Horizon, MemoryKind, MemoryRecord, Subject, short_ttl_for
 from ..router.tiers import Tier
 
 __all__ = ["MemoryWriter", "ExtractedMemory"]
@@ -59,18 +62,6 @@ _SYSTEM = (
     "a place, a service, a fact.\n"
     "Never turn something Bob said about himself into a fact about the user. "
     "That is the single worst mistake you can make here.\n\n"
-    "## How long it lasts\n"
-    'Default to "short". Almost everything is short. A memory does not need to '
-    "be permanent to be useful, and it can be promoted later if it turns out to "
-    "matter — being recalled again is what earns that. Writing everything down "
-    "forever does not make a good memory, it makes a transcript nobody can "
-    "search.\n"
-    '- horizon "short" — the working set: what is being worked on, a state the '
-    "machine is in, a thread still open, anything you are unsure about.\n"
-    '- horizon "long" — reserved for what will still be true and still be useful '
-    "in a year: a standing preference, a decision and its reason, a person and "
-    "their relationship, where something lives, a commitment with a date. If you "
-    'have to think about whether it qualifies, it is "short".\n\n'
     "## Do not write\n"
     "Restatements of the conversation, tool output, anything already listed as "
     "known below, or anything that would still be obvious without writing it.\n\n"
@@ -79,8 +70,8 @@ _SYSTEM = (
     "write about Bob in the first person ('I liked ...'), so the subject is "
     "unmistakable when it is read back.\n"
     'Reply as strict JSON: {"memories": [{"content": "...", "subject": '
-    '"user|bob|world", "horizon": "long|short", "kind": "fact|preference|'
-    'decision|observation", "importance": 0.0-1.0, "tags": ["short", "labels"]}]}\n'
+    '"user|bob|world", "kind": "fact|preference|decision|observation", '
+    '"importance": 0.0-1.0, "tags": ["short", "labels"]}]}\n'
     "An empty list is the correct answer for most conversations. Prefer writing "
     "nothing to writing something marginal."
 )
@@ -95,14 +86,19 @@ class ExtractedMemory:
     importance: float = 0.6
     tags: tuple[str, ...] = ()
 
-    def to_record(self, *, short_ttl: float = 6 * 3600.0) -> MemoryRecord:
+    def to_record(self, *, short_ttl: float | None = None) -> MemoryRecord:
         return MemoryRecord(
             content=self.content,
             kind=self.kind,
             subject=self.subject,
             horizon=self.horizon,
             expires_at=(
-                time.time() + short_ttl if self.horizon is Horizon.SHORT else None
+                # Scaled by importance, so something that reads as vital gets
+                # long enough to be recalled once and earn permanence properly,
+                # rather than being granted it on its own say-so.
+                time.time() + (short_ttl_for(self.importance) if short_ttl is None else short_ttl)
+                if self.horizon is Horizon.SHORT
+                else None
             ),
             importance=self.importance,
             tags=self.tags,
@@ -176,7 +172,13 @@ class MemoryWriter:
                     content=content,
                     kind=MemoryKind.coerce(item.get("kind")),
                     subject=_reattribute(content, subject),
-                    horizon=Horizon.coerce(item.get("horizon")),
+                    # Never long, whatever the model says. Extraction happens
+                    # at the moment of writing, and that is precisely the moment
+                    # at which everything looks like it might matter — which is
+                    # why permanence is earned by later recall instead. An
+                    # explicit `remember` call, which is the user asking for
+                    # something to be kept, may still write straight to long.
+                    horizon=Horizon.SHORT,
                     importance=_clamp(item.get("importance", 0.6)),
                     tags=tuple(str(t).strip().lower() for t in (item.get("tags") or []) if str(t).strip()),
                 )

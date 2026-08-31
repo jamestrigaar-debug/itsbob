@@ -51,6 +51,9 @@ from typing import Any, Callable, Iterable, Sequence
 from ..store import Database
 from .base import (
     DEFAULT_WEIGHTS,
+    SHORT_TTL_SECONDS,
+    VITAL_GRACE,
+    VITAL_IMPORTANCE,
     Horizon,
     MemoryKind,
     MemoryRecord,
@@ -80,7 +83,7 @@ CREATE TABLE IF NOT EXISTS memories (
     source           TEXT NOT NULL DEFAULT 'agent',
     expires_at       REAL,
     subject          TEXT NOT NULL DEFAULT 'user',
-    horizon          TEXT NOT NULL DEFAULT 'long'
+    horizon          TEXT NOT NULL DEFAULT 'short'
 );
 CREATE TABLE IF NOT EXISTS vectors (
     memory_id  TEXT NOT NULL,
@@ -400,7 +403,7 @@ class LongTermMemory:
     #: prompted this: enough to carry a thread, not enough to become the corpus.
     short_term_capacity: int = 24
     #: And how long one lives regardless of how quiet it has been since.
-    short_term_ttl_seconds: float = 6 * 3600.0
+    short_term_ttl_seconds: float = SHORT_TTL_SECONDS
 
     def prune_short_term(self, *, keep: int | None = None, now: float | None = None) -> int:
         """Expire the short-horizon working set, by clock then by count.
@@ -410,26 +413,37 @@ class LongTermMemory:
         the count alone lets a single row from last Tuesday sit in the working
         set forever because nothing has pushed it out.
 
+        Both limits give way to importance, and in the same way the TTL does:
+        by granting *time*, not permanence. A row scored as vital runs on a
+        longer clock and is not counted against the working set's capacity —
+        because the cap exists to keep the working set small, and a fact worth
+        keeping is not what makes it big. It still has to be recalled to become
+        permanent; this only means it is still there to be recalled.
+
         Long-horizon rows are never touched here — the whole point of promoting
         something to long-term is that this method cannot reach it.
         """
         now = time.time() if now is None else now
         keep = self.short_term_capacity if keep is None else max(0, keep)
         cutoff = now - self.short_term_ttl_seconds
+        vital_cutoff = now - self.short_term_ttl_seconds * VITAL_GRACE
 
         doomed = [
             row["id"]
             for row in self._db.query(
-                "SELECT id FROM memories WHERE horizon = 'short' AND created_at < ?",
-                (cutoff,),
+                "SELECT id FROM memories WHERE horizon = 'short' AND ("
+                "  (importance <  ? AND created_at < ?)"
+                "  OR (importance >= ? AND created_at < ?)"
+                ")",
+                (VITAL_IMPORTANCE, cutoff, VITAL_IMPORTANCE, vital_cutoff),
             )
         ]
         survivors = [
             row["id"]
             for row in self._db.query(
-                "SELECT id FROM memories WHERE horizon = 'short' AND created_at >= ? "
-                "ORDER BY created_at DESC",
-                (cutoff,),
+                "SELECT id FROM memories WHERE horizon = 'short' AND importance < ? "
+                "AND created_at >= ? ORDER BY created_at DESC",
+                (VITAL_IMPORTANCE, cutoff),
             )
         ]
         doomed.extend(survivors[keep:])
@@ -440,25 +454,42 @@ class LongTermMemory:
     #: A short-horizon row recalled this many times has proved it matters.
     #: Two rather than one: surfacing once can be the query being vague.
     promote_after_recalls: int = 2
-    #: Or written down as clearly mattering in the first place.
+    #: Recalls needed when the row was *also* scored as important at writing.
+    #: One rather than none: something nobody has looked at since it was
+    #: written has produced no evidence at all that writing it was right.
+    promote_when_important_after: int = 1
     promote_above_importance: float = 0.85
 
     def consolidate(self, *, now: float | None = None) -> list[str]:
         """Promote short-horizon rows that have earned permanence.
 
-        Being recalled *again* is the signal, and it is a good one: something
-        that surfaced in a later conversation is being used, which is the only
-        evidence available that a memory was worth keeping. The alternative —
-        deciding at write time — is what fills a store with forty rows nobody
-        ever reads, because at write time everything looks like it might matter.
+        Being recalled *again* is the signal, and it is the only good one:
+        something that surfaced in a later conversation is being used, which is
+        the sole evidence available that a memory was worth keeping. The
+        alternative — deciding at write time — is what fills a store with forty
+        rows nobody ever reads, because at write time everything looks like it
+        might matter, and a model asked to rate what it has just written will
+        say it matters nearly every time.
+
+        So importance is a discount on how many recalls are needed, never a
+        substitute for them. Nothing becomes permanent without having been
+        useful at least once after the moment it was written.
 
         Run once per turn, before pruning, so a row about to be dropped gets its
         chance first.
         """
+        # `OR importance` meant a row the writer scored highly was promoted on
+        # the first tidy, before anything had recalled it even once — deciding
+        # at write time wearing a promotion's clothes. Importance now only
+        # lowers the number of recalls required.
         rows = self._db.query(
-            "SELECT id FROM memories WHERE horizon = 'short' "
-            "AND (access_count >= ? OR importance >= ?)",
-            (self.promote_after_recalls, self.promote_above_importance),
+            "SELECT id FROM memories WHERE horizon = 'short' AND ("
+            "access_count >= ? OR (access_count >= ? AND importance >= ?))",
+            (
+                self.promote_after_recalls,
+                self.promote_when_important_after,
+                self.promote_above_importance,
+            ),
         )
         promoted = [row["id"] for row in rows]
         for record_id in promoted:

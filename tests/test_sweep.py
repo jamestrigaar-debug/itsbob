@@ -376,12 +376,22 @@ def test_being_recalled_again_is_what_earns_permanence(tmp_path):
         store.search("where is the fuse box")
 
     promoted = store.consolidate()
-    assert set(promoted) == {used.id, vital.id}
+    # `vital` is *not* here. It was scored 0.95 by whatever wrote it and has
+    # never been recalled, and a score assigned at the moment of writing is not
+    # evidence — it is the writer's opinion of its own output, which is high
+    # nearly every time. That `OR importance` is what filled long-term memory.
+    assert set(promoted) == {used.id}
     assert store.get(used.id).horizon is Horizon.LONG
-    assert store.get(vital.id).horizon is Horizon.LONG
+    assert store.get(vital.id).horizon is Horizon.SHORT
     assert store.get(passing.id).horizon is Horizon.SHORT
     # And promotion clears the expiry, or it would be dropped anyway.
     assert store.get(used.id).expires_at is None
+
+    # What importance *does* buy is a lower bar once something is actually
+    # used: one recall rather than two.
+    store.search("what am I allergic to")
+    assert store.consolidate() == [vital.id]
+    assert store.get(vital.id).horizon is Horizon.LONG
 
 
 def test_promotion_happens_before_pruning_can_drop_it(tmp_path):
@@ -414,3 +424,80 @@ def test_forgetting_still_works_on_either_horizon(tmp_path):
     assert store.forget(short.id) and store.forget(kept.id)
     assert len(store) == 0
     assert store.forget("never-existed") is False
+
+
+# -- importance buys time, never permanence ---------------------------------
+
+
+def test_a_high_score_does_not_make_a_memory_permanent(tmp_path):
+    """The bug that filled long-term memory.
+
+    Whatever writes a memory rates its own output, and rates it highly nearly
+    every time. Treating that score as a promotion meant almost everything
+    became permanent on the first tidy, before anything had read it once.
+    """
+    from itsbob.memory.base import Horizon, MemoryRecord
+    from itsbob.memory.long_term import LongTermMemory
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    confident = [
+        store.add(MemoryRecord(content=f"a thing that seemed to matter {i}", importance=0.95))
+        for i in range(6)
+    ]
+    assert store.consolidate() == []
+    assert store.counts_by("horizon") == {"short": 6}
+    for record in confident:
+        assert store.get(record.id).horizon is Horizon.SHORT
+
+
+def test_but_a_vital_memory_gets_long_enough_to_prove_itself(tmp_path):
+    """The failure the strict rule would have caused instead.
+
+    Expiring everything at six hours regardless is worse in a rarer and much
+    more costly way: the one memory whose loss actually matters is the one
+    thrown away, because nobody happened to ask that afternoon.
+    """
+    import time
+
+    from itsbob.memory.base import (
+        SHORT_TTL_SECONDS,
+        VITAL_GRACE,
+        MemoryRecord,
+        short_ttl_for,
+    )
+    from itsbob.memory.long_term import LongTermMemory
+
+    assert short_ttl_for(0.6) == SHORT_TTL_SECONDS
+    assert short_ttl_for(0.95) == SHORT_TTL_SECONDS * VITAL_GRACE
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    ordinary = store.add(MemoryRecord(content="looking at the router", importance=0.6))
+    vital = store.add(MemoryRecord(content="allergic to penicillin", importance=0.95))
+
+    # A day later: past the ordinary clock, well inside the vital one.
+    store.prune_short_term(now=time.time() + 24 * 3600)
+    assert store.get(ordinary.id) is None
+    assert store.get(vital.id) is not None, "a vital memory expired before it could be recalled"
+
+    # And it is not permanent — still short, still on a clock, and it goes too
+    # once the week is up with nobody having needed it.
+    store.prune_short_term(now=time.time() + SHORT_TTL_SECONDS * VITAL_GRACE + 60)
+    assert store.get(vital.id) is None
+
+
+def test_the_working_set_cap_does_not_evict_a_vital_row(tmp_path):
+    """The cap exists to keep the working set small, and a fact worth keeping
+    is not what makes it big."""
+    from itsbob.memory.base import MemoryRecord
+    from itsbob.memory.long_term import LongTermMemory
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    store.short_term_capacity = 3
+    vital = store.add(MemoryRecord(content="allergic to penicillin", importance=0.95))
+    for i in range(10):
+        store.add(MemoryRecord(content=f"chatter {i}", importance=0.5))
+
+    store.prune_short_term()
+    assert store.get(vital.id) is not None
+    # The ordinary rows are still held to the cap.
+    assert len(store.all()) == 4
