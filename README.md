@@ -352,6 +352,20 @@ So on most desktops there is nothing to install beyond `pip install -e
 never uses your own profile: it keeps a separate one under `~/.itsbob/`, so an
 automated session cannot log you out of the real one.
 
+Delegation is a routing decision, not something the model has to remember to
+do. A turn goes out of house only when all of this holds: it classified as
+Tier S, it needs no tool (checked with the same list the classifier routes on,
+so the two cannot disagree), it is over 120 characters, the hour's budget of 8
+is not spent, and the last two attempts did not fail. Miss any of them and the
+tier ladder runs exactly as it would have — the failure mode is "you paid for
+the answer", never "you got a worse one".
+
+The restraint is the interesting part. Free is not free when somebody is
+waiting two minutes for it, so short questions stay on the ladder however they
+were classified. And a chat site cannot read your disk, so "check why the build
+failed" is not a saving — it is a confident answer about a machine it has never
+seen.
+
 Both switches live in `~/.itsbob/.env`, the same file as every key — not the
 shell, so they survive a reboot and apply to the daemon and the browser console
 as well as the terminal. `itsbob doctor` prints a `browser` and a `deepseek`
@@ -698,6 +712,8 @@ ITSBOB_OLLAMA_URL=http://127.0.0.1:11434
 
 # The browser, and the free reasoning that rides on it. Needs `.[browser]`.
 ITSBOB_DEEPSEEK=                  # 1 to send hard questions to a chat site, free
+ITSBOB_DEEPSEEK_PER_HOUR=8        # ceiling per rolling hour
+ITSBOB_DEEPSEEK_MIN_CHARS=120     # below this, the waiting costs more than it saves
 ITSBOB_CHROMIUM=                  # a chromium to drive; empty finds one itself
 ITSBOB_BROWSER_HEADLESS=1         # 0 to watch it work, or to log in the first time
 

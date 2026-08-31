@@ -46,7 +46,7 @@ from ..llm.base import LLMRequest, Provider, system, user
 from .ingestion import Snapshot
 from .tiers import GATEKEEPER_TAGS, LEGACY_TAGS, GateDecision, Tier
 
-__all__ = ["Gatekeeper", "classify_heuristically"]
+__all__ = ["Gatekeeper", "classify_heuristically", "needs_tools"]
 
 _TAG_RE = re.compile(
     r"\[?(ROUTINE|SCRIPT|TRIVIAL|CHEAP|SIMPLE|LIGHT|STANDARD|CLOUD_B|COMPLEX|CLOUD_A|"
@@ -137,6 +137,23 @@ def _phrase_re(needles: tuple[str, ...]) -> re.Pattern[str]:
 def _mentions(text: str, needles: Sequence[str]) -> str | None:
     match = _phrase_re(tuple(needles)).search(text)
     return match.group(0).strip() if match else None
+
+
+def needs_tools(text: str) -> str | None:
+    """The phrase suggesting this cannot be answered by thinking alone.
+
+    Public because two callers need the same judgement and they must not
+    disagree: the classifier uses it to route, and delegation uses it to decide
+    whether a question can go to a chat site at all — which cannot read the
+    machine, call an API or change anything. A second copy of these lists would
+    drift, and the failure would be a question handed to something structurally
+    incapable of answering it.
+    """
+    return (
+        _mentions(text, _TOOL_WORK)
+        or _mentions(text, _IRREVERSIBLE)
+        or _mentions(text, _IRREVERSIBLE_PHRASES)
+    )
 
 
 def classify_heuristically(snapshot: Snapshot, *, routines: Sequence[str] = ()) -> GateDecision:

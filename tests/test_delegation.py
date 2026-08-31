@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from itsbob.integrations.delegate import Delegate, Envelope, unwrap, wrap
+from itsbob.integrations.delegate import Delegate, Delegation, Envelope, unwrap, wrap
 from itsbob.scripts.web_scraper import readable_text, scrape
 from itsbob.tools.base import ToolError
 
@@ -402,3 +402,168 @@ def test_playwright_is_left_to_find_its_own_download(tmp_path, monkeypatch):
     browser.PlaywrightSession(profile=tmp_path / "profile")._launch(_Playwright())
     assert launched["executable_path"] == str(system)
 
+
+
+# -- when the expensive question goes somewhere free ------------------------
+
+
+def _policy(**kwargs):
+    from itsbob.agent.delegation import DelegatePolicy
+
+    class _Fake:
+        def __init__(self):
+            self.asked = []
+
+        def ask(self, question, context=""):
+            self.asked.append((question, context))
+            return Delegation(question=question, answer="a long considered answer", ok=True)
+
+    kwargs.setdefault("delegate", _Fake())
+    return DelegatePolicy(**kwargs)
+
+
+_HARD = (
+    "Talk me through the trade-offs between renting and buying somewhere to "
+    "live over a ten year horizon, assuming interest rates stay roughly where "
+    "they are and I might move cities once in that time."
+)
+
+
+def test_an_expensive_thinking_question_goes_out_of_house():
+    from itsbob.router.tiers import Tier
+
+    policy = _policy()
+    verdict = policy.consider(message=_HARD, tier=Tier.S)
+    assert verdict.allowed, verdict.reason
+
+    result = policy.ask(_HARD)
+    assert result is not None and result.ok
+    assert policy.answers == 1 and policy.saved_tiers == 1
+
+
+def test_a_cheap_question_is_not_worth_two_minutes_of_waiting():
+    from itsbob.router.tiers import Tier
+
+    policy = _policy()
+    for tier in (Tier.C, Tier.B, Tier.A):
+        verdict = policy.consider(message=_HARD, tier=tier)
+        assert not verdict.allowed
+        assert "cheap enough already" in verdict.reason
+
+
+def test_a_short_question_stays_on_the_ladder_however_it_was_classified():
+    """Free is not free when somebody is waiting for it."""
+    from itsbob.router.tiers import Tier
+
+    policy = _policy()
+    verdict = policy.consider(message="should I sell the car?", tier=Tier.S)
+    assert not verdict.allowed and "too short" in verdict.reason
+
+
+def test_anything_needing_a_tool_never_goes():
+    """A chat site cannot read the disk, and a confident answer about a machine
+    it has never seen is worse than a slow one."""
+    from itsbob.router.tiers import Tier
+
+    policy = _policy()
+    for message in (
+        "Read through the log file in ~/build and work out why the compile step "
+        "is failing on this machine, going right back to the first error.",
+        "Delete the old backups under /var and tell me how much space that "
+        "reclaimed, then confirm nothing else was touched in the process.",
+        "Check the football API for today's fixtures and tell me which of them "
+        "clash with the times I usually eat, listing every single one of them.",
+    ):
+        verdict = policy.consider(message=message, tier=Tier.S)
+        assert not verdict.allowed, message
+        assert "needs tools" in verdict.reason
+
+
+def test_it_stops_after_repeated_failures_instead_of_waiting_every_time():
+    """Without this, every hard question waits two minutes to fail before
+    falling back to the tier that was going to answer it anyway."""
+    from itsbob.router.tiers import Tier
+
+    class Broken:
+        def ask(self, question, context=""):
+            raise RuntimeError("chat site is asking for a login")
+
+    policy = _policy(delegate=Broken(), trip_after=2, cooldown_seconds=600)
+    now = 1_000_000.0
+
+    assert policy.ask(_HARD, now=now) is None
+    assert policy.consider(message=_HARD, tier=Tier.S).allowed, "one failure is not a pattern"
+
+    assert policy.ask(_HARD, now=now) is None
+    verdict = policy.consider(message=_HARD, tier=Tier.S, now=now)
+    assert not verdict.allowed and "standing down" in verdict.reason
+
+    # And it comes back on its own once the cooldown is up.
+    assert policy.consider(message=_HARD, tier=Tier.S, now=now + 601).allowed
+
+
+def test_a_recovery_clears_the_failure_streak():
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def ask(self, question, context=""):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("timed out")
+            return Delegation(question=question, answer="a considered answer", ok=True)
+
+    policy = _policy(delegate=Flaky())
+    assert policy.ask(_HARD) is None
+    assert policy.consecutive_failures == 1
+    assert policy.ask(_HARD) is not None
+    assert policy.consecutive_failures == 0
+
+
+def test_the_hourly_cap_is_a_cap():
+    """It is somebody else's free service being used by an automated client."""
+    from itsbob.router.tiers import Tier
+
+    policy = _policy(per_hour=3)
+    now = 1_000_000.0
+    for _ in range(3):
+        assert policy.consider(message=_HARD, tier=Tier.S, now=now).allowed
+        policy.ask(_HARD, now=now)
+
+    verdict = policy.consider(message=_HARD, tier=Tier.S, now=now)
+    assert not verdict.allowed and "this hour" in verdict.reason
+    # An hour later the window has rolled.
+    assert policy.consider(message=_HARD, tier=Tier.S, now=now + 3601).allowed
+
+
+def test_an_unusable_reply_falls_back_rather_than_being_used():
+    """The failure mode is "you paid for the answer", never a worse one."""
+
+    class Refusing:
+        def ask(self, question, context=""):
+            return Delegation(question=question, answer="", ok=False, error="login wall")
+
+    policy = _policy(delegate=Refusing())
+    assert policy.ask(_HARD) is None
+    assert policy.failures == 1 and policy.answers == 0
+    assert policy.last_error == "login wall"
+
+
+def test_delegation_off_by_default():
+    from itsbob.agent.delegation import DelegatePolicy
+    from itsbob.router.tiers import Tier
+
+    policy = DelegatePolicy.from_env({})
+    assert policy.delegate is None
+    assert not policy.consider(message=_HARD, tier=Tier.S).allowed
+    assert policy.describe()["on"] is False
+
+
+def test_the_screen_is_shared_with_the_classifier():
+    """Two copies of "what counts as tool work" would drift, and the failure
+    would be a question handed to something that cannot answer it."""
+    from itsbob.router.gatekeeper import needs_tools
+
+    assert needs_tools("read the log file")
+    assert needs_tools("delete the backups")
+    assert not needs_tools("what do you think about renting versus buying")

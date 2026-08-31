@@ -766,7 +766,14 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"      xdotool:    {browsers['xdotool']['why']}")
 
     if deepseek_on():
+        from .agent.delegation import DelegatePolicy
+
+        policy = DelegatePolicy.from_env()
         print(f"  ok {'deepseek':<10} on — hard questions go to the browser, free")
+        print(
+            f"      only Tier S, only when no tool is needed, at most "
+            f"{policy.per_hour}/hour and never under {policy.min_chars} characters"
+        )
         if not preferred:
             print("      !! but there is no browser to drive, so every call will fail")
     else:

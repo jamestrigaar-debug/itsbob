@@ -177,6 +177,7 @@ class Agent:
         extend_by: int = 6,
         guard: SpendGuard | None = None,
         feasibility: FeasibilityCheck | None = None,
+        delegation: Any = None,
     ) -> None:
         self.brain = brain
         self.toolbox = toolbox
@@ -198,6 +199,10 @@ class Agent:
         self.gatekeeper = gatekeeper or Gatekeeper(
             local_provider=brain.local, cloud_classifier=self._cheap_classify
         )
+        #: The free reasoner, when it is switched on and there is a browser to
+        #: drive. Its own object because the interesting part is the restraint:
+        #: what may go, how often, and when to stop trying.
+        self.delegation = delegation
         self.writer = writer
         if self.writer is None and self.memory is not None:
             self.writer = MemoryWriter(brain=brain, store=self.memory)
@@ -264,6 +269,17 @@ class Agent:
         if memories:
             emit("memory", recalled=[h.as_dict() for h in memories])
 
+        handed_off = self._delegate(message, tier, memories, turn, emit)
+        if handed_off is not None:
+            turn.final = handed_off
+            turn.tier = tier.value
+            turn.duration_ms = (time.perf_counter() - started) * 1000
+            self.conversation.add(turn)
+            emit("final", text=handed_off, tier=tier.value, steps=0, delegated=True)
+            self._remember(message, handed_off, turn, memories, emit)
+            self._tidy_memory(emit)
+            return turn
+
         deadline = started + self.max_seconds
         answer, tier = self._run_steps(
             snapshot=snapshot,
@@ -282,26 +298,77 @@ class Agent:
         self.conversation.add(turn)
         emit("final", text=answer, tier=tier.value, steps=len(turn.steps))
 
-        if self.writer is not None and answer:
-            # Anything the agent already wrote with `remember` this turn counts
-            # as known. Without this the writer re-extracts what was just
-            # stored, in slightly different words, and near-duplicates are the
-            # one thing that degrades recall fastest: three rows saying the
-            # same thing all surface with equal confidence, and none of them is
-            # the one you would have written.
-            known = [*memories, *_written_this_turn(turn)]
-            for record in self.writer.write(message=message, answer=answer, known=known):
-                turn.remembered.append(record.content)
-                emit(
-                    "memory",
-                    wrote=record.content,
-                    id=record.id,
-                    subject=record.subject.value,
-                    horizon=record.horizon.value,
-                )
-
+        self._remember(message, answer, turn, memories, emit)
         self._tidy_memory(emit)
         return turn
+
+    def _remember(
+        self,
+        message: str,
+        answer: str,
+        turn: Turn,
+        memories: Sequence[Any],
+        emit: Callable[..., None],
+    ) -> None:
+        if self.writer is None or not answer:
+            return
+        # Anything the agent already wrote with `remember` this turn counts as
+        # known. Without this the writer re-extracts what was just stored, in
+        # slightly different words, and near-duplicates are the one thing that
+        # degrades recall fastest: three rows saying the same thing all surface
+        # with equal confidence, and none of them is the one you would have
+        # written.
+        known = [*memories, *_written_this_turn(turn)]
+        for record in self.writer.write(message=message, answer=answer, known=known):
+            turn.remembered.append(record.content)
+            emit(
+                "memory",
+                wrote=record.content,
+                id=record.id,
+                subject=record.subject.value,
+                horizon=record.horizon.value,
+            )
+
+    def _delegate(
+        self,
+        message: str,
+        tier: Tier,
+        memories: Sequence[Any],
+        turn: Turn,
+        emit: Callable[..., None],
+    ) -> str | None:
+        """Try the free reasoner before paying the top tier. ``None`` to pay.
+
+        Everything about this is arranged so that "it did not work" costs a
+        decision and nothing else: the tier ladder below is untouched, runs
+        exactly as it would have, and never sees a worse question for having
+        been second choice.
+        """
+        if self.delegation is None:
+            return None
+        verdict = self.delegation.consider(message=message, tier=tier)
+        emit("delegate", allowed=verdict.allowed, reason=verdict.reason, tier=tier.value)
+        if not verdict.allowed:
+            return None
+
+        from .delegation import context_from  # noqa: PLC0415 - optional path
+
+        result = self.delegation.ask(
+            message, context=context_from(memories, self.persona.style)
+        )
+        if result is None:
+            emit("delegate", allowed=False, reason=self.delegation.last_error or "no usable reply")
+            return None
+
+        turn.delegated = True
+        emit(
+            "delegate",
+            allowed=True,
+            answered=True,
+            source=getattr(result, "source", "delegate"),
+            latency_ms=round(getattr(result, "latency_ms", 0.0), 1),
+        )
+        return str(result.answer).strip()
 
     def _pay_out_the_list(
         self, answer: str, turn: Turn, tier: Tier, emit: Callable[..., None]
