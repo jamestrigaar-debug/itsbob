@@ -204,8 +204,26 @@ class Agent:
 
     # -- the turn ----------------------------------------------------------
 
-    def chat(self, message: str, *, on_event: EventFn | None = None, context: Any = None) -> Turn:
-        """Run one full turn and return everything that happened in it."""
+    def chat(
+        self,
+        message: str,
+        *,
+        on_event: EventFn | None = None,
+        context: Any = None,
+        min_tier: Tier | None = None,
+        thorough: bool = False,
+    ) -> Turn:
+        """Run one full turn and return everything that happened in it.
+
+        ``min_tier`` is a floor, not an override: the classifier still runs and
+        may pick something higher. It exists for work nobody is watching — a
+        scheduled task has no one to say "no, do it properly", so a classifier
+        that reads "write a report on X" as one quick lookup has nothing to
+        correct it.
+
+        ``thorough`` says finish the job rather than sketch it: more steps
+        before the budget has to justify itself, and the persona told as much.
+        """
         started = time.perf_counter()
         turn_index = len(self.conversation) + 1
         turn = Turn(message=message)
@@ -221,8 +239,15 @@ class Agent:
         snapshot = self._snapshot(message, context)
         decision = self.gatekeeper.classify(snapshot)
         tier = decision.tier if decision.tier.is_model else Tier.B
+        if min_tier is not None and min_tier.rank > tier.rank:
+            tier = min_tier
         turn.tier = tier.value
-        emit("classified", tier=tier.value, decision=decision.as_dict())
+        emit(
+            "classified",
+            tier=tier.value,
+            floor=min_tier.value if min_tier else None,
+            decision=decision.as_dict(),
+        )
 
         verdict = self._feasible(message, tier, emit)
         if not verdict.feasible:
@@ -247,6 +272,7 @@ class Agent:
             memories=memories,
             deadline=deadline,
             emit=emit,
+            thorough=thorough,
         )
 
         answer = self._pay_out_the_list(answer, turn, tier, emit)
@@ -366,9 +392,15 @@ class Agent:
         memories: Sequence[Any],
         deadline: float,
         emit: Callable[..., None],
+        thorough: bool = False,
     ) -> tuple[str, Tier]:
         guard = TurnGuard()
-        budget = self.max_steps
+        # Thorough work starts with the room to be thorough. The budget still
+        # extends itself when a turn is being productive, but making a report
+        # earn its sixth step one at a time is how a report comes out as a
+        # paragraph: the model can see the budget, and it writes to fit.
+        budget = self.max_steps * 2 if thorough else self.max_steps
+        budget = min(budget, self.hard_max_steps)
         index = 0
         while index < budget:
             index += 1
@@ -378,7 +410,7 @@ class Agent:
             if overspent:
                 return self._forced_answer(snapshot, turn, tier, overspent), tier
 
-            brief = tier in _BRIEF_TIERS
+            brief = tier in _BRIEF_TIERS and not thorough
             # After the first step, tool *descriptions* stop earning their
             # keep: choosing is done, and what remains is calling. Everything
             # stays listed and callable — the roster below is complete — but
@@ -403,6 +435,7 @@ class Agent:
                 policy_note="" if brief else _policy_note(self.toolbox),
                 tool_names=self.toolbox.registry.names(),
                 brief=brief,
+                thorough=thorough,
                 continuing=not first_step,
                 observation_chars=_observation_budget(len(turn.steps)),
             )

@@ -430,3 +430,258 @@ def test_events_are_emitted(tmp_path):
     daemon.tasks.create("t", "x", "every 15m", now=now)
     daemon.tick(now=now)
     assert seen == ["running", "finished"]
+
+
+# -- did the task actually get done ----------------------------------------
+
+
+class _Judge:
+    """A stand-in completion check with a scripted set of verdicts."""
+
+    def __init__(self, *verdicts):
+        from itsbob.daemon.completion import Completion
+
+        self.verdicts = [
+            Completion(complete=ok, missing=missing, checked=True)
+            for ok, missing in verdicts
+        ]
+        self.seen = []
+
+    def judge(self, *, prompt, output, status="ok"):
+        from itsbob.daemon.completion import Completion
+
+        self.seen.append((prompt, output, status))
+        return self.verdicts.pop(0) if self.verdicts else Completion(True, "", checked=True)
+
+
+def test_an_incomplete_task_is_retried_at_a_higher_grade(tmp_path):
+    """Nobody is awake at 07:00 to say "no, all of them"."""
+    now = _at("2026-08-30 14:05")
+    agent = _Agent(replies=["I found several fixtures today.", "1. Hull v Leeds\n2. ..."])
+    judge = _Judge((False, "it counted the matches instead of listing them"))
+    daemon = _daemon(tmp_path, agent=agent, completion=judge)
+    daemon.tasks.create("fixtures", "list today's fixtures", "every 15m", now=now)
+
+    runs = daemon.tick(now=now)
+    assert [r.status for r in runs] == ["ok"]
+    assert runs[0].output.startswith("1. Hull v Leeds")
+    assert daemon.escalations == 1
+
+    # The second attempt carries the first forward rather than starting over:
+    # the first try is usually most of the answer.
+    assert len(agent.prompts) == 2
+    retry = agent.prompts[1]
+    assert "list today's fixtures" in retry
+    assert "it counted the matches instead of listing them" in retry
+    assert "I found several fixtures today." in retry
+
+
+def test_a_complete_task_is_not_run_twice(tmp_path):
+    now = _at("2026-08-30 14:05")
+    agent = _Agent(replies=["1. Hull v Leeds"])
+    daemon = _daemon(tmp_path, agent=agent, completion=_Judge((True, "")))
+    daemon.tasks.create("fixtures", "list today's fixtures", "every 15m", now=now)
+
+    daemon.tick(now=now)
+    assert len(agent.prompts) == 1
+    assert daemon.escalations == 0
+
+
+def test_escalation_stops_at_the_attempt_limit(tmp_path):
+    """Never satisfied is not a reason to run forever."""
+    now = _at("2026-08-30 14:05")
+    agent = _Agent(replies=["thin", "still thin", "thin again", "and again"])
+    judge = _Judge((False, "no"), (False, "no"), (False, "no"))
+    daemon = _daemon(tmp_path, agent=agent, completion=judge)
+    daemon.tasks.create("x", "do it", "every 15m", now=now, attempts=3)
+
+    daemon.tick(now=now)
+    assert len(agent.prompts) == 3
+    assert daemon.escalations == 2
+
+
+def test_the_check_can_be_turned_off(tmp_path):
+    now = _at("2026-08-30 14:05")
+    agent = _Agent(replies=["thin"])
+    daemon = _daemon(tmp_path, agent=agent, completion=False)
+    daemon.tasks.create("x", "do it", "every 15m", now=now)
+    daemon.tick(now=now)
+    assert len(agent.prompts) == 1
+
+
+def test_a_broken_judge_never_blocks_delivery(tmp_path):
+    """A verification pass that can wedge every task is worse than none."""
+    from itsbob.daemon.completion import CompletionCheck
+
+    class Exploding:
+        def complete_json(self, *a, **k):
+            raise RuntimeError("no model")
+
+    verdict = CompletionCheck(brain=Exploding()).judge(
+        prompt="list the fixtures", output="a reasonably long answer about fixtures"
+    )
+    assert verdict.complete is True
+    assert verdict.checked is False, "a guess must not be recorded as a judgement"
+
+
+def test_a_short_answer_is_not_automatically_incomplete():
+    """"Nothing was scheduled today" is 27 characters and finished.
+
+    A length threshold is a bad proxy for completeness, so only genuinely
+    empty output is decided without asking.
+    """
+    from itsbob.daemon.completion import CompletionCheck
+
+    class Asked:
+        def __init__(self):
+            self.calls = 0
+
+        def complete_json(self, tier, request, **k):
+            self.calls += 1
+            return {"complete": True, "missing": ""}, None
+
+    brain = Asked()
+    check = CompletionCheck(brain=brain)
+    assert check.judge(prompt="anything on today?", output="Nothing scheduled.").complete
+    assert brain.calls == 1
+
+    empty = check.judge(prompt="anything on?", output="   ")
+    assert empty.complete is False and brain.calls == 1
+
+
+def test_a_failed_run_is_incomplete_without_asking():
+    from itsbob.daemon.completion import CompletionCheck
+
+    class NeverAsked:
+        def complete_json(self, *a, **k):
+            raise AssertionError("asked a model about a run that already failed")
+
+    verdict = CompletionCheck(brain=NeverAsked()).judge(
+        prompt="x", output="some output", status="failed"
+    )
+    assert verdict.complete is False
+
+
+def test_escalation_climbs_from_where_the_turn_actually_ran(tmp_path):
+    """Not from the floor: the classifier may already have started higher."""
+    from itsbob.daemon.completion import next_grade
+    from itsbob.router.tiers import Tier
+
+    assert next_grade(Tier.C) is Tier.B
+    assert next_grade(Tier.B) is Tier.A
+    assert next_grade(Tier.A) is Tier.S
+    # S is the ceiling — a task that cannot be done at S will not be done at S
+    # twice, so escalation stops rather than looping.
+    assert next_grade(Tier.S) is Tier.S
+
+
+def test_a_graded_task_floors_the_tier_but_does_not_cap_it(tmp_path):
+    """A floor, not an override — the classifier may still go higher."""
+    from itsbob.router.tiers import Tier
+
+    now = _at("2026-08-30 14:05")
+    seen = {}
+
+    class Recording(_Agent):
+        def chat(self, message, **kwargs):
+            seen.update(kwargs)
+            return super().chat(message, **kwargs)
+
+    daemon = _daemon(tmp_path, agent=Recording(), completion=False)
+    daemon.tasks.create("r", "write the review", "every 15m", now=now, grade="S")
+    daemon.tick(now=now)
+    assert seen["min_tier"] is Tier.S
+    assert seen["thorough"] is True
+
+
+def test_an_ungraded_task_leaves_the_classifier_alone(tmp_path):
+    now = _at("2026-08-30 14:05")
+    seen = {}
+
+    class Recording(_Agent):
+        def chat(self, message, **kwargs):
+            seen.update(kwargs)
+            return super().chat(message, **kwargs)
+
+    daemon = _daemon(tmp_path, agent=Recording(), completion=False)
+    daemon.tasks.create("r", "check the disk", "every 15m", now=now)
+    daemon.tick(now=now)
+    assert seen["min_tier"] is None
+    # But effort still defaults to full: nobody is watching a scheduled run.
+    assert seen["thorough"] is True
+
+
+def test_a_quick_task_says_so(tmp_path):
+    now = _at("2026-08-30 14:05")
+    seen = {}
+
+    class Recording(_Agent):
+        def chat(self, message, **kwargs):
+            seen.update(kwargs)
+            return super().chat(message, **kwargs)
+
+    daemon = _daemon(tmp_path, agent=Recording(), completion=False)
+    daemon.tasks.create("r", "is the disk full", "every 15m", now=now, effort="quick")
+    daemon.tick(now=now)
+    assert seen["thorough"] is False
+
+
+def test_a_grade_can_be_changed_without_losing_the_history(tmp_path):
+    """A task that keeps coming back thin wants a higher grade, not a new identity."""
+    from itsbob.daemon.tasks import TaskStore
+
+    store = TaskStore(":memory:")
+    task = store.create("r", "write the review", "daily at 07:00")
+    assert task.grade == "auto" and task.effort == "full"
+
+    store.update(task.id, grade="s")
+    again = store.get(task.id)
+    assert again.grade == "S", "a lowercase grade should be accepted"
+    assert again.id == task.id and again.created_at == task.created_at
+
+    # Nonsense falls back to auto rather than storing a grade nothing honours.
+    store.update(task.id, grade="platinum")
+    assert store.get(task.id).grade == "auto"
+
+    # A bad schedule fails here, not silently at 07:00 tomorrow.
+    import pytest
+
+    from itsbob.daemon.schedule import ScheduleError
+
+    with pytest.raises(ScheduleError):
+        store.update(task.id, schedule="whenever I feel like it")
+    assert store.get(task.id).schedule == "daily at 07:00", "a rejected edit still changed it"
+
+
+def test_an_older_task_list_still_opens(tmp_path):
+    """The columns are new; somebody's tasks.sqlite is not."""
+    import sqlite3
+
+    path = tmp_path / "tasks.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL,
+            schedule TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL, next_run REAL, last_run REAL,
+            last_status TEXT, last_output TEXT, run_count INTEGER NOT NULL DEFAULT 0,
+            fail_count INTEGER NOT NULL DEFAULT 0, notify INTEGER NOT NULL DEFAULT 1,
+            max_runs INTEGER, metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO tasks (id, name, prompt, schedule, created_at)
+        VALUES ('old1', 'briefing', 'do the briefing', 'daily at 07:00', 0);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    from itsbob.daemon.tasks import TaskStore
+
+    store = TaskStore(path)
+    task = store.find("briefing")
+    assert task is not None
+    assert task.grade == "auto" and task.effort == "full" and task.attempts == 2
+    # And it can still be written back.
+    store.update(task.id, grade="A")
+    assert store.get("old1").grade == "A"

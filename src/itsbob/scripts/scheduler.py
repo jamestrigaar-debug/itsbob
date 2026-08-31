@@ -73,7 +73,7 @@ def _list(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
         state = "on " if task.enabled else "off"
         rows.append(
             f"  [{state}] {task.name:<20} {task.schedule:<20} next {_when(task.next_run):<10} "
-            f"{task.run_count} run(s), last: {task.last_status or 'never'}"
+            f"grade {task.grade:<4} {task.run_count} run(s), last: {task.last_status or 'never'}"
         )
     return ToolResult(
         ok=True,
@@ -100,11 +100,53 @@ def _schedule(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     except ScheduleError as exc:
         raise ToolError(str(exc)) from exc
 
-    task = store.create(name, instruction, schedule, notify=bool(params.get("notify", True)))
+    grade = str(params.get("grade") or "auto").strip()
+    grade = grade.upper() if grade.upper() in ("C", "B", "A", "S") else "auto"
+    task = store.create(
+        name,
+        instruction,
+        schedule,
+        notify=bool(params.get("notify", True)),
+        grade=grade,
+        effort="quick" if str(params.get("effort", "")).strip().lower() == "quick" else "full",
+    )
     return ToolResult(
         ok=True,
-        output=f"scheduled '{task.name}' ({task.schedule}), first run {_when(task.next_run)}",
+        output=(
+            f"scheduled '{task.name}' ({task.schedule}), first run {_when(task.next_run)}"
+            f" — grade {task.grade}, {task.effort} effort"
+        ),
         data=task.as_dict(),
+    )
+
+
+def _update(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    store = store_for(ctx)
+    task = store.find(str(params["name"]))
+    if task is None:
+        raise ToolError(f"no task called {params['name']!r}")
+
+    fields = {
+        key: params[key]
+        for key in ("prompt", "schedule", "grade", "effort", "attempts", "notify")
+        if key in params and params[key] is not None
+    }
+    if not fields:
+        raise ToolError(
+            "nothing to change — pass at least one of prompt, schedule, grade, "
+            "effort, attempts or notify"
+        )
+    try:
+        updated = store.update(task.id, **fields)
+    except Exception as exc:  # noqa: BLE001 - a bad schedule is the usual cause
+        raise ToolError(str(exc)) from exc
+    return ToolResult(
+        ok=True,
+        output=(
+            f"updated '{updated.name}' — grade {updated.grade}, {updated.effort} effort, "
+            f"{updated.schedule}, next run {_when(updated.next_run)}"
+        ),
+        data=updated.as_dict(),
     )
 
 
@@ -166,7 +208,10 @@ def tools() -> list[Tool]:
                 "Add recurring work for itsbob to do by itself. The instruction is plain "
                 "language, run by the agent exactly as if you had typed it. Schedules look "
                 "like 'every 30m', 'weekdays at 08:30', 'friday at 17:00', "
-                "'at 2026-09-01T06:00'. Only runs while `itsbob serve` is running."
+                "'at 2026-09-01T06:00'. Only runs while `itsbob serve` is running. "
+                "Scheduled work runs at full effort and is checked afterwards for "
+                "whether it actually did what was asked, retrying at a higher grade "
+                "if not — so ask for the whole job here, not a sketch of it."
             ),
             run=_schedule,
             risk=Risk.WRITE,
@@ -178,8 +223,54 @@ def tools() -> list[Tool]:
                     "instruction": {"type": "string", "description": "What to do, in plain language."},
                     "schedule": {"type": "string", "description": "e.g. 'every 30m' or 'weekdays at 08:30'."},
                     "notify": {"type": "boolean", "description": "May the result interrupt the user? Default true."},
+                    "grade": {
+                        "type": "string",
+                        "description": (
+                            "Floor on how hard to think: C cheap, B light, A standard, "
+                            "S strongest. Default 'auto' lets each run be classified. "
+                            "Set A or S for anything that has to be right or complete."
+                        ),
+                    },
+                    "effort": {
+                        "type": "string",
+                        "description": (
+                            "'full' (default) finishes the job — a report comes back as a "
+                            "report. 'quick' for a one-line check where that is all it is."
+                        ),
+                    },
                 },
                 "required": ["name", "instruction", "schedule"],
+            },
+        ),
+        Tool(
+            name="update_task",
+            description=(
+                "Change an existing task without losing its history: its grade (how hard "
+                "to think), effort, schedule, or the instruction itself. Use this rather "
+                "than removing and re-adding — a task that keeps coming back thin wants a "
+                "higher grade, not a new identity."
+            ),
+            run=_update,
+            risk=Risk.WRITE,
+            mutates=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Task id or name."},
+                    "prompt": {"type": "string", "description": "New instruction."},
+                    "schedule": {"type": "string", "description": "New schedule."},
+                    "grade": {
+                        "type": "string",
+                        "description": "C, B, A, S — or 'auto' to classify each run.",
+                    },
+                    "effort": {"type": "string", "description": "'full' or 'quick'."},
+                    "attempts": {
+                        "type": "integer",
+                        "description": "Tries allowed at a higher grade when a run falls short. 1 disables.",
+                    },
+                    "notify": {"type": "boolean"},
+                },
+                "required": ["name"],
             },
         ),
         Tool(
