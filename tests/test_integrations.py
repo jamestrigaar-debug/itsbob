@@ -952,3 +952,70 @@ def test_the_discord_check_reads_the_channel_rather_than_the_variables():
         token="t", channel_id="42", opener=lambda r, timeout=None: FakeResponse([])
     ).check()
     assert good and "reachable" in detail
+
+
+# -- the switch that is off by default -------------------------------------
+
+
+def test_setup_offers_browser_delegation_only_when_a_browser_exists(monkeypatch):
+    from itsbob import setup_wizard
+
+    monkeypatch.setattr(setup_wizard, "_say", lambda *a, **k: None)
+    monkeypatch.delenv("ITSBOB_DEEPSEEK", raising=False)
+    monkeypatch.setattr(
+        setup_wizard,
+        "_confirm",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("offered a switch that cannot work")),
+    )
+    # Nothing to drive: the question is worse than useless, because every
+    # answer it could collect leads to a tool that fails on first use.
+    monkeypatch.setattr(
+        "itsbob.integrations.browser.available",
+        lambda env=None: {"preferred": None, "chromium": {"path": "", "source": ""}},
+    )
+    assert setup_wizard._ask_about_browser() == {}
+
+
+def test_setup_turns_browser_delegation_on_when_asked(monkeypatch):
+    from itsbob import setup_wizard
+
+    said: list[str] = []
+    monkeypatch.setattr(setup_wizard, "_say", lambda *a, **k: said.append(a[0] if a else ""))
+    monkeypatch.delenv("ITSBOB_DEEPSEEK", raising=False)
+    monkeypatch.setattr(setup_wizard, "_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "itsbob.integrations.browser.available",
+        lambda env=None: {
+            "preferred": "playwright",
+            "chromium": {"path": "/usr/bin/chromium", "source": "system"},
+        },
+    )
+    assert setup_wizard._ask_about_browser() == {"ITSBOB_DEEPSEEK": "1"}
+    # It has to name the file, because "where do I set this" is the next question.
+    assert any("ITSBOB_DEEPSEEK in ~/.itsbob/.env" in line for line in said)
+    assert any("/usr/bin/chromium" in line for line in said)
+
+
+def test_setup_leaves_browser_delegation_alone_when_declined(monkeypatch):
+    from itsbob import setup_wizard
+
+    monkeypatch.setattr(setup_wizard, "_say", lambda *a, **k: None)
+    monkeypatch.delenv("ITSBOB_DEEPSEEK", raising=False)
+    monkeypatch.setattr(setup_wizard, "_confirm", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "itsbob.integrations.browser.available",
+        lambda env=None: {
+            "preferred": "playwright",
+            "chromium": {"path": "/usr/bin/chromium", "source": "system"},
+        },
+    )
+    assert setup_wizard._ask_about_browser() == {}
+
+    # And it does not ask twice once it is set.
+    monkeypatch.setenv("ITSBOB_DEEPSEEK", "1")
+    monkeypatch.setattr(
+        setup_wizard,
+        "_confirm",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked about a set switch")),
+    )
+    assert setup_wizard._ask_about_browser() == {}

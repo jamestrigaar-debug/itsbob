@@ -336,6 +336,28 @@ parsed, or shaped locally by the cheap model, or reported as failed. A login
 wall, a rate-limit page or a two-word refusal is caught before it can look like
 an answer.
 
+Both this and `read_page` need a browser, and *having the `playwright` package
+is not having a browser* — the package is a driver, and on its own it launches
+nothing. A browser can come from any of three places, and it looks for them in
+this order:
+
+| Where | How to get it |
+|---|---|
+| `ITSBOB_CHROMIUM` | point it at a specific build you want used |
+| Playwright's own | `.venv/bin/playwright install chromium` (~150MB) |
+| the system's | already there if you have Chromium or Chrome installed |
+
+So on most desktops there is nothing to install beyond `pip install -e
+'.[browser]'` — the Chromium already on the machine is found and driven. It
+never uses your own profile: it keeps a separate one under `~/.itsbob/`, so an
+automated session cannot log you out of the real one.
+
+Both switches live in `~/.itsbob/.env`, the same file as every key — not the
+shell, so they survive a reboot and apply to the daemon and the browser console
+as well as the terminal. `itsbob doctor` prints a `browser` and a `deepseek`
+line saying which of the three was found and whether delegation is on, and it
+says so *before* you spend an hour wondering why every call fails.
+
 **`read_page` reads a page properly**, escalating only as far as it has to: a
 plain HTTP fetch with the markup stripped, then a headless browser when the page
 turns out to be a JavaScript shell, then the browser already on screen for
@@ -673,6 +695,11 @@ ITSBOB_INITIATIVE_WAKING=8-22
 # The local model. Keep the default unless you have pulled something else.
 ITSBOB_OLLAMA_MODEL=qwen2.5:1.5b
 ITSBOB_OLLAMA_URL=http://127.0.0.1:11434
+
+# The browser, and the free reasoning that rides on it. Needs `.[browser]`.
+ITSBOB_DEEPSEEK=                  # 1 to send hard questions to a chat site, free
+ITSBOB_CHROMIUM=                  # a chromium to drive; empty finds one itself
+ITSBOB_BROWSER_HEADLESS=1         # 0 to watch it work, or to log in the first time
 
 # Safety. `guarded` (default) asks before anything outside the workspace.
 ITSBOB_TOOL_MODE=guarded

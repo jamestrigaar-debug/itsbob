@@ -10,6 +10,7 @@ paths, which is where the value is.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -284,8 +285,120 @@ def test_the_browser_layer_reports_what_this_machine_can_do():
     from itsbob.integrations.browser import available, profile_dir
 
     ready = available({})
-    assert set(ready) == {"playwright", "xdotool", "preferred", "profile"}
+    assert set(ready) == {"playwright", "xdotool", "preferred", "profile", "chromium"}
     for name in ("playwright", "xdotool"):
         assert ready[name]["why"], f"{name} gives no reason either way"
     # Its own profile, never the one a person browses with.
     assert "browser-profile" in str(profile_dir({"ITSBOB_HOME": "/tmp/h"}))
+
+
+# -- having a browser, as opposed to having the package that drives one ------
+
+
+def _fake_download(root: Path, folder: str, relative: str) -> Path:
+    """A stand-in for a browser Playwright downloaded."""
+    binary = root / folder / relative
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_a_configured_chromium_wins_and_a_missing_one_says_so(tmp_path):
+    from itsbob.integrations.browser import available, chromium
+
+    real = tmp_path / "my-chromium"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    assert chromium({"ITSBOB_CHROMIUM": str(real)}) == {
+        "path": str(real),
+        "source": "configured",
+    }
+
+    # Pointed somewhere wrong is its own answer: reporting "no browser" would
+    # send somebody installing one they already have.
+    missing = chromium({"ITSBOB_CHROMIUM": str(tmp_path / "nope")})
+    assert missing == {"path": "", "source": "configured-missing"}
+    why = available({"ITSBOB_CHROMIUM": str(tmp_path / "nope")})["playwright"]["why"]
+    assert "ITSBOB_CHROMIUM" in why and "not there" in why
+
+
+def test_a_full_chromium_beats_a_headless_shell_even_from_an_older_build(tmp_path):
+    from itsbob.integrations.browser import chromium
+
+    # The shell sorts later by name and by version, and still must not win: it
+    # cannot open a visible window, which is half of what the browser is for.
+    _fake_download(tmp_path, "chromium_headless_shell-2000", "chrome-linux/headless_shell")
+    full = _fake_download(tmp_path, "chromium-1194", "chrome-linux/chrome")
+
+    found = chromium({"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)})
+    assert found == {"path": str(full), "source": "playwright"}
+
+
+def test_the_newest_build_wins_among_equals(tmp_path):
+    from itsbob.integrations.browser import chromium
+
+    _fake_download(tmp_path, "chromium-1100", "chrome-linux/chrome")
+    newest = _fake_download(tmp_path, "chromium-1194", "chrome-linux/chrome")
+
+    assert chromium({"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)})["path"] == str(newest)
+
+
+def test_a_system_chromium_is_used_when_playwright_never_downloaded_one(tmp_path, monkeypatch):
+    from itsbob.integrations import browser
+
+    installed = tmp_path / "usr-bin-chromium"
+    installed.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(
+        browser.shutil,
+        "which",
+        lambda name: str(installed) if name == "chromium" else None,
+    )
+
+    found = browser.chromium({"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "empty")})
+    assert found == {"path": str(installed), "source": "system"}
+
+
+def test_the_package_alone_is_not_a_browser(tmp_path, monkeypatch):
+    """Installing playwright downloads no browser, and driving nothing fails."""
+    from itsbob.integrations import browser
+
+    monkeypatch.setattr(browser.shutil, "which", lambda name: None)
+    ready = browser.available({"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "empty")})
+
+    assert ready["playwright"]["ready"] is False
+    assert ready["chromium"] == {"path": "", "source": ""}
+    # Whatever the reason, it has to name the next command to run.
+    assert "install" in ready["playwright"]["why"]
+
+
+def test_playwright_is_left_to_find_its_own_download(tmp_path, monkeypatch):
+    """Its own build needs no executable_path; anything else does."""
+    from itsbob.integrations import browser
+
+    launched: dict[str, object] = {}
+
+    class _Chromium:
+        def launch_persistent_context(self, **options):
+            launched.update(options)
+            return object()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+    downloaded = _fake_download(tmp_path, "chromium-1194", "chrome-linux/chrome")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
+    monkeypatch.delenv("ITSBOB_CHROMIUM", raising=False)
+    session = browser.PlaywrightSession(profile=tmp_path / "profile")
+    session._launch(_Playwright())
+    assert "executable_path" not in launched
+    assert downloaded.exists()
+
+    # A system browser is invisible to Playwright unless it is handed over.
+    launched.clear()
+    system = tmp_path / "system-chromium"
+    system.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("ITSBOB_CHROMIUM", str(system))
+    browser.PlaywrightSession(profile=tmp_path / "profile")._launch(_Playwright())
+    assert launched["executable_path"] == str(system)
+

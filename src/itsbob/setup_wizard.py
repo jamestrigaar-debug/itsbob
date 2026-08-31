@@ -298,6 +298,45 @@ def _ask_about_network() -> dict[str, str]:
     return {"ITSBOB_AUTO_ALLOW_RISKS": "network"}
 
 
+def _ask_about_browser() -> dict[str, str]:
+    """Offer free reasoning through a browser — but only when one exists.
+
+    Asked here rather than left to the docs, because a capability nobody is
+    told about is a capability nobody turns on. Off by default, and skipped
+    entirely when there is no browser: offering a switch whose every call would
+    fail is worse than not offering it.
+    """
+    if os.environ.get("ITSBOB_DEEPSEEK", "").strip():
+        _say()
+        _say(f"  {_TICK} Browser delegation: already configured")
+        return {}
+
+    from .integrations.browser import available  # noqa: PLC0415
+
+    ready = available()
+    if not ready["preferred"]:
+        return {}
+
+    _say()
+    _say("  Free reasoning through a browser")
+    _say("  The hardest questions go to the priciest model, and they are the")
+    _say("  ones that cost. itsbob can put them to a chat site in a browser")
+    _say("  instead, and pay only for a cheap call to tidy up the answer.")
+    _say("  Slower (30s-2min), and it drives someone else's site, so it is off")
+    _say("  until you say otherwise. If it fails, the paid tier answers.")
+    _say()
+    if not _confirm("  Send the hardest questions to a browser?", default=False):
+        _say(f"  {_DOT} left off — hard questions go to the paid top tier")
+        return {}
+    found = ready["chromium"]
+    if found["path"]:
+        _say(f"  {_TICK} on — driving the {found['source']} chromium at {found['path']}")
+    else:
+        _say(f"  {_TICK} on — driving {ready['preferred']}")
+    _say("    Change it any time: ITSBOB_DEEPSEEK in ~/.itsbob/.env")
+    return {"ITSBOB_DEEPSEEK": "1"}
+
+
 def _ask_for_services() -> dict[str, str]:
     """Offer each optional capability once, with what it actually gives you.
 
@@ -420,6 +459,11 @@ def run_setup(
     #     configuring is one you will not go back and enable.
     if interactive and not keys:
         collected.update(_ask_for_services())
+
+    # 2c. And the one capability that is off by default, offered only when the
+    #     browser it needs is actually there.
+    if interactive and not keys:
+        collected.update(_ask_about_browser())
 
     if collected:
         target = write_env(collected)
