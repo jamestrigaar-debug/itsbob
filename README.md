@@ -461,6 +461,15 @@ that exists for talking to it. `ITSBOB_DISCORD_MENTION_ONLY=1` makes it stay
 quiet until tagged — for a shared channel — and `ITSBOB_DISCORD_USERS=id,id`
 limits who may drive it at all.
 
+**Only one process ever answers.** `itsbob serve` and the browser's continuous
+mode both poll the channel, and with both running each used to see every message,
+run its own turn and post its own reply — two answers to everything, and not even
+the same answer, since they are separate turns with separate state. They now
+share a lease file in `~/.itsbob`: whoever holds it answers, everyone else stands
+by. A holder that dies stops renewing and the standby takes over within ninety
+seconds; a clean stop hands over immediately. The status strip shows `standby`
+and names who is holding it, so a quiet bridge does not look like a broken one.
+
 One Discord setting has no error message and is worth knowing about: without
 **Message Content Intent** (Developer Portal → your app → Bot), Discord returns
 empty text for every message that does not tag the bot. The symptom is an
@@ -736,6 +745,7 @@ src/itsbob/
     shaping.py      payloads into complete lines, so nothing is truncated away
     briefing.py     weather + news + the condensed daily report
     discord.py      the channel as a two-way workspace
+    lease.py        one process answers the channel, whichever one is up
   scripts/        what it can do to this machine — drop a file in to add one
     system_monitor.py, network_checker.py, process_manager.py,
     file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py
@@ -770,7 +780,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            541 tests, none of which touch the network
+tests/            547 tests, none of which touch the network
 ```
 
 ## The original simulation

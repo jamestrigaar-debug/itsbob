@@ -282,13 +282,19 @@ async function refresh(){
 
   const d = s.discord || {};
   const dWarn = d.content_warning;
-  p.push(`<span class="pill ${dWarn ? "bad" : d.running ? "ok" : d.configured ? "" : "bad"}"
-    title="${esc(dWarn || (d.running
+  // Standby is not idle and not broken: another process holds the channel, so
+  // this one is deliberately quiet. Saying which stops it looking like a fault.
+  const dState = dWarn ? "cannot read" : d.standby ? "standby"
+    : d.running ? "live" : d.configured ? "idle" : "off";
+  p.push(`<span class="pill ${dWarn ? "bad" : d.running && !d.standby ? "ok" : ""}"
+    title="${esc(dWarn || (d.standby
+      ? `${d.lease?.holder || "another process"} is answering Discord — this one takes `
+        + "over if that stops"
+      : d.running
       ? `listening — ${d.handled || 0} message(s) answered, ${d.mentions || 0} of them tagged`
         + (d.mention_only ? " (only answers when tagged)" : "")
       : d.configured ? "configured, not listening — turn on continuous mode"
-      : (d.hint || "not configured")))}">discord: <b>${
-      dWarn ? "cannot read" : d.running ? "live" : d.configured ? "idle" : "off"}</b></span>`);
+      : (d.hint || "not configured")))}">discord: <b>${dState}</b></span>`);
 
   const spend = s.spend || {};
   p.push(`<span class="pill act" onclick="show('tokens')"

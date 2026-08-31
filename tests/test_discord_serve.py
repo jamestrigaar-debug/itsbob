@@ -271,3 +271,122 @@ def test_the_daemon_starts_and_stops_the_bridge_with_itself(discord, tmp_path):
     daemon.discord.stop()
     time.sleep(0.05)
     assert not daemon.discord.running
+
+
+# -- one channel, one answer ----------------------------------------------
+
+
+def test_two_bridges_on_one_channel_answer_exactly_once(discord, tmp_path):
+    """The reported bug: `itsbob serve` and the browser's continuous mode each
+    poll, each run a turn, and each post. Two replies to every message, not even
+    the same reply — separate turns with separate state, so one recommended a
+    different film from the other. The second is a whole turn's tokens spent on
+    something nobody asked for."""
+
+    served, browsed = [], []
+    daemon = DiscordBridge.from_env(
+        lambda t, **k: served.append((t, k)), home=tmp_path, role="daemon")
+    gui = DiscordBridge.from_env(
+        lambda t, **k: browsed.append((t, k)), home=tmp_path, role="browser")
+    daemon.skip_backlog = gui.skip_backlog = False
+
+    discord.human("what is my favourite manga", mentions_bot=True)
+    assert daemon.poll_once() == 1     # whoever gets there first answers
+    assert gui.poll_once() == 0        # the other stands by
+    assert gui.standby is True
+    assert "standing by" in (gui.last_error or "")
+    assert len(served) == 1 and browsed == []
+
+    # And the standby one still knows it is alive and why.
+    assert gui.status()["standby"] is True
+    assert gui.status()["lease"]["holder"] == "daemon"
+
+    # Only one reply reaches the channel.
+    class Turn:
+        final = "Berserk."
+
+    served[0][1]["on_done"](Turn(), None)
+    with discord.lock:
+        assert [p["content"] for p in discord.posted] == ["Berserk."]
+
+
+def test_the_standby_bridge_takes_over_when_the_holder_dies(discord, tmp_path):
+    """Standing by must not mean Discord goes quiet if the holder crashes."""
+    served, browsed = [], []
+    daemon = DiscordBridge.from_env(
+        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+    gui = DiscordBridge.from_env(
+        lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
+    daemon.skip_backlog = gui.skip_backlog = False
+    daemon.lease.ttl = gui.lease.ttl = 0.2
+
+    discord.human("first question", mentions_bot=True)
+    daemon.poll_once()
+    gui.poll_once()
+    assert served == ["first question"] and browsed == []
+
+    time.sleep(0.3)  # the daemon stops renewing
+    discord.human("second question", mentions_bot=True)
+    assert gui.poll_once() == 1
+    assert browsed == ["second question"]
+    assert gui.standby is False
+
+
+def test_a_clean_stop_hands_the_channel_over_at_once(discord, tmp_path):
+    served, browsed = [], []
+    daemon = DiscordBridge.from_env(
+        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+    gui = DiscordBridge.from_env(
+        lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
+    daemon.skip_backlog = gui.skip_backlog = False
+
+    discord.human("one", mentions_bot=True)
+    daemon.poll_once()
+    gui.poll_once()
+    assert gui.standby
+
+    daemon.stop()  # releases rather than waiting ninety seconds to expire
+    discord.human("two", mentions_bot=True)
+    assert gui.poll_once() == 1
+    assert browsed == ["two"]
+
+
+def test_a_handover_does_not_re_answer_what_was_already_answered(discord, tmp_path):
+    """The one window where both could act, and the one thing it must not do."""
+    served, browsed = [], []
+    daemon = DiscordBridge.from_env(
+        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+    gui = DiscordBridge.from_env(
+        lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
+    daemon.skip_backlog = gui.skip_backlog = False
+
+    discord.human("only answer me once", mentions_bot=True)
+    daemon.poll_once()
+    assert served == ["only answer me once"]
+
+    # The browser takes over with its cursor still behind, so it sees the same
+    # message again. The answered-id trail is what stops it running a turn.
+    daemon.lease.release()
+    gui.after = None
+    assert gui.poll_once() == 0
+    assert browsed == []
+
+
+def test_a_single_bridge_with_no_home_still_works(discord):
+    """The lease is an optimisation for a shared machine, not a requirement."""
+    submitted = []
+    bridge = DiscordBridge.from_env(lambda t, **k: submitted.append(t))
+    bridge.skip_backlog = False
+    assert bridge.lease is None
+    discord.human("hello", mentions_bot=True)
+    assert bridge.poll_once() == 1
+    assert submitted == ["hello"]
+
+
+def test_an_unwritable_home_answers_rather_than_going_quiet(tmp_path):
+    """One process answering twice is a smaller failure than none answering."""
+    from itsbob.integrations.lease import DiscordLease
+
+    lease = DiscordLease(path=tmp_path / "nope" / "x" / "discord.lease", role="daemon")
+    lease.path = tmp_path / "\0bad" / "discord.lease"  # unwritable by construction
+    assert lease.hold() is True
