@@ -46,6 +46,8 @@ starts clean but can still notice "third morning in a row".
 
 from __future__ import annotations
 
+import json
+import os
 import queue
 import signal
 import threading
@@ -144,6 +146,44 @@ class Daemon:
 
     # -- lifecycle ---------------------------------------------------------
 
+    # -- heartbeat ---------------------------------------------------------
+
+    @property
+    def heartbeat_path(self) -> Path:
+        return self.home / "daemon.json"
+
+    def _beat(self) -> None:
+        """Say we are alive, so anything else can tell without guessing.
+
+        A file rather than a pid check or a systemd query, because the daemon
+        may have been started any of three ways — systemd, launchd, or a person
+        in a terminal — and only one of those is visible to `systemctl`. A
+        timestamp also distinguishes *running* from *ran once and died*, which
+        a bare pid file cannot.
+        """
+        try:
+            self.heartbeat_path.write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "at": time.time(),
+                        "started_at": self.started_at,
+                        "runs": self.runs_completed,
+                        "tasks": len(self.tasks),
+                        "discord": self.discord is not None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError:  # pragma: no cover - a read-only home must not stop work
+            pass
+
+    def _clear_beat(self) -> None:
+        try:
+            self.heartbeat_path.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover
+            pass
+
     def run_forever(self) -> None:
         """Block until :meth:`stop` is called, or a stop signal arrives."""
         self.started_at = time.time()
@@ -152,6 +192,7 @@ class Daemon:
         self._emit("started", tasks=len(self.tasks), policy=self.agent.toolbox.policy.mode.value)
         try:
             while not self._stop.is_set():
+                self._beat()
                 ran = self.tick()
                 self.drain_inbox()
                 if not ran:
@@ -169,6 +210,7 @@ class Daemon:
         finally:
             if self.discord is not None:
                 self.discord.stop()
+            self._clear_beat()
             self._emit("stopped", runs=self.runs_completed, notified=self.notifications_sent)
 
     def _start_discord(self) -> None:
@@ -551,3 +593,39 @@ def _default_sink_with_discord(root: Path, *, console: bool) -> Any:
     if client is None:
         return base
     return MultiSink(sinks=[*base.sinks, DiscordSink(client=client)])
+
+
+#: A heartbeat older than this means the daemon is gone, not merely quiet. The
+#: loop beats every tick, and a tick is at most `max_sleep` (60s) apart.
+HEARTBEAT_STALE_AFTER = 180.0
+
+
+def daemon_status(home: str | Path) -> dict[str, Any]:
+    """Is `itsbob serve` running? Read from the heartbeat, not guessed.
+
+    Returns ``running`` plus whatever the daemon last wrote. A stale file is
+    reported as not running *and* says when it was last seen, which is the
+    difference between "you never started it" and "it died an hour ago".
+    """
+    path = Path(home).expanduser() / "daemon.json"
+    try:
+        beat = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"running": False, "seen": None, "reason": "no daemon has run"}
+
+    age = time.time() - float(beat.get("at") or 0)
+    if age > HEARTBEAT_STALE_AFTER:
+        return {
+            "running": False,
+            "seen": beat.get("at"),
+            "age_s": round(age),
+            "reason": f"last seen {round(age / 60)} minutes ago — it stopped",
+            **{k: beat.get(k) for k in ("pid", "runs", "tasks")},
+        }
+    return {
+        "running": True,
+        "seen": beat.get("at"),
+        "age_s": round(age),
+        "uptime_s": round(time.time() - float(beat.get("started_at") or beat.get("at") or 0)),
+        **{k: beat.get(k) for k in ("pid", "runs", "tasks", "discord")},
+    }

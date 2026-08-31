@@ -368,7 +368,8 @@ def test_discord_reports_that_it_is_not_configured_rather_than_failing(client):
 def test_the_page_links_to_the_messages_window(client):
     body = client.get("/").data
     assert b"/messages" in body
-    assert b'data-panel="apis"' in body
+    for panel in (b"activity", b"memory", b"tasks", b"tokens", b"messages", b"system"):
+        assert b'data-panel="' + panel + b'"' in body
 
 
 # -- the header must never sit on "connecting…" ----------------------------
@@ -458,4 +459,95 @@ def test_the_tasks_panel_has_its_own_endpoint(client):
 def test_the_page_loads_tasks_from_the_tasks_route(client):
     body = client.get("/").data
     assert b'api("/api/tasks")' in body
-    assert b"Could not load tasks" in body  # a named failure, not an empty panel
+    # A named failure in place, not a silently empty panel.
+    assert b"Could not load this panel" in body
+
+
+# -- the console: token tracking, serving status, network policy -----------
+
+
+def test_the_token_panel_reports_money_not_only_counts(client):
+    """A million cheap tokens and a million premium ones differ ~40x in price,
+    so a bare token count invites exactly the wrong conclusion."""
+    body = client.get("/api/tokens").get_json()
+    assert set(body) == {"today", "all_time", "recent"}
+    for key in ("usd", "tokens", "calls", "local_share", "by_model", "by_purpose"):
+        assert key in body["today"], key
+
+
+def test_spend_is_split_by_what_the_call_was_for():
+    from itsbob.llm.pricing import Ledger
+    from itsbob.llm.router import UsageRecord, UsageTracker
+    from itsbob.llm.base import Usage
+
+    tracker = UsageTracker()
+    tracker.record(UsageRecord(provider="google", model="gemini-pro-latest", ok=True,
+                               usage=Usage(10_000, 2_000), purpose="agent.step.s"))
+    tracker.record(UsageRecord(provider="ollama", model="qwen2.5:1.5b", ok=True,
+                               usage=Usage(5_000, 500), purpose="gatekeeper.local"))
+    summary = Ledger(tracker).summary()
+    assert summary["calls"] == 2
+    # Pro: 10k prompt at $1.25/M + 2k completion at $10/M = $0.0325
+    assert 0.03 < summary["usd"] < 0.035
+    assert summary["local_tokens"] == 5_500
+    assert summary["by_purpose"]["gatekeeper"]["usd"] == 0.0  # local is free
+    assert summary["by_model"]["ollama/qwen2.5:1.5b"]["local"] is True
+
+
+def test_an_unpriced_model_is_counted_as_unknown_not_guessed():
+    """A made-up number next to real ones is indistinguishable from a real one."""
+    from itsbob.llm.base import Usage
+    from itsbob.llm.pricing import estimate, price_for
+    from itsbob.llm.router import UsageRecord
+
+    assert price_for("some-model-nobody-has-heard-of") is None
+    got = estimate([UsageRecord(provider="x", model="mystery", ok=True,
+                                usage=Usage(1000, 1000))])
+    assert got["usd"] == 0.0 and got["unpriced_calls"] == 1
+    # And the cheap tier is not billed at the expensive tier's rate.
+    assert price_for("gemini-3.5-flash-lite").prompt < price_for("gemini-3.5-flash").prompt
+
+
+def test_serving_status_tells_stopped_apart_from_never_started(tmp_path):
+    import json
+    import time
+
+    from itsbob.daemon import daemon_status
+
+    assert daemon_status(tmp_path)["running"] is False
+    assert "no daemon has run" in daemon_status(tmp_path)["reason"]
+
+    beat = tmp_path / "daemon.json"
+    beat.write_text(json.dumps({"pid": 7, "at": time.time(), "started_at": time.time() - 60}))
+    live = daemon_status(tmp_path)
+    assert live["running"] is True and live["pid"] == 7
+
+    beat.write_text(json.dumps({"pid": 7, "at": time.time() - 4000}))
+    dead = daemon_status(tmp_path)
+    assert dead["running"] is False and "it stopped" in dead["reason"]
+
+
+def test_the_status_says_whether_the_daemon_is_serving(client):
+    body = client.get("/api/status").get_json()
+    assert "serving" in body and body["serving"]["running"] is False
+    assert "spend" in body and "usd" in body["spend"]
+
+
+def test_the_console_has_every_panel_and_the_status_strip(client):
+    body = client.get("/").data.decode()
+    for panel in ("activity", "memory", "tasks", "tokens", "messages", "system"):
+        assert f'data-panel="{panel}"' in body
+    assert "serving:" in body      # is the daemon running
+    assert "discord:" in body      # is it reachable in Discord
+    assert "today:" in body        # what it has cost
+    assert "AbortController" in body  # every request bounded
+    # `display:flex` beats the `hidden` attribute; this is what stops a hidden
+    # element rendering anyway, which a screenshot caught.
+    assert "[hidden]{display:none !important}" in body
+
+
+def test_recalled_memories_carry_their_attribution_to_the_panel(client):
+    """The panel shows whose memory it is; the API has to send it."""
+    client.post("/api/memory", json={"content": "prefers dark roast"})
+    hit = client.get("/api/memory").get_json()["hits"][0]
+    assert hit["subject"] == "user" and hit["horizon"] == "long"

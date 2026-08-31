@@ -20,10 +20,11 @@ from .notify import (
     default_sink,
 )
 from .schedule import Schedule, ScheduleError, parse_schedule
-from .service import Daemon, DaemonEvent, build_daemon
+from .service import Daemon, DaemonEvent, build_daemon, daemon_status
 from .tasks import Task, TaskRun, TaskStore
 
 __all__ = [
+    "daemon_status",
     "ConsoleSink",
     "Daemon",
     "DaemonEvent",

@@ -418,3 +418,45 @@ def test_audit_redacts_credentials(box):
     box.call("http_request", url="https://x.test", headers={"Authorization": "Bearer sk-live-secret"})
     dumped = json.dumps(box.audit.recent())
     assert "sk-live-secret" not in dumped
+
+
+def test_a_whole_risk_level_can_be_allowed_without_naming_every_tool():
+    """There are eight network tools and more arrive with every API, so a
+    per-tool list is out of date the moment it is written."""
+    from itsbob.tools import build_toolbox
+    from itsbob.tools.base import Risk
+
+    box = build_toolbox(workspace="/tmp/itsbob-risk-test", env={"ITSBOB_AUTO_ALLOW_RISKS": "network"})
+    assert box.policy.auto_allow_risks == frozenset({Risk.NETWORK})
+
+    def verdict(name, **params):
+        return box.policy.evaluate(box.registry._tools[name], params)
+
+    # Network runs without asking...
+    assert verdict("web_search", query="x").allowed
+    assert verdict("http_request", url="https://example.test").allowed
+    # ...and the things you cannot take back still ask.
+    assert not verdict("run_shell", command="ls").allowed
+    assert not verdict("delete_file", path="x").allowed
+
+
+def test_an_unknown_risk_level_grants_nothing_rather_than_failing():
+    """Read from an environment variable at startup: a typo must not stop boot,
+    and must not accidentally grant something either."""
+    from itsbob.tools.policy import _risks
+
+    assert _risks("netwrok, nonsense") == frozenset()
+    assert _risks("") == frozenset()
+    assert len(_risks("network,read")) == 2
+
+
+def test_always_confirm_still_wins_over_an_allowed_risk_level():
+    from itsbob.tools import build_toolbox
+
+    box = build_toolbox(
+        workspace="/tmp/itsbob-risk-test",
+        env={"ITSBOB_AUTO_ALLOW_RISKS": "network", "ITSBOB_ALWAYS_CONFIRM": "discord_post"},
+    )
+    box.policy.confirm = None
+    tool = box.registry._tools.get("http_request")
+    assert box.policy.evaluate(tool, {"url": "https://example.test"}).allowed

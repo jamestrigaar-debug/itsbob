@@ -185,6 +185,8 @@ class RecallHit:
             "id": self.record.id,
             "content": self.record.content,
             "kind": self.record.kind.value,
+            "subject": self.record.subject.value,
+            "horizon": self.record.horizon.value,
             "importance": round(self.record.importance, 3),
             "tags": list(self.record.tags),
             "created_at": self.record.created_at,

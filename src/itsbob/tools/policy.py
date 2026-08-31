@@ -164,6 +164,14 @@ class Policy:
     #: Names that always run without asking, whatever their risk. For tools you
     #: have read and trust — the escape hatch that keeps ``guarded`` usable.
     auto_allow: frozenset[str] = frozenset()
+    #: Whole *risk levels* that run without asking. `auto_allow` is per tool,
+    #: which is the wrong grain for a decision like "reading the web is fine":
+    #: there are eight network tools and more arrive with every API, so naming
+    #: them one at a time means a list that is out of date the moment it is
+    #: written. Set by the setup question "may itsbob use the network freely?"
+    #: and by ITSBOB_AUTO_ALLOW_RISKS. `always_confirm` still overrides it, so a
+    #: single tool can be pulled back out without giving up the whole level.
+    auto_allow_risks: frozenset[Risk] = frozenset()
     #: Names that always ask, whatever the mode. Wins over ``auto_allow``.
     always_confirm: frozenset[str] = frozenset()
     #: Names that never run at all.
@@ -206,7 +214,9 @@ class Policy:
         gate = self.gate_for(tool.risk)
         if tool.name in self.always_confirm:
             gate = _Gate.CONFIRM
-        elif tool.name in self.auto_allow and gate is not _Gate.DENY:
+        elif gate is not _Gate.DENY and (
+            tool.name in self.auto_allow or tool.risk in self.auto_allow_risks
+        ):
             gate = _Gate.ALLOW
 
         if gate is _Gate.ALLOW:
@@ -274,6 +284,7 @@ class Policy:
             "workspace": str(self.workspace),
             "interactive": self.confirm is not None,
             "auto_allow": sorted(self.auto_allow),
+            "auto_allow_risks": sorted(r.value for r in self.auto_allow_risks),
             "always_confirm": sorted(self.always_confirm),
             "blocked": sorted(self.blocked),
             "timeout_seconds": self.timeout_seconds,
@@ -303,11 +314,28 @@ class Policy:
             workspace=Path(root).expanduser(),
             confirm=confirm,
             auto_allow=frozenset(_csv(env.get("ITSBOB_AUTO_ALLOW", ""))),
+            auto_allow_risks=_risks(env.get("ITSBOB_AUTO_ALLOW_RISKS", "")),
             always_confirm=frozenset(_csv(env.get("ITSBOB_ALWAYS_CONFIRM", ""))),
             blocked=frozenset(_csv(env.get("ITSBOB_BLOCKED_TOOLS", ""))),
             allowed_hosts=frozenset(_csv(env.get("ITSBOB_ALLOWED_HOSTS", ""))),
             timeout_seconds=_float(env, "ITSBOB_TOOL_TIMEOUT", 60.0),
         )
+
+
+def _risks(value: str) -> frozenset[Risk]:
+    """``"network,read"`` into risk levels, ignoring anything unrecognised.
+
+    Silently dropping a typo rather than raising: this is read at startup from
+    an environment variable, and a misspelling must not stop itsbob booting.
+    An unrecognised level simply grants nothing, which is the safe direction.
+    """
+    found = set()
+    for name in _csv(value):
+        try:
+            found.add(Risk(name.strip().lower()))
+        except ValueError:
+            continue
+    return frozenset(found)
 
 
 def _csv(value: str) -> Iterable[str]:

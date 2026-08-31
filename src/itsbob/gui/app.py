@@ -48,6 +48,9 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
     from ..integrations.apis import builtin_status
     from ..tools.vision import pillow_available
     from ..tools.websearch import available_backend
+    from ..daemon.service import daemon_status
+    from ..llm.pricing import Ledger
+    from .console import CONSOLE
     from .messages import MESSAGES_PAGE, MessageLog
     from .session import Session
 
@@ -136,7 +139,33 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     @app.get("/")
     def index():
+        return Response(CONSOLE, mimetype="text/html")
+
+    @app.get("/old")
+    def old_index():
+        """The previous interface, kept one release for anyone mid-task on it."""
         return Response(PAGE, mimetype="text/html")
+
+    @app.get("/api/tokens")
+    def tokens():
+        """What it is costing, split by model and by what the call was for.
+
+        Token counts alone invite the wrong conclusion — a million Tier C
+        tokens and a million Tier S tokens differ by about forty times in
+        price — so this reports estimated money, and says which share ran
+        locally for nothing.
+        """
+        import time as _time
+
+        ledger = Ledger(session.agent.brain.tracker)
+        midnight = _time.mktime(_time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+        return jsonify(
+            {
+                "today": ledger.summary(since=midnight),
+                "all_time": ledger.summary(),
+                "recent": ledger.recent(40),
+            }
+        )
 
     @app.get("/messages")
     def messages_page():
@@ -304,11 +333,21 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         """
         payload = request.get_json(force=True, silent=True) or {}
         runner = autonomous()
+        bridge = discord()
         if bool(payload.get("enabled")):
             runner.start()
+            # Turning it on means "you have the run of the place", and being
+            # reachable in Discord is part of that. Making it a second switch
+            # somewhere else is how you end up with a bot nobody can talk to.
+            if bridge is not None and not bridge.running:
+                bridge.start()
         else:
             runner.stop()
-        return jsonify(runner.status())
+            if bridge is not None:
+                bridge.stop()
+        status = runner.status()
+        status["discord"] = {"configured": False} if bridge is None else bridge.status()
+        return jsonify(status)
 
     @app.get("/api/autonomous")
     def get_autonomous():
@@ -387,6 +426,20 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                     agent.toolbox.env
                 ), []),
                 "search_backend": _safe(problems, "search", available_backend, "unknown"),
+                # The daemon, which is a different process to this one and the
+                # only thing that runs your schedule with the browser closed.
+                "serving": _safe(problems, "serving", lambda: daemon_status(root), {}),
+                "spend": _safe(
+                    problems,
+                    "spend",
+                    lambda: Ledger(agent.brain.tracker).summary(
+                        since=__import__("time").mktime(
+                            __import__("time").localtime()[:3] + (0, 0, 0, 0, 0, -1)
+                        )
+                    ),
+                    {},
+                ),
+                "tasks_count": _safe(problems, "tasks_count", lambda: len(tasks()), 0),
                 "vision": {"pillow": _safe(problems, "vision", pillow_available, False)},
                 # Named rather than swallowed: a panel that is quietly empty
                 # because something threw is worse than one that says so.
@@ -474,6 +527,7 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
                     "autonomous": bool(
                         "autonomous" in holder and holder["autonomous"].running
                     ),
+                    "serving": bool(daemon_status(root).get("running")),
                 },
             }
         )
@@ -531,6 +585,8 @@ def _record_dict(record: Any) -> dict[str, Any]:
         "id": record.id,
         "content": record.content,
         "kind": record.kind.value,
+        "subject": record.subject.value,
+        "horizon": record.horizon.value,
         "tags": list(record.tags),
         "created_at": record.created_at,
         "score": 0.0,
