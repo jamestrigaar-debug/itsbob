@@ -443,10 +443,30 @@ carries the unread count and opens it in its own window.
 ### Discord
 
 Set `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` and the channel becomes a
-two-way workspace. Outbound: anything the notice gate passes is posted there,
-including messages itsbob starts himself. Inbound: what you type in the channel
-becomes an ordinary turn, queued alongside anything typed in the browser — one
-agent, one queue, so nothing interleaves. Built on the REST API with `urllib`
+two-way workspace, under `itsbob serve` or with continuous mode on in the
+browser. Outbound: anything the notice gate passes is posted there, including
+messages itsbob starts himself. Inbound: what you type in the channel becomes an
+ordinary turn, queued alongside anything typed in the browser — one agent, one
+queue, so nothing interleaves.
+
+**Tag it and it answers.** A mention is always acted on, and the tag itself is
+stripped before the message reaches the model — `@itsbob what is the score`
+arrives as `what is the score`, because a tag is addressing rather than content.
+Replying to one of its own messages counts as tagging it too. Answers go back as
+threaded replies, so in a channel with traffic an answer sits under its question
+instead of floating loose.
+
+By default it answers everything in the channel, which is right for a channel
+that exists for talking to it. `ITSBOB_DISCORD_MENTION_ONLY=1` makes it stay
+quiet until tagged — for a shared channel — and `ITSBOB_DISCORD_USERS=id,id`
+limits who may drive it at all.
+
+One Discord setting has no error message and is worth knowing about: without
+**Message Content Intent** (Developer Portal → your app → Bot), Discord returns
+empty text for every message that does not tag the bot. The symptom is an
+assistant that seems to ignore everything until @-ed. itsbob detects that
+pattern and says so in the status strip and in `itsbob doctor`, rather than
+leaving it to be guessed at. Built on the REST API with `urllib`
 rather than the gateway, so there is no websocket, no async runtime and no new
 dependency; it polls every few seconds, which is how often a person looks at a
 channel anyway. Long messages are split on paragraph breaks, rate limits are
@@ -591,6 +611,8 @@ FOOTBALL_DATA_KEY=…             # fixtures, standings and scorers via call_api
 # Discord: the channel becomes a two-way workspace.
 DISCORD_BOT_TOKEN=…
 DISCORD_CHANNEL_ID=…
+ITSBOB_DISCORD_MENTION_ONLY=      # 1 to stay quiet until tagged (shared channels)
+ITSBOB_DISCORD_USERS=             # comma-separated ids allowed to drive it
 
 # Where the weather is. Defaults to Hull, UK.
 ITSBOB_WEATHER_PLACE="Hull, UK"
@@ -748,7 +770,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            531 tests, none of which touch the network
+tests/            541 tests, none of which touch the network
 ```
 
 ## The original simulation

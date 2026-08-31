@@ -96,12 +96,7 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         """The Discord bridge, built once if a token and channel are configured."""
         with holder_lock:
             if "discord" not in holder:
-                client = DiscordClient.from_env()
-                holder["discord"] = (
-                    None
-                    if client is None
-                    else DiscordBridge(client=client, submit=session.submit)
-                )
+                holder["discord"] = DiscordBridge.from_env(session.submit)
             return holder["discord"]
 
     def sink() -> Any:

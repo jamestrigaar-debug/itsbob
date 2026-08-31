@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "DiscordClient",
@@ -110,6 +110,7 @@ class DiscordClient:
     last_error: str | None = None
     sent: int = 0
     received: int = 0
+    _me: dict[str, Any] | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "DiscordClient | None":
@@ -204,6 +205,44 @@ class DiscordClient:
         """The newest message id right now, used to start without a backlog."""
         rows = self.fetch(limit=1)
         return str(rows[-1]["id"]) if rows else None
+
+    def me(self) -> dict[str, Any]:
+        """The bot's own account, cached. Needed to recognise being tagged.
+
+        Cached because it cannot change while the process runs, and this is on
+        the path of every poll.
+        """
+        if self._me is None:
+            self._me = dict(self._call("GET", "/users/@me") or {})
+        return self._me
+
+    @property
+    def user_id(self) -> str:
+        try:
+            return str(self.me().get("id") or "")
+        except DiscordError:
+            return ""
+
+    def reply_to(self, message_id: str, content: str) -> list[str]:
+        """Post as a threaded reply, so an answer sits under its question.
+
+        In a channel with any traffic at all, a bare message is an answer with
+        no visible question. ``fail_if_not_exists: False`` means a deleted
+        original degrades to an ordinary post rather than losing the reply.
+        """
+        ids: list[str] = []
+        for index, chunk in enumerate(split_message(content)):
+            body: dict[str, Any] = {"content": chunk}
+            if index == 0 and message_id:
+                body["message_reference"] = {
+                    "message_id": str(message_id),
+                    "fail_if_not_exists": False,
+                }
+            payload = self._call("POST", f"/channels/{self.channel_id}/messages", body)
+            self.sent += 1
+            if isinstance(payload, dict) and payload.get("id"):
+                ids.append(str(payload["id"]))
+        return ids
 
     def check(self) -> tuple[bool, str]:
         """Can this bot actually see the channel? One cheap read, for `doctor`.
@@ -318,12 +357,22 @@ class DiscordBridge:
     #: post in the channel can — which is the right default for a private
     #: channel and the wrong one for a public server, hence the switch.
     allowed_users: frozenset[str] = frozenset()
+    #: Answer only when tagged. Off by default, because the common setup is a
+    #: channel that exists for talking to itsbob, where making people @ it every
+    #: time is pure ceremony. Turn it on (ITSBOB_DISCORD_MENTION_ONLY=1) for a
+    #: shared channel where it should stay quiet until spoken to. A mention is
+    #: always answered either way — that is what tagging *means*.
+    mention_only: bool = False
     after: str | None = None
     running: bool = False
     polls: int = 0
     handled: int = 0
+    mentions: int = 0
     errors: int = 0
     last_error: str | None = None
+    #: Set when Discord returned messages whose content was blank — the
+    #: signature of a bot without the Message Content intent.
+    content_warning: str | None = None
     _thread: Any = field(default=None, repr=False)
     _stop: Any = field(default_factory=threading.Event, repr=False)
 
@@ -369,22 +418,86 @@ class DiscordBridge:
             # forever. Set per row it could move backwards if a batch ever
             # arrived out of order.
             self.after = str(rows[-1].get("id") or self.after)
+        self._check_content_intent(rows)
         for row in rows:
             if not self._is_input(row):
                 continue
-            content = str(row.get("content") or "").strip()
+            tagged = self.mentions_us(row)
+            if self.mention_only and not tagged:
+                continue
+            content = self._clean(row)
             if not content:
                 continue
             author = str((row.get("author") or {}).get("username") or "someone")
             self.handled += 1
+            if tagged:
+                self.mentions += 1
             submitted += 1
+            message_id = str(row.get("id") or "")
             self.submit(
                 content,
                 source="discord",
-                label=f"discord ({author}): {content[:50]}",
-                on_done=self._reply,
+                label=f"discord ({author}){' @you' if tagged else ''}: {content[:44]}",
+                on_done=lambda turn, error, mid=message_id: self._reply(turn, error, mid),
             )
         return submitted
+
+    def mentions_us(self, row: Mapping[str, Any]) -> bool:
+        """Whether this message tagged the bot.
+
+        Checked against the `mentions` array Discord supplies rather than by
+        scanning the text: a mention is `<@123>` or `<@!123>` depending on age
+        and client, and someone typing the bot's display name is not a mention
+        at all.
+        """
+        me = self.client.user_id
+        if not me:
+            return False
+        for mentioned in row.get("mentions") or []:
+            if str((mentioned or {}).get("id")) == me:
+                return True
+        # A reply to one of the bot's own messages is a mention in every sense
+        # that matters, and Discord does not always populate `mentions` for it.
+        referenced = row.get("referenced_message") or {}
+        return str((referenced.get("author") or {}).get("id") or "") == me
+
+    def _clean(self, row: Mapping[str, Any]) -> str:
+        """The message with the bot's own tag removed.
+
+        "@itsbob what is the score" should reach the agent as "what is the
+        score" — the tag is addressing, not content, and leaving it in invites
+        the model to wonder who `<@1543…>` is.
+        """
+        content = str(row.get("content") or "")
+        me = self.client.user_id
+        if me:
+            for form in (f"<@{me}>", f"<@!{me}>"):
+                content = content.replace(form, " ")
+        return " ".join(content.split())
+
+    def _check_content_intent(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Notice a bot that cannot read what people type.
+
+        Discord withholds message content from apps without the Message
+        Content intent — except in messages that tag the bot. The symptom is
+        a channel that only ever answers when @-ed and otherwise appears to
+        ignore everything, with no error anywhere. It is a checkbox in the
+        Developer Portal, and worth naming rather than leaving to be guessed.
+        """
+        from_others = [
+            row for row in rows
+            if not (row.get("author") or {}).get("bot")
+        ]
+        if not from_others or self.content_warning:
+            return
+        blank = [row for row in from_others if not str(row.get("content") or "").strip()]
+        if len(blank) == len(from_others) and len(blank) >= 2:
+            self.content_warning = (
+                "Discord returned empty text for every message from a person. That is "
+                "what happens without the Message Content intent: turn on "
+                "'MESSAGE CONTENT INTENT' under Bot in the Developer Portal. Until "
+                "then itsbob can only read messages that tag it."
+            )
 
     def _is_input(self, row: Mapping[str, Any]) -> bool:
         """Whether a message should become a turn.
@@ -399,14 +512,14 @@ class DiscordBridge:
             return False
         return not str(row.get("content") or "").startswith("//")  # a convention for notes
 
-    def _reply(self, turn: Any, error: str | None) -> None:
+    def _reply(self, turn: Any, error: str | None, message_id: str = "") -> None:
         text = getattr(turn, "final", "") if turn is not None else ""
         if error:
             text = f"⚠️ That went wrong: {error}"
         if not text:
             return
         try:
-            self.client.send(text)
+            self.client.reply_to(message_id, text)
         except DiscordError as exc:
             self.errors += 1
             self.last_error = str(exc)
@@ -417,10 +530,31 @@ class DiscordBridge:
             "interval": self.interval,
             "polls": self.polls,
             "handled": self.handled,
+            "mentions": self.mentions,
+            "mention_only": self.mention_only,
             "errors": self.errors,
             "last_error": self.last_error or self.client.last_error,
+            "content_warning": self.content_warning,
             **self.client.describe(),
         }
+
+    @classmethod
+    def from_env(
+        cls, submit: Callable[..., Any], env: Mapping[str, str] | None = None
+    ) -> "DiscordBridge | None":
+        env = os.environ if env is None else env
+        client = DiscordClient.from_env(env)
+        if client is None:
+            return None
+        return cls(
+            client=client,
+            submit=submit,
+            mention_only=str(env.get("ITSBOB_DISCORD_MENTION_ONLY", "")).strip().lower()
+            in ("1", "true", "yes", "on"),
+            allowed_users=frozenset(
+                u.strip() for u in str(env.get("ITSBOB_DISCORD_USERS", "")).split(",") if u.strip()
+            ),
+        )
 
 
 # -- the tool --------------------------------------------------------------

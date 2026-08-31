@@ -695,6 +695,17 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         client = DiscordClient.from_env()
         reachable, detail = client.check() if client else (False, "not configured")
         print(f"  {'ok ' if reachable else '!! '}{'discord':<10} {detail}")
+        if reachable and client is not None:
+            # Being able to read the channel and being able to read what people
+            # *type* in it are different permissions, and only one of them has
+            # an error message.
+            identity = client.user_id
+            print(
+                f"      posting as {client.me().get('username', '?')} (id {identity}) — "
+                "tag it in the channel and it replies"
+                if identity
+                else "      could not read the bot's own identity, so tagging will not work"
+            )
     else:
         print(f"  --  {'discord':<10} proactive posting and two-way chat"
               "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)")

@@ -281,11 +281,14 @@ async function refresh(){
     >serving: <b>${serve.running ? "yes" : "no"}</b></span>`);
 
   const d = s.discord || {};
-  p.push(`<span class="pill ${d.running ? "ok" : d.configured ? "" : "bad"}"
-    title="${esc(d.running ? "listening to the channel"
+  const dWarn = d.content_warning;
+  p.push(`<span class="pill ${dWarn ? "bad" : d.running ? "ok" : d.configured ? "" : "bad"}"
+    title="${esc(dWarn || (d.running
+      ? `listening — ${d.handled || 0} message(s) answered, ${d.mentions || 0} of them tagged`
+        + (d.mention_only ? " (only answers when tagged)" : "")
       : d.configured ? "configured, not listening — turn on continuous mode"
-      : (d.hint || "not configured"))}">discord: <b>${
-      d.running ? "live" : d.configured ? "idle" : "off"}</b></span>`);
+      : (d.hint || "not configured")))}">discord: <b>${
+      dWarn ? "cannot read" : d.running ? "live" : d.configured ? "idle" : "off"}</b></span>`);
 
   const spend = s.spend || {};
   p.push(`<span class="pill act" onclick="show('tokens')"
