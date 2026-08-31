@@ -571,8 +571,23 @@ async function addMemory(){
 }
 
 async function drawTasks(){
-  const s = state.status || await api("/api/status");
-  $("right").innerHTML = s.tasks.length ? s.tasks.map(t => `<div class="row">
+  // Its own endpoint, not a slice of /api/status: the tasks panel used to be
+  // the only one coupled to that payload, so it went dark whenever anything
+  // unrelated in it was slow.
+  let s;
+  try{
+    s = await api("/api/tasks");
+  }catch(e){
+    $("right").innerHTML = `<p class="empty">Could not load tasks: ${esc(e.message)}<br>
+      <button class="btn" onclick="drawTasks()">Try again</button></p>`;
+    return;
+  }
+  const note = s.tasks.length && !s.runner?.autonomous
+    ? `<div class="card"><div class="body"><div class="note">
+        Nothing is running these right now. Turn on continuous mode (the button
+        top-left), or run <code>itsbob serve</code>.</div></div></div>`
+    : "";
+  $("right").innerHTML = note + (s.tasks.length ? s.tasks.map(t => `<div class="row">
       <div class="grow">
         <div>${esc(t.name)} <span class="pill">${esc(t.schedule)}</span>
           ${t.enabled ? "" : '<span class="pill">paused</span>'}</div>
@@ -583,10 +598,11 @@ async function drawTasks(){
       <button class="x" onclick="taskAct('${t.enabled?"disable":"enable"}','${t.id}')">${t.enabled?"pause":"resume"}</button>
       <button class="x" onclick="taskAct('remove','${t.id}')">remove</button></div>`).join("")
     : `<p class="empty">No scheduled work yet.<br>
-        Add one below — it runs whenever <code>itsbob serve</code> is running.</p>`;
+        Add one below — it runs under continuous mode, or <code>itsbob serve</code>.</p>`);
 }
 async function taskAct(action, id){
-  try{ await post("/api/task/" + action, {id}); }catch(e){ alert(e.message); }
+  try{ await post("/api/task/" + action, {id}); }
+  catch(e){ alert(e.message); return; }
   if(action === "run"){ state.panel = "activity"; syncTabs(); }
   await refresh(); render();
 }
@@ -595,6 +611,8 @@ async function addTask(){
   if(!(n && p && s)) return alert("Name, instruction and schedule are all needed.");
   try{ await post("/api/task", {name:n, prompt:p, schedule:s}); }
   catch(e){ return alert(e.message); }
+  // Cleared only once the server has actually accepted it — clearing on a
+  // rejected schedule threw away what you typed along with the mistake.
   ["tn","tp","ts"].forEach(i => $(i).value = "");
   await refresh(); drawTasks();
 }

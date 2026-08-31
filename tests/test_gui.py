@@ -433,3 +433,29 @@ def test_the_page_bounds_its_requests(client):
     body = client.get("/").data
     assert b"AbortController" in body
     assert b"status unavailable" in body  # a named failure, not "connecting…"
+
+
+def test_the_tasks_panel_has_its_own_endpoint(client):
+    """It was the only panel reading its data out of /api/status.
+
+    That coupling is why it went dark alongside the header when the status
+    endpoint deadlocked: memory, scripts and audit each have their own route
+    and kept working. A panel should depend on what it shows and nothing else.
+    """
+    created = client.post(
+        "/api/task", json={"name": "briefing", "prompt": "brief me", "schedule": "daily at 07:00"}
+    ).get_json()
+    body = client.get("/api/tasks").get_json()
+    assert [t["name"] for t in body["tasks"]] == ["briefing"]
+    assert body["next_due"]
+    # And it says whether anything will actually run them, which is the most
+    # common "my task never fired".
+    assert body["runner"]["autonomous"] is False
+    assert client.post("/api/task/remove", json={"id": created["task"]["id"]}).get_json()["ok"]
+    assert client.get("/api/tasks").get_json()["tasks"] == []
+
+
+def test_the_page_loads_tasks_from_the_tasks_route(client):
+    body = client.get("/").data
+    assert b'api("/api/tasks")' in body
+    assert b"Could not load tasks" in body  # a named failure, not an empty panel

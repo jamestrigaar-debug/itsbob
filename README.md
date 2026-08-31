@@ -679,7 +679,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            468 tests, none of which touch the network
+tests/            479 tests, none of which touch the network
 ```
 
 ## The original simulation

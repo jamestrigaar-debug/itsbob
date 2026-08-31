@@ -156,3 +156,20 @@ def test_an_unexpected_error_is_a_message_not_a_traceback(home, capsys, monkeypa
 def test_the_simulation_still_runs(home, capsys):
     assert main(["run", "--ticks", "3", "--policy", "heuristic", "--offline"]) == 0
     assert capsys.readouterr().out.count("energy") == 3
+
+
+def test_a_question_does_not_need_quoting():
+    """`itsbob ask give me the football results` was an argparse error that read
+    like the *command* was wrong, not the quoting."""
+    from itsbob.cli import _build_parser
+
+    args = _build_parser().parse_args(["ask", "give", "me", "the", "latest", "results"])
+    assert " ".join(args.prompt) == "give me the latest results"
+
+
+def test_chat_takes_an_opening_message():
+    from itsbob.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["chat"]).message == []
+    assert " ".join(parser.parse_args(["chat", "hello", "there"]).message) == "hello there"
