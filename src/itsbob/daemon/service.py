@@ -571,12 +571,9 @@ def build_daemon(
 
 def _build_bridge(daemon: Daemon) -> Any:
     """The Discord bridge, wired to answer through the daemon's own inbox."""
-    from ..integrations.discord import DiscordBridge, DiscordClient
+    from ..integrations.discord import DiscordBridge
 
-    client = DiscordClient.from_env()
-    if client is None:
-        return None
-    return DiscordBridge(client=client, submit=daemon.submit_message)
+    return DiscordBridge.from_env(daemon.submit_message)
 
 
 def _default_sink_with_discord(root: Path, *, console: bool) -> Any:
