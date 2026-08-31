@@ -471,13 +471,14 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         record = session.agent.memory.add(
             MemoryRecord(
                 content=content,
-                kind=MemoryKind(str(payload.get("kind", "fact"))),
+                kind=MemoryKind.coerce(payload.get("kind", "fact")),
+                subject=payload.get("subject") or "user",
                 importance=float(payload.get("importance", 0.6)),
                 tags=tuple(payload.get("tags") or ()),
                 metadata={"source": "gui"},
             )
         )
-        return jsonify({"id": record.id})
+        return jsonify({"id": record.id, "tags": list(record.tags)})
 
     @app.post("/api/memory/forget")
     def memory_forget():

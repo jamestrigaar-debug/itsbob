@@ -671,3 +671,90 @@ def test_a_tool_already_in_play_keeps_its_description(tmp_path):
     # Memory tools keep their prose throughout: they are reached for late.
     remember = next(x for x in second.splitlines() if x.startswith("- remember("))
     assert "—" in remember
+
+
+# -- paying out a list that was announced ----------------------------------
+
+
+def test_an_answer_that_names_a_count_is_asked_to_pay_it_out(tmp_path):
+    """The exact reported failure: '10 matches were played', then two named."""
+    from itsbob.integrations.shaping import shape
+
+    shaped = shape("football", "matches", {
+        "competition": {"name": "Premier League"},
+        "matches": [
+            {"homeTeam": {"name": f"Home {i} FC"}, "awayTeam": {"name": f"Away {i} FC"},
+             "score": {"fullTime": {"home": i % 3, "away": 1}}, "status": "FINISHED"}
+            for i in range(10)
+        ],
+    })
+
+    class Fixed:
+        """A tool that hands back a full list, whatever it is asked."""
+
+        name = "list_things"
+        description = "Return ten things."
+        risk = __import__("itsbob.tools.base", fromlist=["Risk"]).Risk.READ
+        mutates = False
+        parameters = {"type": "object", "properties": {}}
+
+    from itsbob.tools.base import Risk, Tool, ToolResult
+
+    tool = Tool(name="list_things", description="Return ten things.",
+                run=lambda p, c: ToolResult(ok=True, output=shaped), risk=Risk.READ)
+    toolbox = build_toolbox(workspace=tmp_path / "ws", mode=Mode.TRUSTED, env={},
+                            extra_tools=[tool])
+    brain = FakeBrain([
+        {"thought": "fetch", "tool": "list_things", "params": {}},
+        {"final": "10 matches were played, including Home 0 and Home 1, among others."},
+        {"final": "All ten:\n" + "\n".join(f"- Home {i} beat Away {i}" for i in range(10))},
+    ])
+    agent = Agent(brain=brain, toolbox=toolbox, memory=None, persona=Persona(name="Test"),
+                  writer=None, gatekeeper=Gatekeeper())
+    turn = agent.chat("give me every match result from the weekend please")
+
+    assert turn.rewritten_for_completeness
+    assert turn.final.startswith("All ten:")
+    for i in range(10):
+        assert f"Home {i}" in turn.final
+
+
+def test_a_complete_answer_costs_no_extra_call(tmp_path):
+    """The check is free; only the rewrite costs, and it must stay rare."""
+    from itsbob.tools.base import Risk, Tool, ToolResult
+
+    shaped = "4 results, all listed:\n" + "\n".join(f"- row {i}" for i in range(4))
+    tool = Tool(name="list_things", description="d",
+                run=lambda p, c: ToolResult(ok=True, output=shaped), risk=Risk.READ)
+    toolbox = build_toolbox(workspace=tmp_path / "ws", mode=Mode.TRUSTED, env={},
+                            extra_tools=[tool])
+    complete = "Here they are:\n" + "\n".join(f"- row {i}" for i in range(4))
+    brain = FakeBrain([
+        {"thought": "fetch", "tool": "list_things", "params": {}},
+        {"final": complete},
+    ])
+    agent = Agent(brain=brain, toolbox=toolbox, memory=None, persona=Persona(name="Test"),
+                  writer=None, gatekeeper=Gatekeeper())
+    turn = agent.chat("list everything you can find for me right now")
+    assert not turn.rewritten_for_completeness
+    assert turn.final == complete
+    assert brain.script == []  # the third scripted reply was never needed
+
+
+def test_standing_style_preferences_reach_every_prompt(tmp_path):
+    """A rule about formatting is never similar to the query, so recall alone
+    would never surface it — it goes straight into the persona instead."""
+    from itsbob.memory.base import MemoryRecord
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    store.add(MemoryRecord(content="Always list every match in full — never summarise.",
+                           tags=("style",)))
+    agent = _agent(tmp_path, [{"final": "ok"}], memory=store)
+    agent.chat("what is the weather like")
+    # The step prompt, not the memory writer's — that has its own system message.
+    system = next(
+        r.messages[0].content for r in agent.brain.requests
+        if "You are Test" in r.messages[0].content
+    )
+    assert "Always list every match in full" in system
+    assert "How this user wants to be answered" in system or "How to answer" in system
