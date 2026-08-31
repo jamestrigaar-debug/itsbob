@@ -102,6 +102,12 @@ MAX_CONSECUTIVE_FAILURES = 3
 #: Tiers cheap enough that the full system prompt costs more than it earns.
 _BRIEF_TIERS = frozenset({Tier.C, Tier.B})
 
+#: Keep the descriptions for these on every step. They are the tools a model
+#: reaches for *late* in a turn — after the work is done and it is deciding
+#: what to write down or how to finish — so they are the ones whose prose is
+#: still doing something at step nine.
+_ALWAYS_DESCRIBED = frozenset({"remember", "recall", "keep_memory", "forget"})
+
 
 class TurnGuard:
     """Stops the three ways a step loop wastes a budget without progressing."""
@@ -322,22 +328,26 @@ class Agent:
                 return self._forced_answer(snapshot, turn, tier, overspent), tier
 
             brief = tier in _BRIEF_TIERS
+            # After the first step, tool *descriptions* stop earning their
+            # keep: choosing is done, and what remains is calling. Everything
+            # stays listed and callable — the roster below is complete — but
+            # only the tools already in play keep their prose. Measured at 37
+            # tools this is ~1,900 tokens a step down to ~650.
+            in_play = {step.tool for step in turn.steps if step.tool}
+            first_step = not turn.steps
             messages = build_messages(
                 persona=self.persona,
-                tools=self.toolbox.render_for_prompt(),
+                tools=self.toolbox.render_for_prompt(
+                    describe_only=None if first_step else (in_play | _ALWAYS_DESCRIBED)
+                ),
                 snapshot_text=snapshot.render(),
                 conversation=self.conversation,
                 memories=memories,
                 steps=turn.steps,
-                # The API block is a fixed cost paid on every step; a cheap tier
-                # doing one obvious thing does not need the catalogue.
-                apis=""
-                if brief
-                else (
-                    self.toolbox.catalog.render_for_prompt(self.toolbox.env)
-                    if self.toolbox.catalog is not None and len(self.toolbox.catalog)
-                    else ""
-                ),
+                # The API block is a fixed cost paid on every step. A cheap tier
+                # doing one obvious thing does not need the catalogue, and
+                # neither does a step that is not about to call an API.
+                apis=self._api_block(brief, first_step, in_play),
                 workspace=self.toolbox.policy.workspace,
                 policy_note="" if brief else _policy_note(self.toolbox),
                 tool_names=self.toolbox.registry.names(),
@@ -481,6 +491,24 @@ class Agent:
         return min(self.hard_max_steps, budget + self.extend_by)
 
     # -- helpers -----------------------------------------------------------
+
+    def _api_block(self, brief: bool, first_step: bool, in_play: set[str]) -> str:
+        """The configured-API list, when it can still change a decision.
+
+        Shown on the first step (where the API might be chosen) and on any
+        later step that has already reached for one (where the worked examples
+        are what fix a bad call). Otherwise it is ~340 tokens of catalogue paid
+        for nothing.
+        """
+        catalog = self.toolbox.catalog
+        if catalog is None or not len(catalog):
+            return ""
+        if "call_api" in in_play:
+            # Already reaching for an API: the worked examples are exactly what
+            # turns a failed call into a right one, so they are shown even on a
+            # cheap tier that otherwise skips this block.
+            return catalog.render_for_prompt(self.toolbox.env)
+        return "" if brief or not first_step else catalog.render_for_prompt(self.toolbox.env)
 
     def _snapshot(self, message: str, context: Any) -> Snapshot:
         snapshot = compress(message)

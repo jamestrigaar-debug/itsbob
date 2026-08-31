@@ -144,8 +144,8 @@ class Toolbox:
     def call(self, name: str, /, **params: Any) -> ToolResult:
         return self.invoke(ToolCall(name, params))
 
-    def render_for_prompt(self) -> str:
-        return self.registry.render_for_prompt()
+    def render_for_prompt(self, **kwargs: Any) -> str:
+        return self.registry.render_for_prompt(**kwargs)
 
     def describe(self) -> dict[str, Any]:
         return {

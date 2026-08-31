@@ -72,7 +72,8 @@ class ApiSpec:
 
     def render_examples(self, indent: str = "  ") -> list[str]:
         return [
-            f"{indent}call_api(api='{self.name}', {call})\n{indent}  → {note}"
+            f"{indent}call_api(api='{self.name}', {call})"
+            + (f"\n{indent}  → {note}" if note else "")
             for call, note in self.examples
         ]
 

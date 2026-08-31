@@ -606,3 +606,68 @@ def test_short_term_memory_is_pruned_by_count_and_by_clock(tmp_path):
     assert store.prune_short_term(keep=0) == 0
     assert store.get(stale.id).expires_at is None
     assert time.time() > 0  # (the clock is only used for the TTL above)
+
+
+# -- what a turn actually costs --------------------------------------------
+
+
+def test_later_steps_send_a_smaller_prompt_than_the_first(tmp_path):
+    """Measured, not asserted by construction: the descriptions stop being
+    re-sent once choosing is done, which was ~1,900 tokens a step at 37 tools."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    for i in range(6):
+        (workspace / f"f{i}.txt").write_text("x" * 200, encoding="utf-8")
+
+    script = [
+        {"thought": "reading", "tool": "read_file", "params": {"path": f"f{i}.txt"}}
+        for i in range(6)
+    ] + [{"final": "done"}]
+    agent = _agent(tmp_path, script, max_steps=10)
+    agent.chat("read all six files in the workspace and summarise them")
+
+    # Only the step requests: the feasibility screen and the gatekeeper make
+    # their own calls, and neither carries a tool list.
+    systems = [
+        r.messages[0].content
+        for r in agent.brain.requests
+        if "- read_file(" in r.messages[0].content
+    ]
+    assert len(systems) >= 3
+    # The prompt grows with the scratchpad, so compare the fixed part instead:
+    # the system message, which is where the tool list lives.
+    assert len(systems[1]) < len(systems[0]) * 0.65
+    # And nothing became uncallable.
+    for name in agent.toolbox.registry.names():
+        assert name in systems[1], f"{name} disappeared from the shortened prompt"
+
+
+def test_a_tool_already_in_play_keeps_its_description(tmp_path):
+    """What it is still reasoning about stays legible; the rest is signatures."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "a.txt").write_text("hello", encoding="utf-8")
+
+    agent = _agent(
+        tmp_path,
+        [
+            {"thought": "read it", "tool": "read_file", "params": {"path": "a.txt"}},
+            {"thought": "again", "tool": "read_file", "params": {"path": "a.txt"}},
+            {"final": "done"},
+        ],
+    )
+    agent.chat("read a.txt and tell me what is in it please")
+    steps = [
+        r.messages[0].content
+        for r in agent.brain.requests
+        if "- read_file(" in r.messages[0].content
+    ]
+    second = steps[1]
+    assert "- read_file(" in second
+    read_line = next(x for x in second.splitlines() if x.startswith("- read_file("))
+    assert "—" in read_line  # kept its prose: it is the tool in play
+    other = next(x for x in second.splitlines() if x.startswith("- check_network("))
+    assert "—" not in other  # signature only
+    # Memory tools keep their prose throughout: they are reached for late.
+    remember = next(x for x in second.splitlines() if x.startswith("- remember("))
+    assert "—" in remember

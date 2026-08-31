@@ -57,12 +57,20 @@ Every turn is billed, so five things work to keep the bill honest:
 - **A turn it cannot finish does not start.** One cheap call reads the request
   against the tools that actually exist. Discovering "there is no key for that"
   in one small call beats discovering it eight premium steps later. It is
-  biased toward yes: a false refusal is worse than a wasted turn.
-- **The prompt is on a diet.** Cheap tiers get a short system prompt (754
-  characters against 3002) with no API catalogue; older scratchpad steps
-  collapse to one line naming the call and whether it worked; observation
-  clipping tightens as a turn goes on; tool output is condensed at the source
-  rather than dumped raw.
+  biased toward yes: a false refusal is worse than a wasted turn — which is
+  also why it only runs on every request when Ollama makes it free. Without a
+  local model it is reserved for requests long enough to imply a long turn,
+  since a screen that rarely refuses anything must not cost a call per turn.
+- **The prompt is on a diet.** The big one: after the first step of a turn,
+  tool *descriptions* stop being re-sent. The description is how you *choose* a
+  tool and the signature is how you *call* one — by step two the choosing is
+  done, so everything stays listed and callable but only the tools in play keep
+  their prose. At 37 tools that is ~1,900 tokens a step down to ~650, measured
+  at **23% off a 16-step turn and 19% off a three-step one**. On top: cheap
+  tiers get a short system prompt (754 characters against 3002), the API
+  catalogue appears only where it can change a decision, older scratchpad steps
+  collapse to one line, observation clipping tightens as a turn goes on, and
+  tool output is condensed at the source rather than dumped raw.
 - **A spend ceiling per turn and per day.** Hitting it does not kill the turn —
   it tells it to stop and answer with what it has.
 - **Durable facts go in memory rather than into every prompt.**
@@ -679,7 +687,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            479 tests, none of which touch the network
+tests/            498 tests, none of which touch the network
 ```
 
 ## The original simulation

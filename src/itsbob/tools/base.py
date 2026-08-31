@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 __all__ = [
     "Risk",
@@ -292,15 +292,28 @@ class Tool:
             "mutates": self.mutates,
         }
 
-    def render_for_prompt(self) -> str:
-        """One compact line per tool — this is what the model actually reads."""
+    def signature(self) -> str:
+        """``name(arg: type, optional?: type)`` — how to *call* it."""
         args = []
         for key, spec in self.properties.items():
             kind = spec.get("type", "any")
             flag = "" if key in self.required else "?"
             args.append(f"{key}{flag}: {kind}")
-        signature = f"{self.name}({', '.join(args)})"
-        line = f"- {signature} — {self.description}"
+        return f"{self.name}({', '.join(args)})"
+
+    def render_for_prompt(self, *, described: bool = True) -> str:
+        """One line per tool — this is what the model actually reads.
+
+        ``described=False`` drops the prose, leaving the signature. The split
+        matters because the two halves answer different questions: the
+        description is how you *choose* a tool, the signature is how you
+        *call* one. After the first step of a turn the choosing is largely
+        done, and re-sending 37 descriptions on every subsequent step was the
+        single largest fixed cost in the prompt (~2,000 tokens a step).
+        """
+        line = f"- {self.signature()}"
+        if described:
+            line += f" — {self.description}"
         if self.risk >= Risk.EXECUTE:
             line += f" [risk: {self.risk.value}]"
         return line
@@ -402,12 +415,34 @@ class ToolRegistry:
     def specs(self) -> list[dict[str, Any]]:
         return [tool.spec() for tool in self.all()]
 
-    def render_for_prompt(self, *, max_risk: Risk | None = None) -> str:
-        """The tool list as the model sees it, cheapest-to-describe first."""
+    def render_for_prompt(
+        self,
+        *,
+        max_risk: Risk | None = None,
+        described: bool = True,
+        describe_only: Collection[str] | None = None,
+    ) -> str:
+        """The tool list as the model sees it.
+
+        ``describe_only`` keeps full descriptions for those names and reduces
+        the rest to signatures — used from the second step of a turn onwards,
+        where the tools already in play are the ones still being reasoned
+        about and the rest only need to remain callable.
+        """
         tools = self.all()
         if max_risk is not None:
             tools = [t for t in tools if not (t.risk > max_risk)]
-        return "\n".join(tool.render_for_prompt() for tool in tools) or "- (no tools available)"
+        if not tools:
+            return "- (no tools available)"
+        lines = [
+            tool.render_for_prompt(
+                described=described
+                if describe_only is None
+                else (described and tool.name in describe_only)
+            )
+            for tool in tools
+        ]
+        return "\n".join(lines)
 
     def suggest(self, name: str, *, limit: int = 3) -> list[str]:
         """Near-miss names, so a wrong guess gets a usable correction back."""

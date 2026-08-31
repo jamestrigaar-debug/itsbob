@@ -155,19 +155,30 @@ class FeasibilityCheck:
     #: Only guard turns the gatekeeper sent to these tiers. Cheap turns cost
     #: less than the check that would screen them.
     guard_tiers: frozenset[Tier] = frozenset({Tier.A, Tier.S})
-    #: Below this many characters a request is not worth screening.
+    #: Below this many characters a request is not worth screening at all.
     min_chars: int = 40
+    #: And when the check is *not* free — no local model — it only earns its
+    #: place on a request big enough to imply a long turn. The check is biased
+    #: hard toward "yes" by design, so it rarely prevents anything; paying a
+    #: cloud call to screen every ordinary Tier A request is the tail wagging
+    #: the dog. With Ollama up it costs nothing and runs on everything.
+    min_chars_when_paid: int = 240
     checks: int = 0
     refusals: int = 0
     errors: int = 0
     last_error: str | None = None
 
+    @property
+    def free(self) -> bool:
+        """Whether this check runs on the local model, and so costs nothing."""
+        return getattr(self.brain, "local", None) is not None
+
     def should_check(self, message: str, tier: Tier) -> bool:
-        return (
-            self.enabled
-            and tier in self.guard_tiers
-            and len(message.strip()) >= self.min_chars
-        )
+        if not self.enabled or tier not in self.guard_tiers:
+            return False
+        size = len(message.strip())
+        floor = self.min_chars if self.free else self.min_chars_when_paid
+        return size >= floor
 
     def check(self, *, message: str, tools: Sequence[str], apis: Sequence[str] = ()) -> Verdict:
         started = time.perf_counter()
@@ -217,6 +228,7 @@ class FeasibilityCheck:
     def as_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "free": self.free,
             "checks": self.checks,
             "refusals": self.refusals,
             "errors": self.errors,
