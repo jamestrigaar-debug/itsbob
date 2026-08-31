@@ -581,8 +581,13 @@ async function drawMemory(){
       <div class="grow"><div>${esc(h.content)}</div>
         <div class="sub"><span class="tag">${esc(h.kind)}</span>
           <span class="tag">about ${esc(h.subject || "user")}</span>
-          <span class="tag">${esc(h.horizon || "long")}-term</span>
+          <span class="tag" ${h.horizon === "short"
+            ? 'style="color:var(--warn);border-color:currentColor"' : ""}>${
+            esc(h.horizon || "short")}-term</span>
           ${esc(h.why || "")} · ${ago(h.created_at)}</div></div>
+      ${h.horizon === "short"
+        ? `<button class="x" onclick="keep('${h.id}')"
+             title="Keep this one for good instead of letting it expire">keep</button>` : ""}
       <button class="x" onclick="forget('${h.id}')">forget</button></div>`).join("")
     : `<p class="empty">Nothing here yet.<br>Tell it something durable — a preference,
        where something lives, a decision and why.</p>`;
@@ -602,6 +607,12 @@ async function addMemory(){
 }
 async function forget(id){
   await post("/api/memory/forget", {id}); drawMemory(); refresh();
+}
+async function keep(id){
+  // Memories start in the working set and expire. This is the manual version
+  // of what being recalled again does automatically.
+  try{ await post("/api/memory/keep", {id}); }catch(e){ return alert(e.message); }
+  drawMemory(); refresh();
 }
 
 async function drawTasks(){

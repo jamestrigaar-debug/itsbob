@@ -477,6 +477,21 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
         )
         return jsonify({"id": record.id, "tags": list(record.tags)})
 
+    @app.post("/api/memory/keep")
+    def memory_keep():
+        """Promote one memory out of the working set, by hand.
+
+        The manual counterpart to consolidation: a memory earns permanence by
+        being recalled again, and this is how you say so before that happens.
+        """
+        payload = request.get_json(force=True, silent=True) or {}
+        agent = session.agent
+        if agent.memory is None:
+            return fail("no memory store is attached", 409)
+        if not agent.memory.promote(str(payload.get("id", ""))):
+            return fail("no memory with that id", 404)
+        return jsonify({"ok": True})
+
     @app.post("/api/memory/forget")
     def memory_forget():
         payload = request.get_json(force=True, silent=True) or {}

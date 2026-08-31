@@ -550,4 +550,10 @@ def test_recalled_memories_carry_their_attribution_to_the_panel(client):
     """The panel shows whose memory it is; the API has to send it."""
     client.post("/api/memory", json={"content": "prefers dark roast"})
     hit = client.get("/api/memory").get_json()["hits"][0]
-    assert hit["subject"] == "user" and hit["horizon"] == "long"
+    # Short by default: everything starts in the working set.
+    assert hit["subject"] == "user" and hit["horizon"] == "short"
+
+    # And can be kept by hand, which is the manual form of being recalled again.
+    assert client.post("/api/memory/keep", json={"id": hit["id"]}).get_json()["ok"]
+    assert client.get("/api/memory").get_json()["hits"][0]["horizon"] == "long"
+    assert client.post("/api/memory/keep", json={"id": "nope"}).status_code == 404

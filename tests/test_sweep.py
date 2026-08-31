@@ -342,3 +342,75 @@ def test_the_feasibility_screen_is_free_or_reserved_for_big_requests():
     for check in (paid, free):
         assert check.should_check(big, Tier.C) is False
         assert check.should_check(big, Tier.B) is False
+
+
+# -- permanence is earned --------------------------------------------------
+
+
+def test_a_memory_starts_in_the_working_set(tmp_path):
+    """Writing everything down forever is not a good memory, it is a transcript:
+    recall then picks between forty near-identical rows with equal confidence."""
+    from itsbob.memory.base import Horizon, MemoryRecord
+
+    assert MemoryRecord(content="x").horizon is Horizon.SHORT
+    assert Horizon.coerce(None) is Horizon.SHORT
+    assert Horizon.coerce("") is Horizon.SHORT
+    assert Horizon.coerce("anything unrecognised") is Horizon.SHORT
+    # Long is still reachable, by asking for it in any of the obvious words.
+    for word in ("long", "long-term", "permanent", "durable", "forever"):
+        assert Horizon.coerce(word) is Horizon.LONG
+
+
+def test_being_recalled_again_is_what_earns_permanence(tmp_path):
+    from itsbob.memory.base import Horizon, MemoryRecord
+    from itsbob.memory.long_term import LongTermMemory
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    passing = store.add(MemoryRecord(content="looking at the router configuration"))
+    used = store.add(MemoryRecord(content="the fuse box is behind the coats"))
+    vital = store.add(MemoryRecord(content="allergic to penicillin", importance=0.95))
+    assert store.counts_by("horizon") == {"short": 3}
+
+    # Surfaced twice: once can be a vague query, twice is being used.
+    for _ in range(2):
+        store.search("where is the fuse box")
+
+    promoted = store.consolidate()
+    assert set(promoted) == {used.id, vital.id}
+    assert store.get(used.id).horizon is Horizon.LONG
+    assert store.get(vital.id).horizon is Horizon.LONG
+    assert store.get(passing.id).horizon is Horizon.SHORT
+    # And promotion clears the expiry, or it would be dropped anyway.
+    assert store.get(used.id).expires_at is None
+
+
+def test_promotion_happens_before_pruning_can_drop_it(tmp_path):
+    """A row that has earned permanence must not be evicted on the same pass."""
+    from itsbob.memory.base import Horizon, MemoryRecord
+    from itsbob.memory.long_term import LongTermMemory
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    store.short_term_capacity = 2
+    earned = store.add(MemoryRecord(content="the fuse box is behind the coats"))
+    for i in range(5):
+        store.add(MemoryRecord(content=f"idle chatter number {i}"))
+    for _ in range(2):
+        store.search("fuse box")
+
+    # The order the agent runs them in.
+    store.consolidate()
+    store.prune_short_term()
+    assert store.get(earned.id) is not None
+    assert store.get(earned.id).horizon is Horizon.LONG
+
+
+def test_forgetting_still_works_on_either_horizon(tmp_path):
+    from itsbob.memory.base import Horizon, MemoryRecord
+    from itsbob.memory.long_term import LongTermMemory
+
+    store = LongTermMemory(tmp_path / "m.sqlite", embedder=None)
+    short = store.add(MemoryRecord(content="passing thought"))
+    kept = store.add(MemoryRecord(content="lives in Reading", horizon=Horizon.LONG))
+    assert store.forget(short.id) and store.forget(kept.id)
+    assert len(store) == 0
+    assert store.forget("never-existed") is False

@@ -590,7 +590,8 @@ def test_short_term_memory_is_pruned_by_count_and_by_clock(tmp_path):
     store.short_term_capacity = 3
     for i in range(6):
         store.add(MemoryRecord(content=f"working on step {i}", horizon=Horizon.SHORT))
-    store.add(MemoryRecord(content="lives in Reading"))  # long-horizon, untouchable
+    # Long-horizon, and so untouchable by the working set's limits.
+    store.add(MemoryRecord(content="lives in Reading", horizon=Horizon.LONG))
     assert store.prune_short_term() == 3
     assert len(store) == 4
     assert store.counts_by("horizon") == {"short": 3, "long": 1}
