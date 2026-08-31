@@ -254,7 +254,32 @@ class DiscordClient:
             self.fetch(limit=1)
         except DiscordError as exc:
             return False, str(exc)
-        return True, f"channel {self.channel_id} is reachable and the bot can read it"
+        return True, f"channel {self.channel_id} is reachable"
+
+    def intent_check(self, *, limit: int = 25) -> tuple[bool | None, str]:
+        """Can it read what people *type*? A different permission from reading
+        the channel, and the one that fails silently.
+
+        Returns ``None`` when there is nothing recent to judge from — no
+        opinion is the honest answer there, and claiming either one would be
+        worse than saying so.
+        """
+        try:
+            rows = self.fetch(limit=limit)
+        except DiscordError as exc:
+            return False, str(exc)
+
+        from_people = [r for r in rows if not (r.get("author") or {}).get("bot")]
+        if not from_people:
+            return None, "no recent messages from a person to judge from"
+
+        withheld = [r for r in from_people if content_withheld(r)]
+        if not withheld:
+            return True, f"read the text of {len(from_people)} recent message(s)"
+        return False, (
+            f"{len(withheld)} of {len(from_people)} recent message(s) arrived with "
+            f"their text stripped out — {INTENT_FIX}"
+        )
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -276,6 +301,41 @@ class DiscordError(RuntimeError):
 #: invited, and from a channel it cannot see, three unrelated problems with one
 #: message. Saying which checks to make is the difference between a two-minute
 #: fix and giving up on the integration.
+#: What Discord says when a bot without the Message Content intent is told to
+#: read a channel. Worth spelling out in one place: it is the single most
+#: common reason a working bot appears to ignore people at random.
+INTENT_FIX = (
+    "turn on MESSAGE CONTENT INTENT under Bot in the Discord Developer Portal "
+    "(discord.com/developers/applications), then restart itsbob"
+)
+
+
+def content_withheld(row: Mapping[str, Any]) -> bool:
+    """Whether Discord stripped this message's text before handing it over.
+
+    Discord will not accept a post with no text, no attachment, no embed, no
+    sticker and no poll — there is nothing to post. So a message that comes
+    back with none of those did not arrive that way: it arrived with content
+    this bot is not permitted to read, which is what the Message Content
+    intent gates.
+
+    That makes it a *definite* test rather than a guess, and it is decidable
+    from one message. The distinction matters, because the intent is not all
+    or nothing: a bot without it still receives full content for messages that
+    tag it, and blanks for everything else. So the channel works when you @ it
+    and appears to ignore you when you do not — and any check that waits for
+    *every* message to be blank will sit there never firing, because the
+    tagged ones are never blank.
+    """
+    if (row.get("author") or {}).get("bot"):
+        return False
+    if str(row.get("content") or "").strip():
+        return False
+    return not any(
+        row.get(key) for key in ("attachments", "embeds", "sticker_items", "poll")
+    )
+
+
 def _explain(code: int, detail: str, channel_id: str) -> str:
     body = detail.lower()
     if code == 404 and "unknown channel" in body:
@@ -373,6 +433,10 @@ class DiscordBridge:
     #: Set when Discord returned messages whose content was blank — the
     #: signature of a bot without the Message Content intent.
     content_warning: str | None = None
+    #: How many messages were dropped because their text never arrived. Counted
+    #: rather than merely warned about: "it missed 6 things" is a report, and
+    #: it is what tells you the intent is still off after you thought you fixed it.
+    withheld: int = 0
     #: The cross-process claim on this channel. Without it, `itsbob serve` and
     #: the browser's continuous mode both poll and both answer — two turns, two
     #: replies, one of them pure waste. ``None`` disables the check.
@@ -427,9 +491,14 @@ class DiscordBridge:
             if not self.standby:
                 self.last_error = f"standing by — {self.lease.held_by} is answering Discord"
             self.standby = True
-            # The cursor still advances, so taking over does not mean replaying
-            # everything said while the other process was in charge.
-            self.after = self.client.latest_id() or self.after
+            # Follow the holder's progress rather than the clock. Jumping to
+            # `latest_id()` here spent an API call per poll doing nothing, and
+            # silently discarded anything the holder had not answered yet — so
+            # a holder that died mid-turn took those messages with it. The
+            # lease already records what was answered, and that is the precise
+            # boundary: everything behind it is done, everything after is still
+            # owed an answer, and a takeover picks up exactly those.
+            self.after = self.lease.last_answered() or self.after
             return 0
         if self.standby:
             self.standby = False
@@ -448,6 +517,12 @@ class DiscordBridge:
                 continue
             tagged = self.mentions_us(row)
             if self.mention_only and not tagged:
+                continue
+            if content_withheld(row):
+                # Not an empty message — an unreadable one. Dropping it in
+                # silence is what made this look like flakiness rather than a
+                # permission, so it is counted and named instead.
+                self.withheld += 1
                 continue
             content = self._clean(row)
             if not content:
@@ -511,25 +586,23 @@ class DiscordBridge:
         """Notice a bot that cannot read what people type.
 
         Discord withholds message content from apps without the Message
-        Content intent — except in messages that tag the bot. The symptom is
-        a channel that only ever answers when @-ed and otherwise appears to
-        ignore everything, with no error anywhere. It is a checkbox in the
-        Developer Portal, and worth naming rather than leaving to be guessed.
+        Content intent — except in messages that tag the bot. So the symptom
+        is not silence, which somebody would investigate; it is a channel that
+        answers when tagged and ignores you when not, with no error anywhere,
+        which reads as flakiness. It is a checkbox in the Developer Portal,
+        and worth naming rather than leaving to be guessed at.
         """
-        from_others = [
-            row for row in rows
-            if not (row.get("author") or {}).get("bot")
-        ]
-        if not from_others or self.content_warning:
+        if self.content_warning:
             return
-        blank = [row for row in from_others if not str(row.get("content") or "").strip()]
-        if len(blank) == len(from_others) and len(blank) >= 2:
-            self.content_warning = (
-                "Discord returned empty text for every message from a person. That is "
-                "what happens without the Message Content intent: turn on "
-                "'MESSAGE CONTENT INTENT' under Bot in the Developer Portal. Until "
-                "then itsbob can only read messages that tag it."
-            )
+        withheld = [row for row in rows if content_withheld(row)]
+        if not withheld:
+            return
+        self.content_warning = (
+            f"Discord handed over {len(withheld)} message(s) with the text removed. "
+            f"That is the Message Content intent being off: {INTENT_FIX}. Until then "
+            "itsbob can only read messages that tag it, which is why it answers "
+            "sometimes and not others."
+        )
 
     def _is_input(self, row: Mapping[str, Any]) -> bool:
         """Whether a message should become a turn.
@@ -567,6 +640,7 @@ class DiscordBridge:
             "errors": self.errors,
             "last_error": self.last_error or self.client.last_error,
             "content_warning": self.content_warning,
+            "withheld": self.withheld,
             "standby": self.standby,
             "lease": self.lease.describe() if self.lease is not None else None,
             **self.client.describe(),

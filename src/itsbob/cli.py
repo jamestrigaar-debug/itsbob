@@ -696,9 +696,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         reachable, detail = client.check() if client else (False, "not configured")
         print(f"  {'ok ' if reachable else '!! '}{'discord':<10} {detail}")
         if reachable and client is not None:
-            # Being able to read the channel and being able to read what people
-            # *type* in it are different permissions, and only one of them has
-            # an error message.
             identity = client.user_id
             print(
                 f"      posting as {client.me().get('username', '?')} (id {identity}) — "
@@ -706,6 +703,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 if identity
                 else "      could not read the bot's own identity, so tagging will not work"
             )
+            # Being able to read the channel and being able to read what people
+            # *type* in it are different permissions, and only one of them has
+            # an error message. Reporting the first as "the bot can read it"
+            # was actively misleading: it is the answer you get while the
+            # second is failing, which is the whole reason this is checked.
+            readable, why = client.intent_check()
+            if readable is True:
+                print(f"      {why}")
+            elif readable is None:
+                print(f"      message text: {why}")
+            else:
+                print(f"      !! cannot read message text — {why}")
+                print("      this is why it answers when tagged and ignores you otherwise")
     else:
         print(f"  -- {'discord':<10} proactive posting and two-way chat"
               "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)")
@@ -732,6 +742,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"      chromium {browsers['chromium']['path']}  ({browsers['chromium']['source']})")
         print(f"      profile  {browsers['profile']}  (its own, not your browsing one)")
     elif preferred == "xdotool":
+        # Say why the better path was skipped. Falling back silently is how you
+        # end up on the intrusive mechanism without ever deciding to.
+        print(f"      playwright: {browsers['playwright']['why']}")
         print("      intrusive: it steals focus and the clipboard while it works")
     else:
         print(f"      playwright: {browsers['playwright']['why']}")

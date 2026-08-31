@@ -138,6 +138,18 @@ class DiscordLease:
         current["answered"] = answered[-REMEMBERED:]
         self._write(current)
 
+    def last_answered(self) -> str | None:
+        """The most recent message the holder dealt with, for a standby cursor.
+
+        Appended in order, so the tail is the high-water mark. A process in
+        standby can follow this instead of polling Discord for the newest id:
+        it costs nothing, and it does not skip past messages the holder has
+        not answered yet — which is the difference between a clean handover
+        and quietly losing whatever was in flight when the holder died.
+        """
+        answered = self._read().get("answered") or []
+        return str(answered[-1]) if answered else None
+
     def describe(self) -> dict[str, Any]:
         current = self._read()
         return {
