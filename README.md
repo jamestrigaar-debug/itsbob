@@ -322,6 +322,27 @@ the prompt on every turn rather than waiting to be recalled. That distinction
 matters: a rule about formatting is never semantically similar to the question
 being asked, so ordinary recall would never surface it.
 
+**Hard questions can be delegated somewhere free.** A Tier S step costs about
+twelve times a Tier C one, and the questions that need it are the long ones.
+`ask_deepseek` sends the question to a chat site in a browser, and the only paid
+work left is one cheap local call to shape the answer. It is opt-in
+(`ITSBOB_DEEPSEEK=1`), slow (30s–2min), and depends on someone else's markup —
+so when it breaks it fails loudly and the tier ladder answers instead. The
+failure mode is "you paid for the answer", never "you got a wrong one".
+
+The handoff is the fragile part, so it is the part with structure. The question
+goes out inside an envelope asking for one fenced JSON block; what comes back is
+parsed, or shaped locally by the cheap model, or reported as failed. A login
+wall, a rate-limit page or a two-word refusal is caught before it can look like
+an answer.
+
+**`read_page` reads a page properly**, escalating only as far as it has to: a
+plain HTTP fetch with the markup stripped, then a headless browser when the page
+turns out to be a JavaScript shell, then the browser already on screen for
+anything behind a login. Stripping first is what makes the difference — an
+observation is clipped to a few thousand characters, and raw HTML means the clip
+lands inside a `<script>` tag and the article never arrives.
+
 **Web search needs no key at all.** `web_search` uses `ddgr` or `googler` if
 either is installed (`sudo apt install ddgr`), and falls back to DuckDuckGo's
 HTML endpoint otherwise. It is a separate tool rather than a `run_shell`
@@ -762,9 +783,12 @@ src/itsbob/
     briefing.py     weather + news + the condensed daily report
     discord.py      the channel as a two-way workspace
     lease.py        one process answers the channel, whichever one is up
+    delegate.py     the envelope, the parser, and the failsafes around both
+    browser.py      Playwright first, xdotool second, neither assumed
   scripts/        what it can do to this machine — drop a file in to add one
     system_monitor.py, network_checker.py, process_manager.py,
-    file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py
+    file_cleaner.py, screenshot.py, screen_reader.py, scheduler.py,
+    web_scraper.py, deepseek.py
   daemon/         the always-on half
     schedule.py     schedules in words
     tasks.py        SQLite task store and run history
@@ -796,7 +820,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            551 tests, none of which touch the network
+tests/            576 tests, none of which touch the network
 ```
 
 ## The original simulation

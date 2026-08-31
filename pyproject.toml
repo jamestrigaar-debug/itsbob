@@ -26,6 +26,10 @@ speed = ["numpy>=1.24"]
 # dimensions locally. Both tools work without it — large images are refused
 # rather than resized, and image_info falls back to the file's own metadata.
 vision = ["pillow>=10.0"]
+# Driving a real browser: `read_page` on JavaScript-heavy sites, and the
+# DeepSeek bridge. Both degrade without it — to a plain fetch, and to the
+# xdotool path or nothing.
+browser = ["playwright>=1.40"]
 all = ["flask>=3.0", "numpy>=1.24", "pillow>=10.0"]
 
 [project.scripts]

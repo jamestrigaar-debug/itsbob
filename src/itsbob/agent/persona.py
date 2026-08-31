@@ -56,6 +56,7 @@ class Persona:
         tool_names: tuple[str, ...] = (),
         background: str = "",
         brief: bool = False,
+        continuing: bool = False,
     ) -> str:
         """The system prompt for one step.
 
@@ -71,23 +72,37 @@ class Persona:
                 tools=tools, workspace=workspace, now=now, tool_names=tool_names,
                 background=background,
             )
-        stamp = time.strftime("%A %d %B %Y, %H:%M %Z", time.localtime(now or time.time()))
+        # Minute-resolution on the first step only. The stamp is inside the
+        # system message, so a clock ticking over mid-turn changes the prefix
+        # and costs a cache miss for a fact nobody re-reads.
+        stamp = time.strftime(
+            "%A %d %B %Y, %H:%M %Z" if not continuing else "%A %d %B %Y",
+            time.localtime(now or time.time()),
+        )
         blocks = [
             f"You are {self.name}, {self.role}.",
             f"Right now it is {stamp}. You are on {platform.system()}"
             + (f", working in {workspace}." if workspace else "."),
-            "",
-            "## How you work",
-            "You work in steps. Each step you either call exactly one tool, or you "
-            "give your final answer. You see the result of every tool call before "
-            "choosing the next step, so prefer looking something up over guessing at it.",
-            "",
-            "Your final answer is words to the user and NOTHING ELSE. It does not "
-            "create files, run anything, or change the machine. Only a tool call does "
-            "that. If the request needs something to happen, call the tool that makes "
-            "it happen — writing out what the file would contain is not writing the "
-            "file, and claiming you did it when no tool call did is the single worst "
-            "thing you can do.",
+        ]
+        # The explainer is for choosing how to work, and by the second step that
+        # is settled — the model has its own steps in front of it as evidence.
+        # Every *rule* below survives; only the teaching prose goes.
+        if not continuing:
+            blocks += [
+                "",
+                "## How you work",
+                "You work in steps. Each step you either call exactly one tool, or you "
+                "give your final answer. You see the result of every tool call before "
+                "choosing the next step, so prefer looking something up over guessing at it.",
+                "",
+                "Your final answer is words to the user and NOTHING ELSE. It does not "
+                "create files, run anything, or change the machine. Only a tool call does "
+                "that. If the request needs something to happen, call the tool that makes "
+                "it happen — writing out what the file would contain is not writing the "
+                "file, and claiming you did it when no tool call did is the single worst "
+                "thing you can do.",
+            ]
+        blocks += [
             "",
             "## Tools",
             tools,
@@ -165,13 +180,16 @@ class Persona:
             '"params": {<arguments for that tool>}, '
             '"final": "<your answer to the user, or null if calling a tool>"}',
             "Exactly one of `tool` and `final` is non-null." + roster,
-            "",
-            "The messages after the user's request are your own previous steps this "
-            "turn and their results. Read them before choosing: work already done is "
-            "done, and repeating a call that succeeded achieves nothing.",
-            "If the user asked for something to be created, changed, run, fetched or "
-            "saved and no step has done it yet, `tool` must be non-null.",
         ]
+        if not continuing:
+            blocks += [
+                "",
+                "The messages after the user's request are your own previous steps this "
+                "turn and their results. Read them before choosing: work already done is "
+                "done, and repeating a call that succeeded achieves nothing.",
+                "If the user asked for something to be created, changed, run, fetched or "
+                "saved and no step has done it yet, `tool` must be non-null.",
+            ]
         return "\n".join(blocks)
 
     def _render_brief(

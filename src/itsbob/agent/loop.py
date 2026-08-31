@@ -403,6 +403,7 @@ class Agent:
                 policy_note="" if brief else _policy_note(self.toolbox),
                 tool_names=self.toolbox.registry.names(),
                 brief=brief,
+                continuing=not first_step,
                 observation_chars=_observation_budget(len(turn.steps)),
             )
 

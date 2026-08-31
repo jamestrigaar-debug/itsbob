@@ -192,6 +192,7 @@ def build_messages(
     memory_limit: int = 6,
     tool_names: Sequence[str] = (),
     brief: bool = False,
+    continuing: bool = False,
     full_observations: int = 3,
     observation_chars: int = 3000,
 ) -> list[Message]:
@@ -237,6 +238,7 @@ def build_messages(
                 tool_names=tuple(tool_names),
                 background=background,
                 brief=brief,
+                continuing=continuing,
             )
         )
     ]

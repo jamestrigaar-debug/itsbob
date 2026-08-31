@@ -101,6 +101,34 @@ def _condenser(brain: TieredBrain):
     return condense
 
 
+def _shaper(brain: TieredBrain):
+    """Put someone else's prose into a structure, on the cheapest model there is.
+
+    Handed to the delegation tools so they never import the model ladder. This
+    is the paid half of the cheap-reasoning trade: the thinking happens for free
+    somewhere else, and all that is bought is one small local call to shape the
+    result.
+    """
+
+    def shape(system_prompt: str, text: str) -> dict:
+        from ..llm.base import LLMRequest, system, user
+
+        payload, _ = brain.complete_json(
+            Tier.C,
+            LLMRequest(
+                messages=[system(system_prompt), user(text)],
+                temperature=0.0,
+                max_tokens=2000,
+                metadata={"local_ok": True},
+            ),
+            purpose="delegate.shape",
+            default={},
+        )
+        return payload
+
+    return shape
+
+
 def build_agent(
     *,
     home: str | Path | None = None,
@@ -144,6 +172,7 @@ def build_agent(
             audit_path=root / "audit.jsonl",
             extra_tools=extra_tools,
             summarize=_condenser(brain),
+            extras={"shape_json": _shaper(brain)},
             env=env,
         )
 
