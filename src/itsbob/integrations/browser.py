@@ -29,13 +29,21 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-__all__ = ["BrowserError", "PlaywrightSession", "XdotoolSession", "available", "profile_dir"]
+__all__ = [
+    "BrowserError",
+    "PlaywrightSession",
+    "XdotoolSession",
+    "available",
+    "chromium",
+    "profile_dir",
+]
 
 
 class BrowserError(RuntimeError):
@@ -59,15 +67,121 @@ def _have(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+#: What a system Chromium can be called, most-standard first.
+_CHROMIUM_NAMES = (
+    "chromium",
+    "chromium-browser",
+    "google-chrome-stable",
+    "google-chrome",
+    "chrome",
+)
+
+#: Where a downloaded Chromium sits inside one of Playwright's version folders.
+_PLAYWRIGHT_BINARIES = (
+    "chrome-linux/chrome",
+    "chrome-linux/headless_shell",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-win/chrome.exe",
+)
+
+
+def _playwright_root(env: Any) -> Path:
+    """Where Playwright keeps the browsers it downloads."""
+    configured = str(env.get("PLAYWRIGHT_BROWSERS_PATH", "")).strip()
+    if configured and configured != "0":
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        local = str(env.get("LOCALAPPDATA", "")).strip()
+        return Path(local or Path.home() / "AppData/Local") / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Caches/ms-playwright"
+    return Path.home() / ".cache/ms-playwright"
+
+
+def _playwright_chromium(env: Any) -> str:
+    """The Chromium Playwright downloaded for itself, if it ever did."""
+    root = _playwright_root(env)
+    if not root.is_dir():
+        return ""
+    # Binary kind first, version second. A machine often holds both a full
+    # Chromium and a headless shell, and the shell cannot open a visible window
+    # — so a full browser in an older folder still beats a shell in a newer one.
+    # Reverse-sorted folders so the newest build of a given kind wins.
+    folders = sorted(root.glob("chromium*"), reverse=True)
+    for relative in _PLAYWRIGHT_BINARIES:
+        for folder in folders:
+            candidate = folder / relative
+            if candidate.exists():
+                return str(candidate)
+    return ""
+
+
+def chromium(env: Any = None) -> dict[str, str]:
+    """A Chromium binary this machine can actually launch, and where it came from.
+
+    Having the ``playwright`` package is not the same as having a browser: the
+    package is a driver, and on its own it launches nothing. Three places a
+    browser can come from, in the order they should be preferred:
+
+    ``configured``
+        ``ITSBOB_CHROMIUM``, when somebody has pointed us at a specific build.
+    ``playwright``
+        The one ``playwright install chromium`` downloads. Best behaved, because
+        it is the build Playwright was tested against.
+    ``system``
+        The Chromium already on the machine. Saves a 150MB download and is
+        usually what somebody means by "we already have chromium installed".
+
+    Returns ``{"path": ..., "source": ...}``, both empty when there is nothing
+    to drive.
+    """
+    env = os.environ if env is None else env
+
+    explicit = str(env.get("ITSBOB_CHROMIUM", "")).strip()
+    if explicit:
+        resolved = explicit if Path(explicit).exists() else (shutil.which(explicit) or "")
+        # A path somebody set by hand and got wrong is worth reporting as set
+        # and broken, rather than silently falling through to something else.
+        return {"path": resolved, "source": "configured" if resolved else "configured-missing"}
+
+    downloaded = _playwright_chromium(env)
+    if downloaded:
+        return {"path": downloaded, "source": "playwright"}
+
+    for name in _CHROMIUM_NAMES:
+        found = shutil.which(name)
+        if found:
+            return {"path": found, "source": "system"}
+
+    return {"path": "", "source": ""}
+
+
 def available(env: Any = None) -> dict[str, Any]:
     """Which mechanisms this machine can actually use, and why not otherwise."""
     env = os.environ if env is None else env
     try:
         import playwright  # noqa: F401, PLC0415
 
-        playwright_ok, playwright_why = True, "installed"
+        package_ok = True
     except ImportError:
-        playwright_ok, playwright_why = False, "not installed — pip install -e '.[browser]'"
+        package_ok = False
+
+    browser = chromium(env)
+    playwright_ok = package_ok and bool(browser["path"])
+    if not package_ok:
+        playwright_why = "not installed — pip install -e '.[browser]'"
+    elif browser["source"] == "configured-missing":
+        playwright_why = (
+            f"ITSBOB_CHROMIUM points at {env.get('ITSBOB_CHROMIUM', '').strip()!r}, "
+            "which is not there"
+        )
+    elif not browser["path"]:
+        playwright_why = (
+            "installed, but there is no chromium for it to drive — run "
+            "'playwright install chromium', or set ITSBOB_CHROMIUM to one you have"
+        )
+    else:
+        playwright_why = f"ready, driving the {browser['source']} chromium"
 
     display = bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"))
     xdotool_ok = _have("xdotool") and (_have("xclip") or _have("xsel")) and display
@@ -85,6 +199,7 @@ def available(env: Any = None) -> dict[str, Any]:
         "xdotool": {"ready": xdotool_ok, "why": xdotool_why},
         "preferred": "playwright" if playwright_ok else ("xdotool" if xdotool_ok else None),
         "profile": str(profile_dir(env)),
+        "chromium": browser,
     }
 
 
@@ -108,7 +223,12 @@ class PlaywrightSession:
             "headless": self.headless,
             "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         }
-        executable = self.executable or os.environ.get("ITSBOB_CHROMIUM", "").strip()
+        # Playwright finds its own download unaided; anything else has to be
+        # handed to it, or it looks in the one place it has not been installed.
+        executable = self.executable
+        if not executable:
+            found = chromium()
+            executable = found["path"] if found["source"] != "playwright" else ""
         if executable:
             options["executable_path"] = executable
         return playwright.chromium.launch_persistent_context(**options)

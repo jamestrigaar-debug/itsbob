@@ -707,15 +707,48 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 else "      could not read the bot's own identity, so tagging will not work"
             )
     else:
-        print(f"  --  {'discord':<10} proactive posting and two-way chat"
+        print(f"  -- {'discord':<10} proactive posting and two-way chat"
               "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)")
     backend = available_backend()
-    print(f"  ok  {'search':<10} via {backend}"
+    print(f"  ok {'search':<10} via {backend}"
           + ("" if backend != "duckduckgo-html" else "  (install ddgr for structured results)"))
-    if pillow_available():
-        print(f"  ok  {'images':<10} pillow installed — large photos are downscaled before upload")
+    # The browser, and what depends on it. Left out before, which meant the one
+    # capability that is off by default was also the one `doctor` never
+    # mentioned — so "is it on?" had no answer short of reading the source.
+    from .integrations.browser import available as browser_available
+    from .scripts.deepseek import enabled as deepseek_on
+
+    browsers = browser_available()
+    preferred = browsers["preferred"]
+    print(
+        f"  {'ok ' if preferred else '-- '}{'browser':<10} "
+        + (
+            f"via {preferred} — reads JavaScript pages and drives chat sites"
+            if preferred
+            else "nothing to drive one with"
+        )
+    )
+    if preferred == "playwright":
+        print(f"      chromium {browsers['chromium']['path']}  ({browsers['chromium']['source']})")
+        print(f"      profile  {browsers['profile']}  (its own, not your browsing one)")
+    elif preferred == "xdotool":
+        print("      intrusive: it steals focus and the clipboard while it works")
     else:
-        print(f"  --  {'images':<10} no pillow — `pip install -e '.[vision]'` to resize before upload")
+        print(f"      playwright: {browsers['playwright']['why']}")
+        print(f"      xdotool:    {browsers['xdotool']['why']}")
+
+    if deepseek_on():
+        print(f"  ok {'deepseek':<10} on — hard questions go to the browser, free")
+        if not preferred:
+            print("      !! but there is no browser to drive, so every call will fail")
+    else:
+        print(f"  -- {'deepseek':<10} off — free reasoning via a browser "
+              "(set ITSBOB_DEEPSEEK=1; it drives a third-party site, so it is your call)")
+
+    if pillow_available():
+        print(f"  ok {'images':<10} pillow installed — large photos are downscaled before upload")
+    else:
+        print(f"  -- {'images':<10} no pillow — `pip install -e '.[vision]'` to resize before upload")
 
     print("\nscripts:")
     from .scripts import describe_scripts, load_errors, user_scripts_dir
