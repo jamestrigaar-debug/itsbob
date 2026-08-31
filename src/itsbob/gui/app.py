@@ -452,6 +452,32 @@ def create_app(home: Path | None = None, *, mode: str | None = None):
 
     # -- tasks -------------------------------------------------------------
 
+    @app.get("/api/tasks")
+    def tasks_list():
+        """The task panel's own endpoint.
+
+        It used to read the task list out of `/api/status`, which made it the
+        one panel that went dark whenever anything else in that payload was
+        slow or broken — the others (memory, scripts, audit) each have their
+        own route and kept working. A panel should depend on the thing it
+        shows and nothing else.
+        """
+        store = tasks()
+        return jsonify(
+            {
+                "tasks": [t.as_dict() for t in store.all()],
+                "next_due": store.next_due_at(),
+                # Whether anything will actually *run* them. A schedule with no
+                # runner is the most common "my task never fired", and the
+                # panel is where you look when that happens.
+                "runner": {
+                    "autonomous": bool(
+                        "autonomous" in holder and holder["autonomous"].running
+                    ),
+                },
+            }
+        )
+
     @app.post("/api/task")
     def task_create():
         payload = request.get_json(force=True, silent=True) or {}

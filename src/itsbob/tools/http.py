@@ -63,6 +63,19 @@ class ApiSpec:
     description: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     timeout: float = DEFAULT_TIMEOUT
+    #: ``(arguments, what it gets you)`` pairs. Shown in the prompt and again
+    #: when a call fails. Most REST APIs 404 on their own base URL, so a model
+    #: that calls ``call_api(api=x)`` with no path gets a bare 404 and no idea
+    #: it left out the one argument that mattered — then burns its budget
+    #: guessing. A worked call ends that in one step.
+    examples: tuple[tuple[str, str], ...] = ()
+
+    def render_examples(self, indent: str = "  ") -> list[str]:
+        return [
+            f"{indent}call_api(api='{self.name}', {call})"
+            + (f"\n{indent}  → {note}" if note else "")
+            for call, note in self.examples
+        ]
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str | None:
         env = os.environ if env is None else env
@@ -132,11 +145,19 @@ class ApiCatalog:
         return [self._specs[name].describe(env) for name in self.names()]
 
     def render_for_prompt(self, env: Mapping[str, str] | None = None) -> str:
+        """The APIs block in the system prompt, with worked calls.
+
+        The examples are the expensive part to leave out. Without them a model
+        guesses at paths, and each guess is a round trip and a step off the
+        budget; with them the first call is usually right.
+        """
         rows = []
         for name in self.names():
             spec = self._specs[name]
             state = "" if spec.is_configured(env) else "  [NOT CONFIGURED — do not call]"
             rows.append(f"- {name}: {spec.description or spec.base_url}{state}")
+            if spec.is_configured(env):
+                rows.extend(spec.render_examples("    "))
         return "\n".join(rows) or "- (no APIs configured)"
 
     def __len__(self) -> int:
@@ -159,6 +180,11 @@ class ApiCatalog:
                 continue
             catalog.register(
                 ApiSpec(
+                    examples=tuple(
+                        (str(e[0]), str(e[1])) if isinstance(e, (list, tuple)) and len(e) > 1
+                        else (str(e), "")
+                        for e in (body.get("examples") or [])
+                    ),
                     name=str(name),
                     base_url=str(body["base_url"]),
                     key_env=str(body.get("key_env", "")),
@@ -277,6 +303,39 @@ def _http_request(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     return _summarize(status, payload, url)
 
 
+def _hint(spec: ApiSpec, path: str, status: int) -> str:
+    """What to try next, when a call comes back wrong.
+
+    Written for the model that just made the mistake, not for a log. Real
+    transcript: `call_api(api=football)` with no path returned a bare 404, and
+    the next eleven steps were spent guessing at URLs and scraping websites.
+    Naming the missing argument, once, is the whole fix.
+    """
+    lines: list[str] = []
+    if status == 404 and not str(path).strip():
+        lines.append(
+            f"You called {spec.name!r} with no `path`, so this hit the API's base URL "
+            "— almost every REST API returns 404 for that. `path` is the part after "
+            "the base URL and it is nearly always required."
+        )
+    elif status == 404:
+        lines.append(
+            f"{path!r} is not a path this API serves. Check it against the examples "
+            "rather than guessing at another one."
+        )
+    elif status in (401, 403):
+        lines.append(
+            f"The key in {spec.key_env or '(none configured)'} was rejected or is not "
+            "allowed to see this. Do not retry the same call — say so instead."
+        )
+    elif status == 429:
+        lines.append("Rate-limited. Wait, or ask for less at a time — retrying now will fail too.")
+    if spec.examples:
+        lines.append("Calls that work:")
+        lines.extend(spec.render_examples("  "))
+    return "\n".join(lines)
+
+
 def _call_api(catalog: ApiCatalog):
     def run(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
         name = params["api"]
@@ -285,8 +344,9 @@ def _call_api(catalog: ApiCatalog):
             raise ToolError(
                 f"no API named {name!r}. Configured: {', '.join(catalog.names()) or '(none)'}"
             )
+        path = params.get("path", "")
         url, headers = spec.build(
-            params.get("path", ""), params=params.get("params") or {}, env=ctx.env or os.environ
+            path, params=params.get("params") or {}, env=ctx.env or os.environ
         )
         started = time.perf_counter()
         status, payload, _ = _request(
@@ -299,6 +359,14 @@ def _call_api(catalog: ApiCatalog):
         result = _summarize(status, payload, url)
         result.data["api"] = name
         result.data["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        if not result.ok:
+            hint = _hint(spec, path, status)
+            if hint:
+                # Onto `error`, which is what the loop feeds back as the
+                # observation. Putting it in `output` alone would leave the
+                # model reading "HTTP 404" and nothing else.
+                result.error = f"{result.error}\n{hint}"
+                result.output = f"{result.output}\n\n{hint}"
         return result
 
     return run

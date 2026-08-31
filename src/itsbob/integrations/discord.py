@@ -158,7 +158,7 @@ class DiscordClient:
                 if 500 <= exc.code < 600 and attempt < MAX_ATTEMPTS - 1:
                     time.sleep(2.0**attempt)
                     continue
-                self.last_error = f"HTTP {exc.code}: {detail}"
+                self.last_error = _explain(exc.code, detail, self.channel_id)
                 raise DiscordError(self.last_error) from exc
             except Exception as exc:  # noqa: BLE001 - network, retried then reported
                 if attempt < MAX_ATTEMPTS - 1:
@@ -205,6 +205,18 @@ class DiscordClient:
         rows = self.fetch(limit=1)
         return str(rows[-1]["id"]) if rows else None
 
+    def check(self) -> tuple[bool, str]:
+        """Can this bot actually see the channel? One cheap read, for `doctor`.
+
+        A token and a channel id in `.env` prove nothing — the first real sign
+        of trouble was otherwise a failed `discord_post` mid-conversation.
+        """
+        try:
+            self.fetch(limit=1)
+        except DiscordError as exc:
+            return False, str(exc)
+        return True, f"channel {self.channel_id} is reachable and the bot can read it"
+
     def describe(self) -> dict[str, Any]:
         return {
             "channel": self.channel_id,
@@ -216,6 +228,46 @@ class DiscordClient:
 
 class DiscordError(RuntimeError):
     """A Discord call that could not be completed."""
+
+
+#: Discord's failures are all "404" or "403" with a two-word body, and every
+#: one of them has a different fix that is not guessable from the code. Real
+#: transcript: `Unknown Channel (HTTP 404)` — which is what you get from a
+#: *server* id pasted where a *channel* id goes, from a bot that was never
+#: invited, and from a channel it cannot see, three unrelated problems with one
+#: message. Saying which checks to make is the difference between a two-minute
+#: fix and giving up on the integration.
+def _explain(code: int, detail: str, channel_id: str) -> str:
+    body = detail.lower()
+    if code == 404 and "unknown channel" in body:
+        return (
+            f"Discord does not recognise channel {channel_id} (HTTP 404, Unknown Channel). "
+            "One of three things, in the order worth checking:\n"
+            "  1. DISCORD_CHANNEL_ID is a server id, not a channel id. Right-click the "
+            "*channel* in the sidebar (not the server) → Copy Channel ID. You need "
+            "Developer Mode on: Settings → Advanced → Developer Mode.\n"
+            "  2. The bot was never invited to that server. Generate an invite in the "
+            "Developer Portal → OAuth2 → URL Generator, scopes `bot`, permissions "
+            "'View Channel' and 'Send Messages', then open the URL.\n"
+            "  3. The bot is in the server but cannot see that channel — check the "
+            "channel's permissions for the bot's role."
+        )
+    if code == 401:
+        return (
+            "Discord rejected the bot token (HTTP 401). It has been reset or was "
+            "mistyped — Developer Portal → your application → Bot → Reset Token, then "
+            "put the new value in DISCORD_BOT_TOKEN. Note it is the *bot* token, not "
+            "the application id or the client secret."
+        )
+    if code == 403:
+        return (
+            f"The bot may not post in channel {channel_id} (HTTP 403, Forbidden). It is "
+            "in the server but its role lacks 'Send Messages' there — check the "
+            "channel's permission overrides."
+        )
+    if code == 400 and "content" in body:
+        return f"Discord rejected the message body (HTTP 400): {detail}"
+    return f"HTTP {code}: {detail}"
 
 
 @dataclass

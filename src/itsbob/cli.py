@@ -154,12 +154,20 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     print(f"itsbob — {policy.mode.value} mode, workspace {policy.workspace}")
     print("type your message; /help for commands, /quit to leave\n")
 
+    # Anything typed after `itsbob chat` opens the conversation, then the
+    # session carries on as normal.
+    opening = " ".join(getattr(args, "message", []) or []).strip()
+
     while True:
-        try:
-            message = input("you › ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
+        if opening:
+            message, opening = opening, ""
+            print(f"you › {message}")
+        else:
+            try:
+                message = input("you › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
         if not message:
             continue
         if message.startswith("/"):
@@ -237,7 +245,8 @@ def _repl_command(line: str, agent: Any, args: argparse.Namespace) -> bool:
 
 def _cmd_ask(args: argparse.Namespace) -> int:
     agent = _build_agent(args, interactive=sys.stdin.isatty())
-    turn = agent.chat(args.prompt, on_event=_streamer(args.verbose) if args.verbose else None)
+    prompt = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
+    turn = agent.chat(prompt, on_event=_streamer(args.verbose) if args.verbose else None)
     if args.json:
         print(json.dumps(turn.as_dict(), indent=2, default=str))
     else:
@@ -677,9 +686,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         mark = "ok " if row["configured"] else "-- "
         print(f"  {mark}{row['name']:<10} {row['description']}"
               + ("" if row["configured"] else f"  (set {row['key_env']})"))
-    mark = "ok " if discord_configured() else "-- "
-    print(f"  {mark}{'discord':<10} proactive posting and two-way chat"
-          + ("" if discord_configured() else "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)"))
+    if discord_configured():
+        # A live read, not a variable check. Both being set proves nothing: the
+        # commonest failure is a *server* id in DISCORD_CHANNEL_ID, which looks
+        # identical in `.env` and fails only at the moment you try to post.
+        from .integrations.discord import DiscordClient
+
+        client = DiscordClient.from_env()
+        reachable, detail = client.check() if client else (False, "not configured")
+        print(f"  {'ok ' if reachable else '!! '}{'discord':<10} {detail}")
+    else:
+        print(f"  --  {'discord':<10} proactive posting and two-way chat"
+              "  (set DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID)")
     backend = available_backend()
     print(f"  ok  {'search':<10} via {backend}"
           + ("" if backend != "duckduckgo-html" else "  (install ddgr for structured results)"))
@@ -995,6 +1013,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # chat
     chat = with_mode(add("chat", "Interactive conversation."))
+    # An opening message is optional, and starts the conversation rather than
+    # replacing it — `itsbob chat <something>` used to be a hard error, which
+    # is a poor answer to somebody who reached for the obvious thing.
+    chat.add_argument(
+        "message", nargs="*", help="optional opening message; the session continues after it"
+    )
     chat.add_argument("-v", "--verbose", action="store_true", help="show tiers and tool results")
     chat.add_argument("-y", "--yes", action="store_true", help="approve every tool without asking")
     chat.add_argument(
@@ -1007,7 +1031,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ask
     ask = with_mode(add("ask", "One question, one answer."))
-    ask.add_argument("prompt")
+    # nargs="+" rather than a single positional: `itsbob ask what is the
+    # weather` is how everybody types it, and quoting is a thing you learn by
+    # being told off for not doing it. argparse called those "unrecognized
+    # arguments", which reads like the *command* was wrong.
+    ask.add_argument("prompt", nargs="+", help="your question; quotes optional")
     ask.add_argument("-v", "--verbose", action="store_true")
     ask.add_argument("-y", "--yes", action="store_true")
     ask.add_argument("--json", action="store_true", help="machine-readable turn record")

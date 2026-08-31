@@ -33,9 +33,18 @@ BUILTIN_SPECS: tuple[ApiSpec, ...] = (
         auth="query",
         query_param="appid",
         description=(
-            "OpenWeather: current conditions and 5-day forecast. Paths `weather` "
-            "and `forecast`; params lat, lon, units=metric. Prefer the `weather` "
-            "tool, which fills in the configured location."
+            "OpenWeather: current conditions and 5-day forecast. Prefer the "
+            "`weather` tool, which fills in the configured location for you."
+        ),
+        examples=(
+            (
+                "path='weather', params={'lat': 53.77, 'lon': -0.33, 'units': 'metric'}",
+                "conditions right now",
+            ),
+            (
+                "path='forecast', params={'lat': 53.77, 'lon': -0.33, 'units': 'metric'}",
+                "the five-day, three-hourly forecast",
+            ),
         ),
     ),
     ApiSpec(
@@ -45,8 +54,16 @@ BUILTIN_SPECS: tuple[ApiSpec, ...] = (
         auth="header",
         header_name="X-Api-Key",
         description=(
-            "NewsAPI: paths `top-headlines` and `everything`. Prefer the `news` "
-            "tool, which merges this with GNews and strips the payload down."
+            "NewsAPI: headlines and article search. Prefer the `news` tool, which "
+            "merges this with GNews and strips the payload down to headlines."
+        ),
+        examples=(
+            (
+                "path='everything', params={'q': 'ceasefire', 'sortBy': 'publishedAt', "
+                "'pageSize': 10, 'language': 'en'}",
+                "articles matching a query, newest first",
+            ),
+            ("path='top-headlines', params={'country': 'gb', 'pageSize': 10}", "UK headlines"),
         ),
     ),
     ApiSpec(
@@ -56,8 +73,15 @@ BUILTIN_SPECS: tuple[ApiSpec, ...] = (
         auth="query",
         query_param="apikey",
         description=(
-            "GNews: paths `top-headlines` and `search`. A second source for the "
-            "`news` tool, and its fallback when NewsAPI is rate-limited."
+            "GNews: a second news source for the `news` tool, and its fallback "
+            "when NewsAPI is rate-limited."
+        ),
+        examples=(
+            ("path='search', params={'q': 'election', 'lang': 'en', 'max': 10}", "a query"),
+            (
+                "path='top-headlines', params={'category': 'world', 'lang': 'en'}",
+                "world headlines",
+            ),
         ),
     ),
     ApiSpec(
@@ -67,9 +91,25 @@ BUILTIN_SPECS: tuple[ApiSpec, ...] = (
         auth="header",
         header_name="X-Auth-Token",
         description=(
-            "football-data.org: competitions, matches, standings, scorers. "
-            "e.g. path `competitions/PL/matches` with params dateFrom/dateTo "
-            "(YYYY-MM-DD), or `competitions/PL/standings`."
+            "football-data.org: fixtures, results, standings and scorers. "
+            "`path` is always required. Competition codes: PL (Premier League), "
+            "ELC (Championship), CL, BL1, SA, PD, FL1. For *results*, pass "
+            "status=FINISHED — without it you get scheduled fixtures with null "
+            "scores, which look like a bug."
+        ),
+        examples=(
+            (
+                "path='competitions/PL/matches', params={'status': 'FINISHED', 'limit': 10}",
+                "the most recent finished Premier League matches, with scores",
+            ),
+            ("path='competitions/PL/matches', params={'matchday': 3}", "one whole matchday"),
+            (
+                "path='competitions/PL/matches', "
+                "params={'dateFrom': '2026-08-28', 'dateTo': '2026-08-31'}",
+                "a date range — both dates required, at most 10 days apart",
+            ),
+            ("path='competitions/PL/standings'", "the current table"),
+            ("path='competitions/PL/scorers'", "top scorers"),
         ),
     ),
 )

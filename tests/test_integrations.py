@@ -849,3 +849,106 @@ def test_setup_skips_what_is_already_configured(monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("asked about a set key")),
     )
     assert setup_wizard._ask_for_services() == {}
+
+
+# -- failures that have to name their own fix ------------------------------
+
+
+def test_calling_an_api_with_no_path_says_so(monkeypatch):
+    """A real transcript: `call_api(api=football)` 404'd, then eleven wasted steps."""
+    from itsbob.tools import http as http_module
+    from itsbob.tools.http import ApiCatalog, _call_api
+
+    catalog = ApiCatalog()
+    register_builtins(catalog, {"FOOTBALL_DATA_KEY": "k"})
+    monkeypatch.setattr(
+        http_module, "_request", lambda *a, **k: (404, '{"message":"Not Found"}', {})
+    )
+
+    class Ctx:
+        env = {"FOOTBALL_DATA_KEY": "k"}
+
+    result = _call_api(catalog)({"api": "football"}, Ctx())
+    assert not result.ok
+    assert "no `path`" in result.error
+    # And the observation the loop feeds back carries a call that works.
+    assert "competitions/PL/matches" in result.error
+
+
+def test_an_api_rejection_says_not_to_retry(monkeypatch):
+    from itsbob.tools import http as http_module
+    from itsbob.tools.http import ApiCatalog, _call_api
+
+    catalog = ApiCatalog()
+    register_builtins(catalog, {"NEWSAPI_KEY": "k"})
+    monkeypatch.setattr(http_module, "_request", lambda *a, **k: (401, "nope", {}))
+
+    class Ctx:
+        env = {"NEWSAPI_KEY": "k"}
+
+    result = _call_api(catalog)({"api": "news", "path": "everything"}, Ctx())
+    assert "NEWSAPI_KEY" in result.error and "Do not retry" in result.error
+
+
+def test_every_builtin_ships_a_call_that_works():
+    """The examples are what stop a model guessing at paths a step at a time."""
+    for spec in BUILTIN_SPECS:
+        assert spec.examples, f"{spec.name} has no worked example"
+        for call, note in spec.examples:
+            assert call.startswith("path=") and note
+        rendered = "\n".join(spec.render_examples())
+        assert f"call_api(api='{spec.name}'" in rendered
+
+
+def test_configured_apis_show_their_examples_in_the_prompt():
+    from itsbob.tools.http import ApiCatalog
+
+    catalog = ApiCatalog()
+    register_builtins(catalog, {"FOOTBALL_DATA_KEY": "k"})
+    block = catalog.render_for_prompt({"FOOTBALL_DATA_KEY": "k"})
+    assert "competitions/PL/standings" in block
+    assert "status" in block and "FINISHED" in block  # results vs fixtures
+    # An unconfigured API is named but not given examples to call.
+    catalog2 = ApiCatalog()
+    register_builtins(catalog2, {"FOOTBALL_DATA_KEY": "k"})
+    assert "call_api" not in catalog2.render_for_prompt({})
+
+
+def test_unknown_channel_names_all_three_causes():
+    """One message, three unrelated problems — so the fix has to list them."""
+    from itsbob.integrations.discord import _explain
+
+    text = _explain(404, '{"message": "Unknown Channel"}', "999")
+    assert "server id, not a channel id" in text
+    assert "never invited" in text
+    assert "permissions" in text
+    assert "999" in text
+
+
+def test_a_rejected_token_is_told_apart_from_a_missing_channel():
+    from itsbob.integrations.discord import _explain
+
+    assert "Reset Token" in _explain(401, "401: Unauthorized", "1")
+    assert "Send Messages" in _explain(403, "Missing Access", "1")
+
+
+def test_the_discord_check_reads_the_channel_rather_than_the_variables():
+    """Both variables being set proves nothing — a server id looks identical."""
+    import json as _json
+    import urllib.error
+
+    from itsbob.integrations.discord import DiscordClient
+
+    def refuse(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", {},
+            __import__("io").BytesIO(_json.dumps({"message": "Unknown Channel"}).encode()),
+        )
+
+    ok, detail = DiscordClient(token="t", channel_id="42", opener=refuse).check()
+    assert not ok and "server id" in detail
+
+    good, detail = DiscordClient(
+        token="t", channel_id="42", opener=lambda r, timeout=None: FakeResponse([])
+    ).check()
+    assert good and "reachable" in detail
