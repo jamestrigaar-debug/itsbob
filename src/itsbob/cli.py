@@ -864,6 +864,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     # The capability keys take the same route, so an unattended install can set
     # everything up in one command rather than the providers here and the rest
     # by hand in `.env`.
+    if getattr(args, "open_network", False):
+        keys["ITSBOB_AUTO_ALLOW_RISKS"] = "network"
     for service in SERVICE_KEYS:
         for env in (service.env, service.also):
             if not env:
@@ -993,6 +995,10 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--groq-key", help="set GROQ_API_KEY without being prompted")
     setup.add_argument("--openrouter-key", help="set OPENROUTER_API_KEY without being prompted")
     setup.add_argument("--no-verify", action="store_true", help="skip the live API check")
+    setup.add_argument(
+        "--open-network", action="store_true",
+        help="run network tools without asking (shell and deletions still ask)",
+    )
     # One flag per optional capability, derived from the same list the wizard
     # prompts from, so adding a service never means remembering to add a flag.
     from .setup_wizard import SERVICE_KEYS as _SERVICES

@@ -374,6 +374,29 @@ supervisor here and there shouldn't be.
 itsbob gui       # http://localhost:8765
 ```
 
+The console is one page: the conversation on the left at full height, and on
+the right six panels of evidence about it — **activity** (every step as it
+happens), **memory**, **tasks**, **tokens**, **messages**, and **system**
+(APIs, scripts, tools). Across the top, the four things asked at a glance:
+whether it is thinking, whether the daemon is serving, whether Discord is
+connected, and what today has cost.
+
+Two rules it was rebuilt around. Every panel owns its endpoint, so one broken
+subsystem costs one panel and says so in place — the old tasks panel read from
+the shared status payload and went dark whenever anything unrelated in it was
+slow. And nothing spins without saying why: every request is bounded, and a
+timeout is a named error with a retry rather than a placeholder that never
+resolves.
+
+The **tokens** panel reports estimated money, not just counts. A million cheap
+tokens and a million premium ones differ by roughly forty times in price, so a
+bare token number invites the wrong conclusion. It splits spend by model and by
+*what the call was for* — answering, classifying, extracting memories — and
+shows what share ran locally for nothing. A model with no published price is
+reported as unpriced rather than guessed at.
+
+The previous interface is still at `/old` for one release.
+
 Chat on the left. On the right, **every step as it happens** — streamed over
 server-sent events, not delivered in one lump when the turn ends. You watch the
 tier get chosen, each tool call go out, and each result come back, which is the
@@ -404,6 +427,16 @@ rather than the gateway, so there is no websocket, no async runtime and no new
 dependency; it polls every few seconds, which is how often a person looks at a
 channel anyway. Long messages are split on paragraph breaks, rate limits are
 waited out per Discord's own `retry_after`, and the bot never answers itself.
+
+**Network access is a setup question.** Fetching a page, searching the web and
+calling your own APIs each raise an approval prompt by default, and a web
+search that needs a yes every time is not a web search. `itsbob setup` offers to
+let network calls run without asking; shell commands, deletions and stopping
+processes still ask, because those are the ones you cannot take back. Change it
+any time with `ITSBOB_AUTO_ALLOW_RISKS=network` in `.env`, or
+`itsbob setup --open-network`. It is a *risk level* rather than a list of tool
+names on purpose: there are eight network tools and more arrive with every API
+you add, so a per-tool list is out of date the moment it is written.
 
 **You can approve tools from the page.** When the agent reaches something
 `guarded` mode gates, a card appears showing the exact command and why it wants
@@ -665,6 +698,7 @@ src/itsbob/
     service.py      the loop
   llm/            provider-agnostic model access
     router.py       failover, rate limiting, circuit breaker, usage tracking
+    pricing.py      what a call cost, and which share of it was free
     embeddings.py   the embedding chain and signature isolation
     providers.py    Groq / Google / OpenRouter (one OpenAI-compatible client)
     local.py        Ollama
@@ -678,7 +712,8 @@ src/itsbob/
   gui/            the browser interface
     app.py          Flask routes and the SSE stream
     session.py      one running agent: event fan-out and the approval gate
-    page.py         the single-page interface, inline (no build step)
+    console.py      the console: chat, activity, memory, tasks, tokens, system
+    page.py         the previous interface, served at /old for one release
     messages.py     the standalone /messages window and its log reader
     autonomous.py   continuous mode: scheduled work through the chat queue
   store.py        locked SQLite: one lock per file, WAL, busy timeout
@@ -687,7 +722,7 @@ src/itsbob/
   service.py      systemd/launchd unit generation
   cli.py          every command
 install.sh        one-command install
-tests/            498 tests, none of which touch the network
+tests/            508 tests, none of which touch the network
 ```
 
 ## The original simulation

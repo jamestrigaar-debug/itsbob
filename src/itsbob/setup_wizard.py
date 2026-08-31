@@ -268,6 +268,36 @@ def write_env(values: Mapping[str, str], *, path: Path | None = None) -> Path:
     return target
 
 
+def _ask_about_network() -> dict[str, str]:
+    """Offer to stop asking before every network call.
+
+    Deliberately scoped to *network* rather than everything. Reading the web,
+    calling a configured API and posting to your own Discord are all recoverable
+    and constant — approving each one individually is friction with no safety
+    return. Running shell commands, deleting files and stopping processes are
+    not, and stay behind the confirm gate whatever is chosen here.
+    """
+    if os.environ.get("ITSBOB_AUTO_ALLOW_RISKS", "").strip():
+        _say()
+        _say(f"  {_TICK} Network access: already configured")
+        return {}
+
+    _say()
+    _say("  Network access")
+    _say("  Fetching a page, searching the web and calling your own APIs each")
+    _say("  raise an approval prompt by default. That is a lot of prompts, and")
+    _say("  none of them is a decision worth making twice.")
+    _say()
+    if not _confirm("  Let itsbob use the network without asking?", default=True):
+        _say(f"  {_DOT} left as-is — it will ask before each network call")
+        return {}
+    _say(f"  {_TICK} network calls run without asking")
+    _say("    Shell commands, deletions and stopping processes still ask —")
+    _say("    those are the ones you cannot take back.")
+    _say("    Change it any time: ITSBOB_AUTO_ALLOW_RISKS in ~/.itsbob/.env")
+    return {"ITSBOB_AUTO_ALLOW_RISKS": "network"}
+
+
 def _ask_for_services() -> dict[str, str]:
     """Offer each optional capability once, with what it actually gives you.
 
@@ -378,6 +408,12 @@ def run_setup(
                 collected[name] = value
             elif primary:
                 _say(f"     {_DOT} skipped — itsbob will run offline until you add one")
+
+    # 2a. How much rope. Asked once, changeable later, and it is the setting
+    #     people feel most: every network tool otherwise raises a confirm card,
+    #     and a web search that needs a yes each time is not a web search.
+    if interactive and not keys:
+        collected.update(_ask_about_network())
 
     # 2b. The capability keys. Asked for, not just reported at the end: a
     #     capability you find out about after you thought you had finished
