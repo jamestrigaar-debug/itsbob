@@ -49,6 +49,7 @@ class Persona:
         self,
         *,
         tools: str,
+        tool_awareness: str = "",
         apis: str = "",
         workspace: Path | None = None,
         policy_note: str = "",
@@ -74,8 +75,13 @@ class Persona:
         """
         if brief:
             return self._render_brief(
-                tools=tools, workspace=workspace, now=now, tool_names=tool_names,
+                tools=tools,
+                tool_awareness=tool_awareness,
+                workspace=workspace,
+                now=now,
+                tool_names=tool_names,
                 background=background,
+                continuing=continuing,
             )
         # Minute-resolution on the first step only. The stamp is inside the
         # system message, so a clock ticking over mid-turn changes the prefix
@@ -112,6 +118,11 @@ class Persona:
             "## Tools",
             tools,
         ]
+        # Continuation steps use compact callable signatures to save tokens;
+        # keep descriptions available in the standing pre-prompt so the model
+        # can still rediscover the right capability.
+        if continuing and tool_awareness:
+            blocks += ["", "## Tool capability guide", tool_awareness]
         if apis:
             blocks += ["", "## Configured APIs", apis]
         if policy_note:
@@ -123,8 +134,8 @@ class Persona:
             "- Never report an action as done unless a tool call in this turn "
             "actually did it and you saw the result. No exceptions.",
             "- When a tool hands you a list, give the user every row of it. "
-            "Naming a count instead of the items — \"10 matches were played\", "
-            "\"several results\" — is not an answer, it is a description of one. "
+            'Naming a count instead of the items — "10 matches were played", '
+            '"several results" — is not an answer, it is a description of one. '
             "One item per line, with the detail each carries. If some are "
             "genuinely missing, list what you have and say what is absent and why.",
             "- Only call a tool from the list above, with exactly the arguments it "
@@ -216,15 +227,15 @@ class Persona:
         self,
         *,
         tools: str,
+        tool_awareness: str,
         workspace: Path | None,
         now: float | None,
         tool_names: tuple[str, ...],
         background: str,
+        continuing: bool,
     ) -> str:
         stamp = time.strftime("%A %d %B %Y, %H:%M", time.localtime(now or time.time()))
-        roster = (
-            f" `tool` must be one of: {', '.join(tool_names)}." if tool_names else ""
-        )
+        roster = f" `tool` must be one of: {', '.join(tool_names)}." if tool_names else ""
         blocks = [
             f"You are {self.name}, {self.role}.",
             f"It is {stamp} on {platform.system()}"
@@ -232,13 +243,16 @@ class Persona:
             "",
             "Work in steps: each step is exactly one tool call, or your final answer. "
             "Never say you did something unless a tool call in this turn did it.",
-            "When a tool gives you a list, list every row of it — a count is not "
-            "an answer.",
+            "When a tool gives you a list, list every row of it — a count is not an answer.",
             "Anything worth keeping goes in `remember` — and your own opinions are "
             "yours (subject `bob`), never the user's.",
             "",
             "## Tools",
             tools,
+        ]
+        if continuing and tool_awareness:
+            blocks += ["", "## Tool capability guide", tool_awareness]
+        blocks += [
             "",
             "## Voice",
             self.voice,

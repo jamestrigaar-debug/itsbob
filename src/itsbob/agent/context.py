@@ -191,6 +191,7 @@ def build_messages(
     *,
     persona: Persona,
     tools: str,
+    tool_awareness: str = "",
     snapshot_text: str,
     conversation: Conversation,
     memories: Sequence[Any] = (),
@@ -243,6 +244,7 @@ def build_messages(
         system(
             persona.render(
                 tools=tools,
+                tool_awareness=tool_awareness,
                 apis=apis,
                 workspace=workspace,
                 policy_note=policy_note,
@@ -258,7 +260,12 @@ def build_messages(
     messages.extend(conversation.as_messages())
     messages.append(user(snapshot_text))
     if scratchpad.strip():
-        messages.append(user("Private scratchpad (working notes; do not repeat verbatim):\n" + scratchpad[:MAX_SCRATCHPAD_CHARS]))
+        messages.append(
+            user(
+                "Private scratchpad (working notes; do not repeat verbatim):\n"
+                + scratchpad[:MAX_SCRATCHPAD_CHARS]
+            )
+        )
 
     steps = list(steps)
     cutoff = max(0, len(steps) - max(1, full_observations))
@@ -325,7 +332,12 @@ def _clip(text: str, limit: int) -> str:
 
 def _ago(created_at: float) -> str:
     seconds = max(0.0, time.time() - created_at)
-    for limit, unit, size in ((60, "s", 1), (3600, "m", 60), (86400, "h", 3600), (86400 * 30, "d", 86400)):
+    for limit, unit, size in (
+        (60, "s", 1),
+        (3600, "m", 60),
+        (86400, "h", 3600),
+        (86400 * 30, "d", 86400),
+    ):
         if seconds < limit:
             return f"{int(seconds // size)}{unit} ago"
     return f"{int(seconds // (86400 * 30))}mo ago"

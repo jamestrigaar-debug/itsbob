@@ -99,6 +99,7 @@ class Risk(str, Enum):
     def __hash__(self) -> int:
         return hash(self.value)
 
+
 _RISK_ORDER = {
     Risk.READ: 0,
     Risk.WRITE: 1,
@@ -443,6 +444,15 @@ class ToolRegistry:
             for tool in tools
         ]
         return "\n".join(lines)
+
+    def render_awareness(self, *, exclude: Collection[str] = ()) -> str:
+        """Compact capability guide for the agent's standing tool pre-prompt."""
+        excluded = set(exclude)
+        return "\n".join(
+            f"- {tool.name}: {tool.description[:24].rstrip()}…"
+            for tool in self.all()
+            if tool.name not in excluded
+        )
 
     def suggest(self, name: str, *, limit: int = 3) -> list[str]:
         """Near-miss names, so a wrong guess gets a usable correction back."""

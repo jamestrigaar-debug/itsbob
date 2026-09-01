@@ -38,6 +38,7 @@ from .policy import DENY_PATTERNS, Mode, Policy, Verdict
 from .sandbox import run_command, sandbox_tools
 from .vision import vision_tools
 from .websearch import web_search_tools
+from .productivity import productivity_tools
 
 __all__ = [
     "ApiCatalog",
@@ -61,6 +62,7 @@ __all__ = [
     "build_toolbox",
     "default_registry",
     "run_command",
+    "productivity_tools",
     "vision_tools",
     "web_search_tools",
 ]
@@ -85,6 +87,7 @@ def default_registry(
         *http_tools(catalog),
         *memory_tools(),
         *web_search_tools(),
+        *productivity_tools(),
         *vision_tools(),
         # Weather, news and the combined daily report. Registered whether or
         # not the keys are set: a tool that says "OPENWEATHER_API_KEY is not

@@ -282,6 +282,25 @@ itsbob audit     # every call, including the refused ones
 
 ## APIs
 
+### Productivity tools
+
+The toolbox also includes provider-neutral productivity capabilities:
+
+- `email_list` and `email_send` use IMAPS/SMTPS. Configure
+  `ITSBOB_EMAIL_IMAP_HOST`, `ITSBOB_EMAIL_SMTP_HOST`, `ITSBOB_EMAIL_USERNAME`,
+  `ITSBOB_EMAIL_PASSWORD`, and optional port variables. Credentials never enter
+  tool arguments or model prompts.
+- `calendar_list`, `calendar_add`, and `calendar_remove` manage a bounded local
+  `calendar.json` in the workspace. Destructive removal remains policy-gated.
+- `database_query` runs read-only, parameterized SQLite queries against files in
+  the workspace. Writes, `ATTACH`, extensions, and vacuum operations are refused.
+- `parse_document` extracts text from PDF, DOCX, XLSX, and PPTX files. PDF
+  support is optional: install `itsbob[documents]` for `pypdf`.
+
+All of these tools are registered in the same catalog as the existing file,
+memory, web, vision, scheduling, and system tools, so their names and schemas
+are included in the agent's tool roster and considered during response planning.
+
 Adding an API is a config entry, not a code change. The model names the API and
 the path; the catalog attaches the base URL and the credential. **The key never
 enters the prompt, the model's output, or the audit log** — a model that cannot

@@ -92,8 +92,14 @@ class AgentEvent:
 EventFn = Callable[[AgentEvent], None]
 
 #: Raising within a turn only. A turn never gets cheaper than it started.
-_RAISE = {Tier.C: Tier.B, Tier.B: Tier.A, Tier.A: Tier.S, Tier.S: Tier.S,
-          Tier.D: Tier.B, Tier.H: Tier.A}
+_RAISE = {
+    Tier.C: Tier.B,
+    Tier.B: Tier.A,
+    Tier.A: Tier.S,
+    Tier.S: Tier.S,
+    Tier.D: Tier.B,
+    Tier.H: Tier.A,
+}
 
 #: How many invented tool names to tolerate before giving up on the turn.
 MAX_UNKNOWN_TOOLS = 3
@@ -193,9 +199,7 @@ class Agent:
         self.max_seconds = max_seconds
         self.recall_limit = recall_limit
         self.guard = guard if guard is not None else SpendGuard()
-        self.feasibility = (
-            feasibility if feasibility is not None else FeasibilityCheck(brain=brain)
-        )
+        self.feasibility = feasibility if feasibility is not None else FeasibilityCheck(brain=brain)
         self.gatekeeper = gatekeeper or Gatekeeper(
             local_provider=brain.local, cloud_classifier=self._cheap_classify
         )
@@ -355,9 +359,7 @@ class Agent:
 
         from .delegation import context_from  # noqa: PLC0415 - optional path
 
-        result = self.delegation.ask(
-            message, context=context_from(memories, self.persona.style)
-        )
+        result = self.delegation.ask(message, context=context_from(memories, self.persona.style))
         if result is None:
             emit("delegate", allowed=False, reason=self.delegation.last_error or "no usable reply")
             return None
@@ -492,6 +494,9 @@ class Agent:
                 tools=self.toolbox.render_for_prompt(
                     describe_only=None if first_step else (in_play | _ALWAYS_DESCRIBED)
                 ),
+                tool_awareness=self.toolbox.registry.render_awareness(
+                    exclude=(in_play | _ALWAYS_DESCRIBED) if not first_step else ()
+                ),
                 snapshot_text=snapshot.render(),
                 conversation=self.conversation,
                 memories=memories,
@@ -565,7 +570,9 @@ class Agent:
                 turn.steps.append(step)
                 emit("step", **step.as_dict())
                 if raised is tier:
-                    return self._forced_answer(snapshot, turn, tier, "the model would not answer"), tier
+                    return self._forced_answer(
+                        snapshot, turn, tier, "the model would not answer"
+                    ), tier
                 tier = raised
                 continue
 
@@ -626,11 +633,11 @@ class Agent:
                 )
                 budget = extended
 
-        return self._forced_answer(snapshot, turn, tier, _stop_reason(budget, self.hard_max_steps)), tier
+        return self._forced_answer(
+            snapshot, turn, tier, _stop_reason(budget, self.hard_max_steps)
+        ), tier
 
-    def _extend(
-        self, budget: int, turn: Turn, guard: TurnGuard, deadline: float
-    ) -> int | None:
+    def _extend(self, budget: int, turn: Turn, guard: TurnGuard, deadline: float) -> int | None:
         """More steps, if the last stretch earned them. ``None`` to stop.
 
         "Earned" is deliberately mechanical rather than a judgement call — no
@@ -710,7 +717,9 @@ class Agent:
             found = self.memory.by_tag("style", limit=8)
         except Exception:  # noqa: BLE001 - a preference is an assist, never a dependency
             return
-        self.persona.style = tuple(dict.fromkeys(r.content.strip() for r in found if r.content.strip()))
+        self.persona.style = tuple(
+            dict.fromkeys(r.content.strip() for r in found if r.content.strip())
+        )
 
     def _recall(self, query: str) -> list[Any]:
         if self.memory is None or not query.strip():
@@ -812,5 +821,7 @@ def _policy_note(toolbox: Toolbox) -> str:
             "say clearly when something needs a person."
         )
     else:
-        lines.append("Steps that change things outside the workspace will be shown to the user first.")
+        lines.append(
+            "Steps that change things outside the workspace will be shown to the user first."
+        )
     return " ".join(lines)
