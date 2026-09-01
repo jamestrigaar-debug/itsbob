@@ -139,9 +139,7 @@ class Daemon:
         #: never interleave into each other's conversation.
         self.discord = discord
         #: Speaking first when nothing is due. ``False`` turns it off.
-        self.initiative = (
-            Initiative.from_env() if initiative is None else (initiative or None)
-        )
+        self.initiative = Initiative.from_env() if initiative is None else (initiative or None)
         #: Whether a finished task actually did what it was asked. Runs on the
         #: local model, so it is free; pass ``False`` to turn it off entirely.
         self.completion = (
@@ -372,10 +370,20 @@ class Daemon:
         hours = max(0.0, (now - self._autonomous_quiet_since) / 3600.0)
         definition = choose_autonomous(pressure=1.0 + hours)
         task = Task(
-            name=f"itsbobtask: {definition.name}", prompt=definition.prompt,
-            schedule="every 52 weeks", next_run=now, max_runs=1, notify=False,
-            grade=definition.tier.value, attempts=1,
-            metadata={"itsbobtask": True, "autonomous": True, "hidden": True, "tier": definition.tier.value},
+            name=f"itsbobtask: {definition.name}",
+            prompt=definition.prompt,
+            schedule="every 52 weeks",
+            next_run=now,
+            max_runs=1,
+            notify=False,
+            grade=definition.tier.value,
+            attempts=1,
+            metadata={
+                "itsbobtask": True,
+                "autonomous": True,
+                "hidden": True,
+                "tier": definition.tier.value,
+            },
         )
         self.tasks.add(task)
         self._autonomous_last = now
@@ -389,19 +397,26 @@ class Daemon:
             # was actually shown in the activity/conversation view.
             stored = self.tasks.get(task.id)
             report = (stored.last_output if stored is not None else run.output).strip()
-            self._deliver(Notification(
-                title=f"itsbobtask: {definition.name}",
-                body=f"@everyone\n{report or 'Autonomous task completed without a report.'}",
-                task=task.name, source="autonomous", urgency="normal",
-            ))
+            self._deliver(
+                Notification(
+                    title=f"itsbobtask: {definition.name}",
+                    body=f"@everyone\n{report or 'Autonomous task completed without a report.'}",
+                    task=task.name,
+                    source="autonomous",
+                    urgency="normal",
+                )
+            )
             if self.agent.memory is not None:
                 try:
-                    self.agent.memory.add(MemoryRecord(
-                        content=f"Completed autonomous itsbobtask '{definition.name}': {report[:500]}",
-                        kind=MemoryKind.OBSERVATION, importance=0.45,
-                        tags=("itsbobtask", "autonomous"),
-                        metadata={"source": "autonomous", "task_id": task.id},
-                    ))
+                    self.agent.memory.add(
+                        MemoryRecord(
+                            content=f"Completed autonomous itsbobtask '{definition.name}': {report[:500]}",
+                            kind=MemoryKind.OBSERVATION,
+                            importance=0.45,
+                            tags=("itsbobtask", "autonomous"),
+                            metadata={"source": "autonomous", "task_id": task.id},
+                        )
+                    )
                 except Exception:  # noqa: BLE001
                     pass
         return run
@@ -429,8 +444,9 @@ class Daemon:
         self._defers[task.id] = count
         task.next_run = (now or time.time()) + self.defer_seconds
         self.tasks.add(task)
-        self._emit("deferred", task=task.name, reason=reason, count=count,
-                   retry_in_s=self.defer_seconds)
+        self._emit(
+            "deferred", task=task.name, reason=reason, count=count, retry_in_s=self.defer_seconds
+        )
 
         if count >= self.max_defers and task.id not in self._defer_notified:
             self._defer_notified.add(task.id)
@@ -497,7 +513,12 @@ class Daemon:
             tools=tools,
         )
 
-        if task.notify and status != "skipped":
+        # A task that explicitly posts through Discord has already delivered
+        # its result. Sending the same output through the scheduler sink as
+        # well creates duplicate reminders (and becomes especially noisy when
+        # completion checking retries a task). The task's own Discord call is
+        # the authoritative notification for that run.
+        if task.notify and status != "skipped" and "discord_post" not in tools:
             notification = self.gate.judge(
                 task_name=task.name, prompt=task.prompt, result=output, previous=previous
             )
@@ -513,8 +534,13 @@ class Daemon:
 
         self.tasks.record_run(task, run, now=now)
         self.runs_completed += 1
-        self._emit("finished", task=task.name, status=status, notified=run.notified,
-                   duration_ms=round(run.duration_ms, 1))
+        self._emit(
+            "finished",
+            task=task.name,
+            status=status,
+            notified=run.notified,
+            duration_ms=round(run.duration_ms, 1),
+        )
         return run
 
     def run_now(self, needle: str) -> TaskRun | None:
@@ -563,6 +589,10 @@ class Daemon:
             began = time.perf_counter()
             turn = self._run_bounded(task, prompt=prompt, min_tier=floor, thorough=thorough)
             spent += time.perf_counter() - began
+            # Never replay a task after an external side effect. In particular,
+            # a completion retry would post the same Discord reminder again.
+            if "discord_post" in turn.tools_used:
+                break
             if self.completion is None or number == attempts:
                 break
             if self.task_timeout and spent >= self.task_timeout * 0.5:
@@ -571,9 +601,7 @@ class Daemon:
                 # already in hand.
                 break
             status = "failed" if turn.error else "ok"
-            verdict = self.completion.judge(
-                prompt=task.prompt, output=turn.final, status=status
-            )
+            verdict = self.completion.judge(prompt=task.prompt, output=turn.final, status=status)
             if verdict.complete:
                 break
             self._emit(
@@ -591,8 +619,9 @@ class Daemon:
             floor = next_grade(self._tier_of(turn) or floor or Tier.B)
         return turn
 
-    def _run_bounded(self, task: Task, *, prompt: str | None = None,
-                     min_tier: Any = None, thorough: bool = False):
+    def _run_bounded(
+        self, task: Task, *, prompt: str | None = None, min_tier: Any = None, thorough: bool = False
+    ):
         """Run one task with a deadline while reserving the shared agent.
 
         A deadline lets the scheduler persist the failure and remain responsive.
@@ -623,9 +652,7 @@ class Daemon:
             finally:
                 self._agent_lock.release()
 
-        thread = threading.Thread(
-            target=target, name=f"itsbob-task-{task.id}", daemon=True
-        )
+        thread = threading.Thread(target=target, name=f"itsbob-task-{task.id}", daemon=True)
         try:
             thread.start()
         except Exception:

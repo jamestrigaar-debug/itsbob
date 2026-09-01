@@ -31,8 +31,13 @@ def _at(text: str) -> float:
 
 @pytest.mark.parametrize(
     "text,seconds",
-    [("every 30s", 30), ("every 15m", 900), ("every 2 hours", 7200),
-     ("every 1 day", 86400), ("hourly", 3600)],
+    [
+        ("every 30s", 30),
+        ("every 15m", 900),
+        ("every 2 hours", 7200),
+        ("every 1 day", 86400),
+        ("hourly", 3600),
+    ],
 )
 def test_intervals_parse(text, seconds):
     assert parse_schedule(text).seconds == seconds
@@ -73,7 +78,9 @@ def test_an_interval_task_starts_immediately():
     assert parse_schedule("daily at 08:30").first_run(now) > now
 
 
-@pytest.mark.parametrize("text", ["whenever", "", "every 3 fortnights", "daily at 25:00", "at nonsense"])
+@pytest.mark.parametrize(
+    "text", ["whenever", "", "every 3 fortnights", "daily at 25:00", "at nonsense"]
+)
 def test_unparseable_schedules_raise_with_a_hint(text):
     with pytest.raises(ScheduleError):
         parse_schedule(text)
@@ -255,7 +262,9 @@ def test_an_empty_result_is_never_notified():
 
 
 def test_an_invalid_urgency_falls_back_to_normal():
-    gate = NoticeGate(brain=_Gatekeeper({"notify": True, "title": "t", "body": "b", "urgency": "SCREAMING"}))
+    gate = NoticeGate(
+        brain=_Gatekeeper({"notify": True, "title": "t", "body": "b", "urgency": "SCREAMING"})
+    )
     assert gate.judge(task_name="t", prompt="p", result="x").urgency == "normal"
 
 
@@ -319,7 +328,9 @@ def test_autonomous_notification_uses_committed_task_output(tmp_path):
     class Discord:
         pass
 
-    daemon = _daemon(tmp_path, agent=_Agent(replies=["**Headline**\nSummary from source"]), autonomous=True)
+    daemon = _daemon(
+        tmp_path, agent=_Agent(replies=["**Headline**\nSummary from source"]), autonomous=True
+    )
     daemon.discord = Discord()
     run = daemon.run_autonomous(now=5000)
     assert run is not None and run.status == "ok"
@@ -358,6 +369,7 @@ def test_each_run_gets_a_fresh_conversation(tmp_path):
 
 def test_a_timed_out_task_restores_its_budget_and_blocks_overlapping_turns(tmp_path):
     """A deadline must not shrink later tasks or run two turns on one agent."""
+
     class SlowAgent(_Agent):
         def __init__(self):
             super().__init__()
@@ -416,6 +428,30 @@ def test_notify_false_skips_the_gate_entirely(tmp_path):
     daemon.gate = NoticeGate(brain=agent.brain)
     daemon.tasks.create("quiet", "x", "every 15m", notify=False, now=now)
     assert daemon.tick(now=now)[0].notified is False
+
+
+def test_explicit_discord_post_is_not_reposted_by_scheduler(tmp_path):
+    now = _at("2026-08-30 14:05")
+
+    class PostingAgent(_Agent):
+        def chat(self, message, **kwargs):
+            self.prompts.append(message)
+            turn = Turn(message=message, final="posted")
+            turn.steps.append(Step(index=1, tool="discord_post", ok=True))
+            return turn
+
+    from itsbob.agent.context import Step
+
+    posting_agent = PostingAgent()
+    daemon = _daemon(tmp_path, agent=posting_agent, completion=_Judge((False, "missing")))
+    daemon.gate = NoticeGate(
+        brain=_Gatekeeper({"notify": True, "title": "duplicate", "body": "no"})
+    )
+    daemon.tasks.create("reminder", "post a reminder", "every 4h", now=now)
+    run = daemon.tick(now=now)[0]
+    assert run.notified is False
+    assert daemon.sink.read() == []
+    assert len(posting_agent.prompts) == 1
 
 
 def test_a_noteworthy_result_is_delivered(tmp_path):
@@ -499,8 +535,7 @@ class _Judge:
         from itsbob.daemon.completion import Completion
 
         self.verdicts = [
-            Completion(complete=ok, missing=missing, checked=True)
-            for ok, missing in verdicts
+            Completion(complete=ok, missing=missing, checked=True) for ok, missing in verdicts
         ]
         self.seen = []
 
@@ -582,7 +617,7 @@ def test_a_broken_judge_never_blocks_delivery(tmp_path):
 
 
 def test_a_short_answer_is_not_automatically_incomplete():
-    """"Nothing was scheduled today" is 27 characters and finished.
+    """ "Nothing was scheduled today" is 27 characters and finished.
 
     A length threshold is a bad proxy for completeness, so only genuinely
     empty output is decided without asking.
