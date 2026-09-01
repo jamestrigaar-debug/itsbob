@@ -315,6 +315,18 @@ def test_a_tick_with_nothing_due_does_nothing(tmp_path):
     assert daemon.tick(now=now) == []
 
 
+def test_autonomous_notification_uses_committed_task_output(tmp_path):
+    class Discord:
+        pass
+
+    daemon = _daemon(tmp_path, agent=_Agent(replies=["**Headline**\nSummary from source"]), autonomous=True)
+    daemon.discord = Discord()
+    run = daemon.run_autonomous(now=5000)
+    assert run is not None and run.status == "ok"
+    rows = daemon.sink.read()
+    assert rows[-1]["body"].startswith("@everyone\n**Headline**\nSummary from source")
+
+
 def test_one_failing_task_does_not_stop_the_others(tmp_path):
     now = _at("2026-08-30 14:05")
     agent = _Agent(replies=[RuntimeError("model exploded"), "second ran"])

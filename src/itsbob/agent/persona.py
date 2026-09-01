@@ -197,6 +197,7 @@ class Persona:
             '{"thought": "<one short sentence on what you are doing and why>", '
             '"tool": "<tool name, or null if you are answering now>", '
             '"params": {<arguments for that tool>}, '
+            '"scratchpad": "<optional concise private plan or key facts>", '
             '"final": "<your answer to the user, or null if calling a tool>"}',
             "Exactly one of `tool` and `final` is non-null." + roster,
         ]
@@ -255,7 +256,8 @@ class Persona:
             "## Output format",
             "Reply with a single JSON object and nothing else:",
             '{"thought": "<one short sentence>", "tool": "<tool name or null>", '
-            '"params": {...}, "final": "<answer or null>"}',
+            '"params": {...}, "scratchpad": "<optional private notes>", '
+            '"final": "<answer or null>"}',
             "Exactly one of `tool` and `final` is non-null." + roster,
         ]
         return "\n".join(blocks)

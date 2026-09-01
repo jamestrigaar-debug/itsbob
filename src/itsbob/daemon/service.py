@@ -383,15 +383,21 @@ class Daemon:
         self._emit("autonomous_created", task=task.name, tier=definition.tier.value)
         run = self.run_task(task, now=now)
         if run.status != "skipped":
+            # Read back the committed result.  The task runner may perform
+            # completion bookkeeping and notification sinks may run in other
+            # threads; the persisted output is the authoritative answer that
+            # was actually shown in the activity/conversation view.
+            stored = self.tasks.get(task.id)
+            report = (stored.last_output if stored is not None else run.output).strip()
             self._deliver(Notification(
                 title=f"itsbobtask: {definition.name}",
-                body=f"@everyone\n{run.output or 'Autonomous task completed without a report.'}",
+                body=f"@everyone\n{report or 'Autonomous task completed without a report.'}",
                 task=task.name, source="autonomous", urgency="normal",
             ))
             if self.agent.memory is not None:
                 try:
                     self.agent.memory.add(MemoryRecord(
-                        content=f"Completed autonomous itsbobtask '{definition.name}': {run.output[:500]}",
+                        content=f"Completed autonomous itsbobtask '{definition.name}': {report[:500]}",
                         kind=MemoryKind.OBSERVATION, importance=0.45,
                         tags=("itsbobtask", "autonomous"),
                         metadata={"source": "autonomous", "task_id": task.id},

@@ -70,7 +70,7 @@ from ..tools import ToolCall, Toolbox
 from .brain import TieredBrain
 from .budget import FeasibilityCheck, SpendGuard, Verdict
 from .completeness import REWRITE_INSTRUCTION, inspect as inspect_completeness
-from .context import Conversation, Step, Turn, build_messages
+from .context import Conversation, Step, Turn, build_messages, MAX_SCRATCHPAD_CHARS
 from .persona import Persona
 from .writer import MemoryWriter
 
@@ -507,6 +507,7 @@ class Agent:
                 thorough=thorough,
                 continuing=not first_step,
                 observation_chars=_observation_budget(len(turn.steps)),
+                scratchpad=turn.scratchpad,
             )
 
             step = Step(index=index, tier=tier.value)
@@ -536,6 +537,14 @@ class Agent:
                 # would penalise the thing the ceiling exists to encourage.
                 self.guard.add(result.response.usage.total_tokens)
             step.thought = str(payload.get("thought") or "").strip()
+            notes = payload.get("scratchpad")
+            if isinstance(notes, str):
+                # Replace rather than append: the model owns one compact set
+                # of notes, and an append-only scratchpad would become a new
+                # unbounded context channel.
+                turn.scratchpad = notes.strip()[:MAX_SCRATCHPAD_CHARS]
+                if turn.scratchpad:
+                    emit("scratchpad", text=turn.scratchpad)
 
             final = payload.get("final")
             tool_name = payload.get("tool")

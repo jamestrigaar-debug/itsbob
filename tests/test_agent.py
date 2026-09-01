@@ -643,6 +643,21 @@ def test_later_steps_send_a_smaller_prompt_than_the_first(tmp_path):
         assert name in systems[1], f"{name} disappeared from the shortened prompt"
 
 
+def test_private_scratchpad_is_carried_between_steps_and_bounded(tmp_path):
+    agent = _agent(
+        tmp_path,
+        [
+            {"thought": "plan", "scratchpad": "keep this plan", "tool": "read_file", "params": {"path": "a.txt"}},
+            {"final": "done"},
+        ],
+    )
+    (tmp_path / "ws").mkdir(exist_ok=True)
+    (tmp_path / "ws" / "a.txt").write_text("hello", encoding="utf-8")
+    turn = agent.chat("read a.txt")
+    assert turn.scratchpad == "keep this plan"
+    assert any("Private scratchpad" in m.content for r in agent.brain.requests[1:] for m in r.messages)
+
+
 def test_a_tool_already_in_play_keeps_its_description(tmp_path):
     """What it is still reasoning about stays legible; the rest is signatures."""
     workspace = tmp_path / "ws"

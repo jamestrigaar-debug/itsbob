@@ -23,6 +23,8 @@ from .persona import Persona
 
 __all__ = ["Turn", "Step", "Conversation", "build_messages"]
 
+MAX_SCRATCHPAD_CHARS = 2000
+
 
 @dataclass
 class Step:
@@ -78,6 +80,8 @@ class Turn:
     #: Set when a free reasoner answered instead of the tier this was routed
     #: to. Recorded because "that one was free" is the number worth watching.
     delegated: bool = False
+    #: Bounded private working notes supplied by the model between steps.
+    scratchpad: str = ""
 
     @property
     def tools_used(self) -> list[str]:
@@ -99,6 +103,7 @@ class Turn:
             "stopped_because": self.stopped_because,
             "rewritten_for_completeness": self.rewritten_for_completeness,
             "delegated": self.delegated,
+            "scratchpad": self.scratchpad,
         }
 
 
@@ -200,6 +205,7 @@ def build_messages(
     continuing: bool = False,
     full_observations: int = 3,
     observation_chars: int = 3000,
+    scratchpad: str = "",
 ) -> list[Message]:
     """The full message list for one step of one turn.
 
@@ -251,6 +257,8 @@ def build_messages(
 
     messages.extend(conversation.as_messages())
     messages.append(user(snapshot_text))
+    if scratchpad.strip():
+        messages.append(user("Private scratchpad (working notes; do not repeat verbatim):\n" + scratchpad[:MAX_SCRATCHPAD_CHARS]))
 
     steps = list(steps)
     cutoff = max(0, len(steps) - max(1, full_observations))
