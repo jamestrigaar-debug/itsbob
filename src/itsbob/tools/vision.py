@@ -195,6 +195,11 @@ def _describe(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     api_key = str(env.get("GOOGLE_API_KEY", "")).strip()
     if not api_key:
         raise ToolError("GOOGLE_API_KEY is not set, so there is no vision model to ask")
+    policy = getattr(ctx, "policy", None)
+    if policy is not None:
+        host_reason = policy.check_url("https://generativelanguage.googleapis.com/")
+        if host_reason:
+            raise ToolError(host_reason)
 
     path = _resolve(params["path"], ctx)
     data, mime = prepare_image(path)

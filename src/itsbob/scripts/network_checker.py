@@ -281,12 +281,24 @@ def attempt_repair(state: NetworkState, *, timeout: float = 20.0) -> dict[str, A
 
 
 def _check(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    policy = getattr(ctx, "policy", None)
+    if policy is not None and policy.allowed_hosts:
+        return ToolResult.failure(
+            "check_network",
+            "check_network uses fixed public probes and is unavailable while allowed_hosts is set",
+        )
     state = check_network(timeout=float(params.get("timeout", 3.0)))
     return ToolResult(ok=state.online, output=state.render(),
                       error=None if state.online else state.diagnosis, data=state.as_dict())
 
 
 def _repair(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    policy = getattr(ctx, "policy", None)
+    if policy is not None and policy.allowed_hosts:
+        return ToolResult.failure(
+            "repair_network",
+            "repair_network uses fixed public probes and is unavailable while allowed_hosts is set",
+        )
     state = check_network()
     if state.online:
         return ToolResult(ok=True, output="already online — nothing to repair",

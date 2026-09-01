@@ -254,21 +254,13 @@ class Agent:
             decision=decision.as_dict(),
         )
 
-        verdict = self._feasible(message, tier, emit)
-        if not verdict.feasible:
-            turn.final = verdict.explain()
-            turn.tier = tier.value
-            turn.refused = verdict.reason
-            turn.duration_ms = (time.perf_counter() - started) * 1000
-            self.conversation.add(turn)
-            emit("final", text=turn.final, tier=tier.value, steps=0, refused=True)
-            return turn
-
         self._load_style()
         memories = self._recall(message)
         if memories:
             emit("memory", recalled=[h.as_dict() for h in memories])
 
+        # Delegation independently rejects tool-dependent requests. Trying it
+        # first avoids a redundant cheap feasibility call when it succeeds.
         handed_off = self._delegate(message, tier, memories, turn, emit)
         if handed_off is not None:
             turn.final = handed_off
@@ -278,6 +270,16 @@ class Agent:
             emit("final", text=handed_off, tier=tier.value, steps=0, delegated=True)
             self._remember(message, handed_off, turn, memories, emit)
             self._tidy_memory(emit)
+            return turn
+
+        verdict = self._feasible(message, tier, emit)
+        if not verdict.feasible:
+            turn.final = verdict.explain()
+            turn.tier = tier.value
+            turn.refused = verdict.reason
+            turn.duration_ms = (time.perf_counter() - started) * 1000
+            self.conversation.add(turn)
+            emit("final", text=turn.final, tier=tier.value, steps=0, refused=True)
             return turn
 
         deadline = started + self.max_seconds

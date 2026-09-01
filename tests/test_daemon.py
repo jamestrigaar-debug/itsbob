@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 
@@ -286,6 +287,9 @@ def _daemon(tmp_path, agent=None, store=None, **kwargs):
     toolbox = build_toolbox(workspace=tmp_path / "ws", mode=Mode.GUARDED, env={})
     agent = agent or _Agent(toolbox=toolbox)
     agent.toolbox = toolbox
+    # These tests exercise scheduling, not the host machine's current battery,
+    # disk or temperature state.  A real health gate would make them flaky.
+    kwargs.setdefault("health_gate", False)
     return Daemon(
         agent=agent,
         tasks=store or TaskStore(":memory:"),
@@ -338,6 +342,47 @@ def test_each_run_gets_a_fresh_conversation(tmp_path):
     first = daemon.agent.conversation
     daemon.run_task(task, now=now)
     assert daemon.agent.conversation is not first
+
+
+def test_a_timed_out_task_restores_its_budget_and_blocks_overlapping_turns(tmp_path):
+    """A deadline must not shrink later tasks or run two turns on one agent."""
+    class SlowAgent(_Agent):
+        def __init__(self):
+            super().__init__()
+            self.max_seconds = 100.0
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.seen_limits = []
+
+        def chat(self, message, **kwargs):
+            self.seen_limits.append(self.max_seconds)
+            self.started.set()
+            self.release.wait(2)
+            return Turn(message=message, final="done")
+
+    agent = SlowAgent()
+    daemon = _daemon(tmp_path, agent=agent, task_timeout=0.02, completion=False)
+    first = daemon.tasks.create("first", "one", "every 15m", notify=False)
+    second = daemon.tasks.create("second", "two", "every 15m", notify=False)
+
+    run = daemon.run_task(first)
+    assert run.status == "failed"
+    assert agent.started.is_set()
+    assert agent.seen_limits == [pytest.approx(0.018)]
+
+    deferred = daemon.run_task(second)
+    assert deferred.status == "skipped"
+    assert daemon.tasks.get(second.id).run_count == 0
+    assert daemon.tasks.get(second.id).fail_count == 0
+
+    agent.release.set()
+    for _ in range(100):
+        if not daemon._agent_lock.locked():
+            break
+        time.sleep(0.01)
+    assert not daemon._agent_lock.locked()
+    assert daemon.run_task(second).status == "ok"
+    assert agent.max_seconds == 100.0
 
 
 def test_run_now_ignores_the_schedule(tmp_path):

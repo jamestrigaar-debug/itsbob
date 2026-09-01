@@ -20,23 +20,12 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from pathlib import Path
 from typing import Any
 
+from .filelock import exclusive_file_lock
+
 __all__ = ["JsonlFile"]
-
-_LOCKS: dict[str, threading.Lock] = {}
-_LOCKS_GUARD = threading.Lock()
-
-
-def _lock_for(key: str) -> threading.Lock:
-    with _LOCKS_GUARD:
-        lock = _LOCKS.get(key)
-        if lock is None:
-            lock = _LOCKS[key] = threading.Lock()
-        return lock
-
 
 class JsonlFile:
     """One JSON object per line, rotated by size."""
@@ -51,12 +40,12 @@ class JsonlFile:
         self.path = Path(path).expanduser()
         self.max_bytes = max(0, max_bytes)
         self.keep = max(0, keep)
-        self._lock = _lock_for(str(self.path))
+        self._lock_path = self.path.with_name(f".{self.path.name}.lock")
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def append(self, entry: dict[str, Any]) -> None:
         line = json.dumps(entry, default=str)
-        with self._lock:
+        with exclusive_file_lock(self._lock_path):
             self._rotate_if_needed(len(line) + 2)
             with self.path.open("a", encoding="utf-8") as handle:
                 if self._needs_newline():
@@ -106,33 +95,35 @@ class JsonlFile:
     def read(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Entries oldest first, across rotations. Skips unparseable lines."""
         entries: list[dict[str, Any]] = []
-        for candidate in [*reversed([self._backup(i) for i in range(1, self.keep + 1)]), self.path]:
-            if not candidate.exists():
-                continue
-            try:
-                lines = candidate.read_text(encoding="utf-8").splitlines()
-            except OSError:
-                continue
-            for line in lines:
-                if not line.strip():
+        with exclusive_file_lock(self._lock_path):
+            for candidate in [*reversed([self._backup(i) for i in range(1, self.keep + 1)]), self.path]:
+                if not candidate.exists():
                     continue
                 try:
-                    entries.append(json.loads(line))
-                except (json.JSONDecodeError, TypeError):
-                    continue  # a torn line from a crash; skip it, keep the rest
+                    lines = candidate.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except (json.JSONDecodeError, TypeError):
+                        continue  # a torn line from a crash; skip it, keep the rest
         return entries[-limit:] if limit is not None else entries
 
     def size(self) -> int:
         total = 0
-        for candidate in [self.path, *(self._backup(i) for i in range(1, self.keep + 1))]:
-            try:
-                total += candidate.stat().st_size
-            except FileNotFoundError:
-                continue
+        with exclusive_file_lock(self._lock_path):
+            for candidate in [self.path, *(self._backup(i) for i in range(1, self.keep + 1))]:
+                try:
+                    total += candidate.stat().st_size
+                except FileNotFoundError:
+                    continue
         return total
 
     def clear(self) -> None:
-        with self._lock:
+        with exclusive_file_lock(self._lock_path):
             self.path.unlink(missing_ok=True)
             for index in range(1, self.keep + 2):
                 self._backup(index).unlink(missing_ok=True)

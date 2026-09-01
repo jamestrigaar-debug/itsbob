@@ -291,10 +291,22 @@ def _key(ctx: ToolContext, name: str) -> str:
     return str(env.get(name, "")).strip()
 
 
+def _allow_hosts(ctx: ToolContext, *urls: str) -> None:
+    """Check the fixed endpoints hidden behind the convenience tools."""
+    policy = getattr(ctx, "policy", None)
+    if policy is None:
+        return
+    for url in urls:
+        host_reason = policy.check_url(url)
+        if host_reason:
+            raise ToolError(host_reason)
+
+
 def _weather_tool(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     key = _key(ctx, "OPENWEATHER_API_KEY")
     if not key:
         raise ToolError("OPENWEATHER_API_KEY is not set — add it to .env and restart")
+    _allow_hosts(ctx, "https://api.openweathermap.org/")
     place = Place.from_env(ctx.env)
     weather = fetch_weather(
         key=key, place=place, forecast=bool(params.get("forecast", True))
@@ -303,10 +315,17 @@ def _weather_tool(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 def _news_tool(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    news_key = _key(ctx, "NEWSAPI_KEY")
+    gnews_key = _key(ctx, "GNEWS_API_KEY")
+    _allow_hosts(
+        ctx,
+        *(["https://newsapi.org/"] if news_key else []),
+        *(["https://gnews.io/"] if gnews_key else []),
+    )
     limit = max(1, min(25, int(params.get("limit", 10))))
     headlines, problems = fetch_news(
-        newsapi_key=_key(ctx, "NEWSAPI_KEY"),
-        gnews_key=_key(ctx, "GNEWS_API_KEY"),
+        newsapi_key=news_key,
+        gnews_key=gnews_key,
         query=str(params.get("topic") or "").strip() or GEOPOLITICS,
         limit=limit,
     )
@@ -333,6 +352,7 @@ def _briefing_tool(summarize: Any):
         key = _key(ctx, "OPENWEATHER_API_KEY")
         if key:
             try:
+                _allow_hosts(ctx, "https://api.openweathermap.org/")
                 weather = fetch_weather(key=key, place=Place.from_env(ctx.env))
                 payload["weather"] = weather.as_dict()
                 parts += ["", "## Weather", weather.render()]
@@ -341,12 +361,24 @@ def _briefing_tool(summarize: Any):
         else:
             problems.append("weather: OPENWEATHER_API_KEY is not set")
 
-        headlines, news_problems = fetch_news(
-            newsapi_key=_key(ctx, "NEWSAPI_KEY"),
-            gnews_key=_key(ctx, "GNEWS_API_KEY"),
+        news_key = _key(ctx, "NEWSAPI_KEY")
+        gnews_key = _key(ctx, "GNEWS_API_KEY")
+        try:
+            _allow_hosts(
+                ctx,
+                *(["https://newsapi.org/"] if news_key else []),
+                *(["https://gnews.io/"] if gnews_key else []),
+            )
+        except ToolError as exc:
+            news_problems = [str(exc)]
+            headlines = []
+        else:
+            headlines, news_problems = fetch_news(
+                newsapi_key=news_key,
+                gnews_key=gnews_key,
             query=str(params.get("topic") or "").strip() or GEOPOLITICS,
             limit=max(1, min(25, int(params.get("limit", 12)))),
-        )
+            )
         problems.extend(news_problems)
         if headlines:
             payload["headlines"] = [h.as_dict() for h in headlines]

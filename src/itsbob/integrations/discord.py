@@ -444,6 +444,9 @@ class DiscordBridge:
     #: True while another process holds the lease. Still polling the clock, not
     #: the channel, so a crash over there is picked up here.
     standby: bool = False
+    #: Replies that Discord did not accept yet.  Keeping the text lets the
+    #: bridge retry delivery without rerunning an expensive agent turn.
+    _pending_replies: dict[str, str] = field(default_factory=dict, repr=False)
     _thread: Any = field(default=None, repr=False)
     _stop: Any = field(default_factory=threading.Event, repr=False)
 
@@ -503,6 +506,7 @@ class DiscordBridge:
         if self.standby:
             self.standby = False
             self.last_error = None
+        self._retry_replies()
         rows = self.client.fetch(after=self.after)
         submitted = 0
         if rows:
@@ -539,14 +543,20 @@ class DiscordBridge:
                 self.mentions += 1
             submitted += 1
             message_id = message_id_check
-            if self.lease is not None:
-                self.lease.mark_answered(message_id)
-            self.submit(
-                content,
-                source="discord",
-                label=f"discord ({author}){' @you' if tagged else ''}: {content[:44]}",
-                on_done=lambda turn, error, mid=message_id: self._reply(turn, error, mid),
-            )
+            try:
+                accepted = self.submit(
+                    content,
+                    source="discord",
+                    label=f"discord ({author}){' @you' if tagged else ''}: {content[:44]}",
+                    on_done=lambda turn, error, mid=message_id: self._reply(turn, error, mid),
+                )
+            except Exception as exc:  # noqa: BLE001 - retain it for a later poll
+                accepted = False
+                self.last_error = f"could not queue Discord message: {type(exc).__name__}: {exc}"[:200]
+            if accepted is False:
+                # The cursor has advanced, so an explicit retry queue is what
+                # prevents a full inbox from silently dropping this message.
+                self._pending_replies[message_id] = "⚠️ The assistant is busy; please retry shortly."
         return submitted
 
     def mentions_us(self, row: Mapping[str, Any]) -> bool:
@@ -622,12 +632,31 @@ class DiscordBridge:
         if error:
             text = f"⚠️ That went wrong: {error}"
         if not text:
-            return
+            text = "⚠️ The assistant did not produce a response. Please try again."
         try:
             self.client.reply_to(message_id, text)
         except DiscordError as exc:
             self.errors += 1
             self.last_error = str(exc)
+            self._pending_replies[message_id] = text
+            return
+        if self.lease is not None:
+            # A message counts as answered only after Discord accepted its reply.
+            self.lease.mark_answered(message_id)
+        self._pending_replies.pop(message_id, None)
+
+    def _retry_replies(self) -> None:
+        """Retry a failed Discord post before accepting new questions."""
+        for message_id, text in list(self._pending_replies.items()):
+            try:
+                self.client.reply_to(message_id, text)
+            except DiscordError as exc:
+                self.errors += 1
+                self.last_error = str(exc)
+                continue
+            if self.lease is not None:
+                self.lease.mark_answered(message_id)
+            self._pending_replies.pop(message_id, None)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -697,6 +726,11 @@ def discord_tools(client: DiscordClient | None = None) -> list[Any]:
                 "Discord is not configured — set DISCORD_BOT_TOKEN and "
                 "DISCORD_CHANNEL_ID in .env and restart"
             )
+        policy = getattr(ctx, "policy", None)
+        if policy is not None:
+            host_reason = policy.check_url(API)
+            if host_reason:
+                raise ToolError(host_reason)
         message = str(params.get("message", "")).strip()
         if not message:
             raise ToolError("message is empty")

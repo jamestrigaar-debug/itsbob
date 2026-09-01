@@ -61,8 +61,8 @@ class Envelope:
     #: Prepended context. Short on purpose: a free chat interface has its own
     #: context limits and no prompt caching, so every word is paid twice.
     preamble: str = (
-        "Answer the question below thoroughly and concretely. Do not ask me "
-        "anything back — I cannot reply, this is a one-shot request."
+        "Answer the question below accurately and concisely. Think privately; "
+        "do not print chain-of-thought or ask anything back — this is one-shot."
     )
 
     def render(self, question: str, *, context: str = "") -> str:
@@ -75,8 +75,7 @@ class Envelope:
             "QUESTION:",
             question.strip(),
             "",
-            "Reply with your reasoning first if you want, then end your message "
-            "with exactly one fenced JSON block in this shape and nothing after it:",
+            "Return exactly one fenced JSON block in this shape and nothing after it:",
             "```json",
             "{",
             schema,

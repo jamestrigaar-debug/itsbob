@@ -348,6 +348,11 @@ def _call_api(catalog: ApiCatalog):
         url, headers = spec.build(
             path, params=params.get("params") or {}, env=ctx.env or os.environ
         )
+        policy = getattr(ctx, "policy", None)
+        if policy is not None:
+            host_reason = policy.check_url(url)
+            if host_reason:
+                raise ToolError(host_reason)
         started = time.perf_counter()
         status, payload, _ = _request(
             url,

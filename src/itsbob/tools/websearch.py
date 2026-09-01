@@ -135,7 +135,9 @@ def _text(markup: str) -> str:
     return " ".join(html.unescape(_TAG_RE.sub("", markup)).split())
 
 
-def search(query: str, *, limit: int = 6) -> tuple[list[SearchResult], str]:
+def search(
+    query: str, *, limit: int = 6, command_backends: bool = True
+) -> tuple[list[SearchResult], str]:
     """Search the web. Returns ``(results, which backend answered)``."""
     query = query.strip()
     if not query:
@@ -143,16 +145,17 @@ def search(query: str, *, limit: int = 6) -> tuple[list[SearchResult], str]:
     limit = max(1, min(20, limit))
 
     problems: list[str] = []
-    for binary in ("ddgr", "googler"):
-        if not shutil.which(binary):
-            continue
-        try:
-            results = _from_cli(binary, query, limit)
-        except ToolError as exc:
-            problems.append(str(exc))
-            continue
-        if results:
-            return results, binary
+    if command_backends:
+        for binary in ("ddgr", "googler"):
+            if not shutil.which(binary):
+                continue
+            try:
+                results = _from_cli(binary, query, limit)
+            except ToolError as exc:
+                problems.append(str(exc))
+                continue
+            if results:
+                return results, binary
     try:
         results = _from_html(query, limit)
     except ToolError as exc:
@@ -164,8 +167,18 @@ def search(query: str, *, limit: int = 6) -> tuple[list[SearchResult], str]:
 
 
 def _run(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    # Command-line clients can be configured to use arbitrary search engines.
+    # Under an explicit allow-list use only the built-in HTML endpoint, whose
+    # host we can verify before the request leaves the machine.
+    policy = getattr(ctx, "policy", None)
+    restricted = bool(policy and policy.allowed_hosts)
+    if restricted:
+        host_reason = policy.check_url("https://html.duckduckgo.com/html/")
+        if host_reason:
+            raise ToolError(host_reason)
     results, backend = search(
-        str(params.get("query", "")), limit=int(params.get("limit", 6))
+        str(params.get("query", "")), limit=int(params.get("limit", 6)),
+        command_backends=not restricted,
     )
     return ToolResult(
         ok=True,

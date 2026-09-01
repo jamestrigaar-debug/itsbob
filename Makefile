@@ -20,6 +20,9 @@ install: $(PY)   ## Install itsbob and dev dependencies
 test: install    ## Run the test suite (offline; no network)
 	$(PY) -m pytest -q
 
+lint: install    ## Run static correctness checks
+	$(VENV)/bin/ruff check src tests
+
 check: test      ## Everything CI would run
 	$(PY) -m itsbob doctor
 

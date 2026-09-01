@@ -314,7 +314,7 @@ def test_the_standby_bridge_takes_over_when_the_holder_dies(discord, tmp_path):
     """Standing by must not mean Discord goes quiet if the holder crashes."""
     served, browsed = [], []
     daemon = DiscordBridge.from_env(
-        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+        lambda t, **k: served.append((t, k)), home=tmp_path, role="daemon")
     gui = DiscordBridge.from_env(
         lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
     daemon.skip_backlog = gui.skip_backlog = False
@@ -323,7 +323,12 @@ def test_the_standby_bridge_takes_over_when_the_holder_dies(discord, tmp_path):
     discord.human("first question", mentions_bot=True)
     daemon.poll_once()
     gui.poll_once()
-    assert served == ["first question"] and browsed == []
+    assert served[0][0] == "first question" and browsed == []
+
+    class Turn:
+        final = "First answer."
+
+    served[0][1]["on_done"](Turn(), None)
 
     time.sleep(0.3)  # the daemon stops renewing
     discord.human("second question", mentions_bot=True)
@@ -335,7 +340,7 @@ def test_the_standby_bridge_takes_over_when_the_holder_dies(discord, tmp_path):
 def test_a_clean_stop_hands_the_channel_over_at_once(discord, tmp_path):
     served, browsed = [], []
     daemon = DiscordBridge.from_env(
-        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+        lambda t, **k: served.append((t, k)), home=tmp_path, role="daemon")
     gui = DiscordBridge.from_env(
         lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
     daemon.skip_backlog = gui.skip_backlog = False
@@ -344,6 +349,11 @@ def test_a_clean_stop_hands_the_channel_over_at_once(discord, tmp_path):
     daemon.poll_once()
     gui.poll_once()
     assert gui.standby
+
+    class Turn:
+        final = "First answer."
+
+    served[0][1]["on_done"](Turn(), None)
 
     daemon.stop()  # releases rather than waiting ninety seconds to expire
     discord.human("two", mentions_bot=True)
@@ -355,14 +365,19 @@ def test_a_handover_does_not_re_answer_what_was_already_answered(discord, tmp_pa
     """The one window where both could act, and the one thing it must not do."""
     served, browsed = [], []
     daemon = DiscordBridge.from_env(
-        lambda t, **k: served.append(t), home=tmp_path, role="daemon")
+        lambda t, **k: served.append((t, k)), home=tmp_path, role="daemon")
     gui = DiscordBridge.from_env(
         lambda t, **k: browsed.append(t), home=tmp_path, role="browser")
     daemon.skip_backlog = gui.skip_backlog = False
 
     discord.human("only answer me once", mentions_bot=True)
     daemon.poll_once()
-    assert served == ["only answer me once"]
+    assert served[0][0] == "only answer me once"
+
+    class Turn:
+        final = "Once."
+
+    served[0][1]["on_done"](Turn(), None)
 
     # The browser takes over with its cursor still behind, so it sees the same
     # message again. The answered-id trail is what stops it running a turn.
@@ -530,6 +545,11 @@ def test_standby_follows_the_holder_instead_of_the_clock(discord, tmp_path):
     assert standby.poll_once() == 0         # and the other stands by
     assert standby.standby is True
 
+    class Turn:
+        final = "First answer."
+
+    submitted_a[0][1]["on_done"](Turn(), None)
+
     # Three more arrive. The holder dies before it polls again, so it never
     # sees them — which is exactly when the handover has to be lossless.
     discord.human("second question")
@@ -556,6 +576,11 @@ def test_a_takeover_does_not_re_answer_what_the_holder_already_did(discord, tmp_
     discord.human("answered by the first one")
     holder.poll_once()
     standby.poll_once()
+
+    class Turn:
+        final = "Done."
+
+    submitted_a[0][1]["on_done"](Turn(), None)
     holder.lease.release()
 
     assert standby.poll_once() == 0

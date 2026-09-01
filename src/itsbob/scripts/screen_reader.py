@@ -110,6 +110,11 @@ def _api_key(ctx: ToolContext) -> str:
 def _ask(path: Path, question: str, ctx: ToolContext) -> tuple[str, str, int]:
     """Send one image to the vision model. Returns (answer, model, bytes sent)."""
     key = _api_key(ctx)
+    policy = getattr(ctx, "policy", None)
+    if policy is not None:
+        host_reason = policy.check_url("https://generativelanguage.googleapis.com/")
+        if host_reason:
+            raise ToolError(host_reason)
     data, mime = prepare_image(path)
     env = ctx.env if ctx.env is not None else os.environ
     answer, model = describe_image(

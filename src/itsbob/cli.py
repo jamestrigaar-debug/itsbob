@@ -281,9 +281,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         mode=getattr(args, "mode", None),
         console=False,
         on_event=show,
+        autonomous=getattr(args, "autonomous", False),
     )
     state = daemon.describe()
-    print(f"itsbob daemon — {state['tasks']} task(s), {state['policy_mode']} mode")
+    operation = "autonomous" if state.get("autonomous") else "scheduled"
+    print(f"itsbob daemon — {operation}, {state['tasks']} task(s), {state['policy_mode']} mode")
     print(f"  workspace: {state['workspace']}")
     if not state["can_run_commands"]:
         print(
@@ -297,7 +299,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     print("  ctrl-c to stop\n")
 
     if args.once:
-        daemon.tick()
+        runs = daemon.tick()
+        if not runs and getattr(args, "autonomous", False):
+            daemon.run_autonomous()
         return 0
     daemon.run_forever()
     return 0
@@ -1130,6 +1134,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # serve
     serve = with_mode(add("serve", "Run the always-on daemon."))
+    serve.add_argument("--autonomous", action="store_true", help="enable weighted self-created itsbobtasks")
     serve.add_argument("--once", action="store_true", help="run whatever is due, then exit")
     serve.set_defaults(handler=_cmd_serve)
 

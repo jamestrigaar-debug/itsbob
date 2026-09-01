@@ -135,8 +135,17 @@ def _ask(params: dict[str, Any], ctx: ToolContext) -> ToolResult:
     question = str(params.get("question", "")).strip()
     if not question:
         raise ToolError("question is empty")
+    config = DeepSeekConfig.from_env(env)
+    policy = getattr(ctx, "policy", None)
+    if policy is not None:
+        host_reason = policy.check_url(config.url)
+        if host_reason:
+            raise ToolError(host_reason)
 
     formatter = ctx.extras.get("shape_json") if getattr(ctx, "extras", None) else None
+    # Keep the transport's small public call shape: it is injectable in tests
+    # and by local integrations.  ``config`` above is only the preflight host
+    # check; ``ask_deepseek`` resolves the identical configuration itself.
     result: Delegation = build_delegate(formatter, env).ask(
         question, context=str(params.get("context") or "")
     )

@@ -34,6 +34,9 @@ class _NeverNotify:
 def _runner(agent, store, **kwargs):
     session = Session(lambda _confirm: agent)
     session.emit = lambda *a, **k: None
+    # The scheduling tests must not depend on the audit machine's battery,
+    # temperature or free disk. Health-gate behaviour is covered explicitly.
+    kwargs.setdefault("health_gate", False)
     return session, Autonomous(session, store, gate=_NeverNotify(), poll_seconds=0.05, **kwargs)
 
 
@@ -97,7 +100,7 @@ def test_work_is_deferred_not_failed_when_the_machine_is_unfit(monkeypatch):
 
     store = TaskStore(":memory:")
     agent = _Agent()
-    session, runner = _runner(agent, store, defer_seconds=60)
+    session, runner = _runner(agent, store, defer_seconds=60, health_gate=True)
     monkeypatch.setattr(
         monitor, "read_system",
         lambda *a, **k: type("S", (), {"concerns": ["on battery at 9%"]})(),
@@ -120,7 +123,7 @@ def test_a_task_can_opt_out_of_the_health_gate(monkeypatch):
 
     store = TaskStore(":memory:")
     agent = _Agent()
-    session, runner = _runner(agent, store)
+    session, runner = _runner(agent, store, health_gate=True)
     monkeypatch.setattr(
         monitor, "read_system",
         lambda *a, **k: type("S", (), {"concerns": ["overheating"]})(),

@@ -8,6 +8,7 @@ the test name alone.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 
@@ -28,6 +29,14 @@ from itsbob.tools.base import Risk
 #: outcome; the bad one is the push that quietly succeeds.
 EXAMPLE_GOOGLE_KEY = "AQ.ExampleNotARealKey00000000000000000000000000000000"
 EXAMPLE_AIZA_KEY = "AIzaSyExampleNotARealKey0000000000000"
+
+
+def _append_jsonl_in_process(path: str, started, worker: int) -> None:
+    """Top-level so it is usable by Windows' spawn start method too."""
+    started.wait(10)
+    log = JsonlFile(path, max_bytes=1_000_000)
+    for number in range(40):
+        log.append({"worker": worker, "number": number})
 
 
 # -- 1. concurrent writes silently lost rows -------------------------------
@@ -77,6 +86,29 @@ def test_two_handles_on_one_file_share_a_lock(tmp_path):
         t.join()
     assert errors == []
     assert len(a) == 240
+
+
+def test_jsonl_rotation_lock_is_shared_by_separate_processes(tmp_path):
+    """The GUI and daemon are separate processes, not merely threads."""
+    context = multiprocessing.get_context("spawn")
+    started = context.Event()
+    path = str(tmp_path / "shared.jsonl")
+    workers = [
+        context.Process(target=_append_jsonl_in_process, args=(path, started, worker))
+        for worker in range(4)
+    ]
+    for worker in workers:
+        worker.start()
+    started.set()
+    for worker in workers:
+        worker.join(15)
+        assert worker.exitcode == 0
+
+    rows = JsonlFile(path).read()
+    assert len(rows) == 160
+    assert {(row["worker"], row["number"]) for row in rows} == {
+        (worker, number) for worker in range(4) for number in range(40)
+    }
 
 
 def test_databases_use_wal_so_readers_do_not_block(tmp_path):
@@ -331,6 +363,7 @@ def _daemon(tmp_path, agent, **kwargs):
             return None
 
     agent.toolbox = build_toolbox(workspace=tmp_path / "ws", mode=Mode.GUARDED, env={})
+    kwargs.setdefault("health_gate", False)
     return Daemon(
         agent=agent,
         tasks=TaskStore(":memory:"),
@@ -360,7 +393,7 @@ class _SlowAgent:
         return Turn(message=message, final="done")
 
 
-def test_a_hanging_task_is_abandoned_not_waited_on(tmp_path):
+def test_a_hanging_task_is_recorded_without_waiting_for_it(tmp_path):
     daemon = _daemon(tmp_path, _SlowAgent(), task_timeout=1.0)
     now = time.time()
     daemon.tasks.create("hang", "please hang forever", "every 15m", now=now)
@@ -368,18 +401,19 @@ def test_a_hanging_task_is_abandoned_not_waited_on(tmp_path):
     runs = daemon.tick(now=now)
     assert time.perf_counter() - started < 10
     assert runs[0].status == "failed"
-    assert "abandoned" in runs[0].output
+    assert "still running" in runs[0].output
     assert daemon.describe()["abandoned_runs"] == 1
 
 
-def test_a_hanging_task_does_not_poison_the_next_one(tmp_path):
-    """A shared single worker made one wedged task time out every task after it."""
+def test_a_hanging_task_defers_later_turns_instead_of_overlapping_them(tmp_path):
+    """One mutable agent cannot safely service a second turn while the first runs."""
     daemon = _daemon(tmp_path, _SlowAgent(), task_timeout=1.0)
     now = time.time()
     daemon.tasks.create("hang", "please hang forever", "every 15m", now=now)
     daemon.tasks.create("fine", "quick", "every 15m", now=now)
     daemon.tasks.create("also", "quick too", "every 15m", now=now)
-    assert [r.status for r in daemon.tick(now=now)] == ["failed", "ok", "ok"]
+    assert [r.status for r in daemon.tick(now=now)] == ["failed", "skipped", "skipped"]
+    assert daemon.agent.seen == ["please hang forever"]
 
 
 def test_an_agent_without_max_seconds_still_runs(tmp_path):

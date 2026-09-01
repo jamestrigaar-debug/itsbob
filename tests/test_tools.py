@@ -267,6 +267,29 @@ def test_a_caller_cannot_extend_the_policy_timeout(box):
     assert effective_timeout(ctx, None) == box.policy.timeout_seconds
 
 
+def test_named_api_obeys_the_allowed_host_policy(tmp_path, monkeypatch):
+    from itsbob.tools import http as http_module
+
+    catalog = ApiCatalog({
+        "blocked": ApiSpec(name="blocked", base_url="https://blocked.test", auth="none")
+    })
+    policy = Policy(
+        mode=Mode.TRUSTED,
+        workspace=tmp_path / "ws",
+        allowed_hosts=frozenset({"allowed.test"}),
+    )
+    box = build_toolbox(workspace=policy.workspace, policy=policy, catalog=catalog, env={})
+    monkeypatch.setattr(
+        http_module,
+        "_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+
+    result = box.call("call_api", api="blocked", path="items")
+    assert result.ok is False
+    assert "allowed_hosts" in result.error
+
+
 def test_run_python_captures_stdout(box):
     assert "6" in box.call("run_python", code="print(2 * 3)").output
 

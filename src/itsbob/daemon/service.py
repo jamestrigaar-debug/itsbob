@@ -19,14 +19,12 @@ recorded against that task and the loop continues. Five consecutive failures
 disable the task, because at that point it is broken rather than unlucky and
 running it hourly forever helps nobody.
 
-**Nor can a slow one.** Tasks run on a worker thread with a hard wall-clock
-deadline. Without it a single task that wedges — a tool waiting on a socket
-that never answers — stalls every other schedule indefinitely, and the symptom
-("my 8am briefing stopped arriving") points nowhere near the cause. Python
-cannot kill a thread, so an overrunning task is abandoned rather than stopped:
-it is recorded as failed, the loop moves on, and the orphan finishes into a
-locked database where it can do no damage. That is a real cost, and it is
-still much better than blocking the daemon.
+**Nor can a slow one.** Tasks run with a wall-clock deadline. Python cannot
+safely kill a running thread, so an overrun is recorded promptly and allowed to
+finish, but it retains the daemon's single-agent lock until it does. That means
+later work is deferred rather than racing the same conversation, budget, and
+toolbox state. A wedged task can therefore delay later work, but it cannot make
+overlapping turns corrupt each other or perform conflicting actions.
 
 **Ctrl-C and SIGTERM stop it cleanly.** A service manager stopping the daemon
 mid-task would otherwise lose the run record entirely.
@@ -64,12 +62,17 @@ from ..router.tiers import Tier
 from .completion import CompletionCheck, next_grade
 from .notify import Notification, NoticeGate, default_sink
 from .tasks import Task, TaskRun, TaskStore
+from .autonomous import choose as choose_autonomous
 
-__all__ = ["Daemon", "DaemonEvent", "TaskTimeout"]
+__all__ = ["Daemon", "DaemonEvent", "TaskTimeout", "TaskBusy"]
 
 
 class TaskTimeout(TimeoutError):
-    """A task ran past the daemon's per-task deadline and was abandoned."""
+    """A task ran past the daemon's deadline and is still draining."""
+
+
+class TaskBusy(RuntimeError):
+    """Another daemon turn still owns the shared agent state."""
 
 
 @dataclass
@@ -105,6 +108,7 @@ class Daemon:
         discord: Any = None,
         initiative: Any = None,
         completion: Any = None,
+        autonomous: bool = False,
     ) -> None:
         self.agent = agent
         self.tasks = tasks
@@ -143,7 +147,13 @@ class Daemon:
         self.completion = (
             CompletionCheck(brain=agent.brain) if completion is None else (completion or None)
         )
+        self.autonomous = autonomous
+        self._autonomous_last = 0.0
+        self._autonomous_quiet_since: float | None = None
         self._inbox: queue.Queue = queue.Queue(maxsize=50)
+        #: Agent, conversation and budgets are mutable.  There must never be
+        #: two turns mutating them, including after a worker passes its deadline.
+        self._agent_lock = threading.Lock()
         self._stop = threading.Event()
         self._abandoned = 0
         self._defers: dict[str, int] = {}
@@ -204,6 +214,9 @@ class Daemon:
                 self._beat()
                 ran = self.tick()
                 self.drain_inbox()
+                if not ran and self.autonomous:
+                    auto_run = self.run_autonomous()
+                    ran = [auto_run] if auto_run else []
                 if not ran:
                     self.maybe_speak()
                 if self._stop.is_set():
@@ -273,6 +286,10 @@ class Daemon:
 
     def drain_inbox(self) -> int:
         """Answer everything queued from outside. Returns how many ran."""
+        # Preserve queued messages for when a timed-out task finally finishes;
+        # replying "busy" is less useful than replying properly a moment later.
+        if self._agent_lock.locked():
+            return 0
         answered = 0
         while not self._stop.is_set():
             try:
@@ -343,6 +360,46 @@ class Daemon:
             runs.append(self.run_task(task, now=now))
         return runs
 
+    def run_autonomous(self, now: float | None = None) -> TaskRun | None:
+        """Create and immediately run one weighted, one-shot itsbobtask."""
+        if not self.autonomous or self.discord is None or self._agent_lock.locked():
+            return None
+        now = time.time() if now is None else now
+        if now - self._autonomous_last < 3600.0:
+            return None
+        if self._autonomous_quiet_since is None:
+            self._autonomous_quiet_since = now
+        hours = max(0.0, (now - self._autonomous_quiet_since) / 3600.0)
+        definition = choose_autonomous(pressure=1.0 + hours)
+        task = Task(
+            name=f"itsbobtask: {definition.name}", prompt=definition.prompt,
+            schedule="every 52 weeks", next_run=now, max_runs=1, notify=False,
+            grade=definition.tier.value, attempts=1,
+            metadata={"itsbobtask": True, "autonomous": True, "hidden": True, "tier": definition.tier.value},
+        )
+        self.tasks.add(task)
+        self._autonomous_last = now
+        self._autonomous_quiet_since = now
+        self._emit("autonomous_created", task=task.name, tier=definition.tier.value)
+        run = self.run_task(task, now=now)
+        if run.status != "skipped":
+            self._deliver(Notification(
+                title=f"itsbobtask: {definition.name}",
+                body=f"@everyone\n{run.output or 'Autonomous task completed without a report.'}",
+                task=task.name, source="autonomous", urgency="normal",
+            ))
+            if self.agent.memory is not None:
+                try:
+                    self.agent.memory.add(MemoryRecord(
+                        content=f"Completed autonomous itsbobtask '{definition.name}': {run.output[:500]}",
+                        kind=MemoryKind.OBSERVATION, importance=0.45,
+                        tags=("itsbobtask", "autonomous"),
+                        metadata={"source": "autonomous", "task_id": task.id},
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+        return run
+
     def _health_hold(self, task: Task) -> str | None:
         """Why this task should wait, or None to go ahead."""
         if not self.health_gate or task.metadata.get("ignore_health"):
@@ -398,13 +455,26 @@ class Daemon:
             tools = tuple(turn.tools_used)
             if turn.error:
                 status = "failed"
+        except TaskBusy as exc:
+            # A task that ran past its deadline still owns the agent.  Do not
+            # record a failure (or advance its schedule): retry on the next
+            # daemon tick once the current turn has released the lock.
+            output = str(exc)
+            self._emit("deferred", task=task.name, reason=output)
+            return TaskRun(
+                task_id=task.id,
+                started_at=now,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                status="skipped",
+                output=output,
+            )
         except TaskTimeout:
             status = "failed"
             self._abandoned += 1
             output = (
-                f"exceeded the {self.task_timeout:g}s task limit and was abandoned. "
-                "It may still be running in the background; the daemon moved on so "
-                "other schedules are not held up."
+                f"exceeded the {self.task_timeout:g}s task limit and is still running. "
+                "Other turns are deferred until it exits, so the shared agent state "
+                "cannot overlap."
             )
             self._emit("error", task=task.name, error=output)
         except Exception as exc:  # noqa: BLE001 - one task must not stop the loop
@@ -517,31 +587,46 @@ class Daemon:
 
     def _run_bounded(self, task: Task, *, prompt: str | None = None,
                      min_tier: Any = None, thorough: bool = False):
-        """Run one task with a hard deadline, on its own thread.
+        """Run one task with a deadline while reserving the shared agent.
 
-        A fresh thread per run, not a shared worker pool. With a pool of one, a
-        task that wedges holds the only worker and every *subsequent* task times
-        out behind it — which turns one broken task into a broken daemon, the
-        exact failure the deadline exists to prevent. A pool sized above one
-        just moves the ceiling. Daemon threads, so an abandoned run never keeps
-        the process alive at exit.
+        A deadline lets the scheduler persist the failure and remain responsive.
+        It cannot terminate arbitrary Python safely, so the worker keeps the
+        agent lock until it exits.  Later tasks are deferred instead of starting
+        an overlapping turn against the same mutable agent instance.
         """
         prompt = task.prompt if prompt is None else prompt
+        if not self._agent_lock.acquire(blocking=False):
+            raise TaskBusy("another task is still finishing; retrying shortly")
         if not self.task_timeout:
-            return self._run_prompt(prompt, min_tier=min_tier, thorough=thorough)
+            try:
+                return self._run_prompt(
+                    prompt, min_tier=min_tier, thorough=thorough, _reserved=True
+                )
+            finally:
+                self._agent_lock.release()
 
         box: dict[str, Any] = {}
 
         def target() -> None:
             try:
-                box["value"] = self._run_prompt(prompt, min_tier=min_tier, thorough=thorough)
+                box["value"] = self._run_prompt(
+                    prompt, min_tier=min_tier, thorough=thorough, _reserved=True
+                )
             except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
                 box["error"] = exc
+            finally:
+                self._agent_lock.release()
 
         thread = threading.Thread(
             target=target, name=f"itsbob-task-{task.id}", daemon=True
         )
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            # A thread-start failure is rare, but leaving the reservation held
+            # would make every later task look permanently busy.
+            self._agent_lock.release()
+            raise
         thread.join(self.task_timeout)
         if thread.is_alive():
             raise TaskTimeout(f"task {task.name!r} exceeded {self.task_timeout:g}s")
@@ -549,24 +634,39 @@ class Daemon:
             raise box["error"]
         return box["value"]
 
-    def _run_prompt(self, prompt: str, *, min_tier: Any = None, thorough: bool = False):
-        # A fresh conversation per run: a nightly task should not inherit
-        # yesterday's context. Long-term memory is shared, so it still can.
-        self.agent.conversation = Conversation()
-        # The agent's own budget sits just inside the daemon's, so an overrun
-        # normally ends as a proper turn ("I ran out of time, here is what I
-        # found") rather than as an abandoned thread.
-        # getattr, because the agent is injectable and a stand-in need not
-        # carry every field the real one does.
-        current = getattr(self.agent, "max_seconds", None)
-        if self.task_timeout and isinstance(current, (int, float)):
-            self.agent.max_seconds = min(current, self.task_timeout * 0.9)
-        # kwargs, because the agent is injectable and a stand-in in the tests
-        # need not accept the newer arguments.
+    def _run_prompt(
+        self, prompt: str, *, min_tier: Any = None, thorough: bool = False, _reserved: bool = False
+    ):
+        acquired = False
+        if not _reserved:
+            if not self._agent_lock.acquire(blocking=False):
+                raise TaskBusy("another task is still finishing; retrying shortly")
+            acquired = True
+        current = None
         try:
-            return self.agent.chat(prompt, min_tier=min_tier, thorough=thorough)
-        except TypeError:
-            return self.agent.chat(prompt)
+            # A fresh conversation per run: a nightly task should not inherit
+            # yesterday's context. Long-term memory is shared, so it still can.
+            self.agent.conversation = Conversation()
+            # The agent's own budget sits just inside the daemon's, so an overrun
+            # normally ends as a proper turn ("I ran out of time, here is what I
+            # found") rather than as an abandoned thread.  ``getattr`` keeps
+            # injected test and extension agents compatible.
+            current = getattr(self.agent, "max_seconds", None)
+            if self.task_timeout and isinstance(current, (int, float)):
+                self.agent.max_seconds = min(current, self.task_timeout * 0.9)
+            # kwargs, because the agent is injectable and a stand-in in the tests
+            # need not accept the newer arguments.
+            try:
+                return self.agent.chat(prompt, min_tier=min_tier, thorough=thorough)
+            except TypeError:
+                return self.agent.chat(prompt)
+        finally:
+            # The bound is per task; keeping it after the turn silently makes
+            # every later task 10% shorter than the last one.
+            if isinstance(current, (int, float)):
+                self.agent.max_seconds = current
+            if acquired:
+                self._agent_lock.release()
 
     def _deliver(self, notification: Notification) -> bool:
         try:
@@ -618,6 +718,7 @@ class Daemon:
             "task_timeout_s": self.task_timeout,
             "health_gate": self.health_gate,
             "initiative": self.initiative.status() if self.initiative else {"enabled": False},
+            "autonomous": self.autonomous,
             "deferred_now": {name: count for name, count in self._defers.items() if count},
             "policy_mode": policy.mode.value,
             "can_run_commands": (
@@ -635,6 +736,7 @@ def build_daemon(
     sink: Any = None,
     console: bool = True,
     on_event: EventFn | None = None,
+    autonomous: bool = False,
     **agent_kwargs: Any,
 ) -> Daemon:
     """Assemble a daemon over the standard home directory."""
@@ -649,6 +751,7 @@ def build_daemon(
         sink=sink if sink is not None else _default_sink_with_discord(root, console=console),
         home=root,
         on_event=on_event,
+        autonomous=autonomous,
     )
     daemon.discord = _build_bridge(daemon)
     return daemon

@@ -168,13 +168,13 @@ def available(env: Any = None) -> dict[str, Any]:
 
     browser = chromium(env)
     playwright_ok = package_ok and bool(browser["path"])
-    if not package_ok:
-        playwright_why = "not installed — pip install -e '.[browser]'"
-    elif browser["source"] == "configured-missing":
+    if browser["source"] == "configured-missing":
         playwright_why = (
             f"ITSBOB_CHROMIUM points at {env.get('ITSBOB_CHROMIUM', '').strip()!r}, "
             "which is not there"
         )
+    elif not package_ok:
+        playwright_why = "not installed — pip install -e '.[browser]'"
     elif not browser["path"]:
         playwright_why = (
             "installed, but there is no chromium for it to drive — run "

@@ -22,6 +22,7 @@ from .notify import (
 from .schedule import Schedule, ScheduleError, parse_schedule
 from .service import Daemon, DaemonEvent, build_daemon, daemon_status
 from .tasks import Task, TaskRun, TaskStore
+from .autonomous import AUTONOMOUS_TASKS, AutonomousTask
 
 __all__ = [
     "daemon_status",
@@ -38,6 +39,10 @@ __all__ = [
     "Task",
     "TaskRun",
     "TaskStore",
+    "AutonomousTask",
+    "AUTONOMOUS_TASKS",
+    "AutonomousTask",
+    "AUTONOMOUS_TASKS",
     "WebhookSink",
     "build_daemon",
     "default_sink",

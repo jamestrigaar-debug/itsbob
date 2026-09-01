@@ -186,8 +186,8 @@ class Policy:
     #: else — every API key included — is withheld, so a generated script
     #: cannot read a credential it was never handed.
     env_allowlist: frozenset[str] = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "USER", "SHELL", "TMPDIR"})
-    #: Hosts an http_request may reach. Empty means "any" — narrow it if the
-    #: agent only ever needs the APIs you configured.
+    #: Hosts built-in network tools may reach. Empty means "any" — narrow it
+    #: if the agent only ever needs the APIs you configured.
     allowed_hosts: frozenset[str] = frozenset()
 
     def gate_for(self, risk: Risk) -> _Gate:
@@ -261,12 +261,24 @@ class Policy:
         url = str(params.get("url", ""))
         if not url:
             return None
+        return self.check_url(url)
+
+    def check_url(self, url: str) -> str | None:
+        """Return a refusal when ``url`` falls outside the configured egress list.
+
+        Network tools that construct their URL from a named API call use this
+        after resolving it.  Keeping the check here makes the policy one source
+        of truth instead of teaching every tool its own host-matching rules.
+        """
+        if not self.allowed_hosts:
+            return None
         from urllib.parse import urlparse
 
         host = (urlparse(url).hostname or "").lower()
-        if host in self.allowed_hosts:
+        allowed_hosts = {str(value).lower().strip(".") for value in self.allowed_hosts}
+        if host in allowed_hosts:
             return None
-        if any(host.endswith(f".{allowed}") for allowed in self.allowed_hosts):
+        if any(host.endswith(f".{allowed}") for allowed in allowed_hosts):
             return None
         return f"host {host!r} is not in the allowed_hosts list"
 

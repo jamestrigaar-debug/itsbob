@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..filelock import exclusive_file_lock
+
 __all__ = ["DiscordLease"]
 
 #: How many answered ids to carry. Enough to cover a handover and a restart,
@@ -58,6 +60,10 @@ class DiscordLease:
     def __post_init__(self) -> None:
         self.path = Path(self.path).expanduser()
 
+    @property
+    def _lock_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.lock")
+
     # -- the file ----------------------------------------------------------
 
     def _read(self) -> dict[str, Any]:
@@ -73,7 +79,7 @@ class DiscordLease:
     def _write(self, data: dict[str, Any]) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
+            tmp = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
             tmp.replace(self.path)
         except (OSError, ValueError):
@@ -92,51 +98,73 @@ class DiscordLease:
     def hold(self, *, now: float | None = None) -> bool:
         """Take or renew the claim. ``False`` means someone else has it."""
         now = time.time() if now is None else now
-        current = self._read()
-        mine = current.get("owner") == self.owner
+        try:
+            with exclusive_file_lock(self._lock_path):
+                current = self._read()
+                mine = current.get("owner") == self.owner
 
-        if not mine and self._fresh(current, self.ttl, now):
-            self.held_by = f"{current.get('role', 'another process')} (pid {current.get('pid')})"
-            return False
+                if not mine and self._fresh(current, self.ttl, now):
+                    self.held_by = (
+                        f"{current.get('role', 'another process')} (pid {current.get('pid')})"
+                    )
+                    return False
 
-        self.held_by = None
-        if not self._write(
-            {
-                **current,
-                "owner": self.owner,
-                "role": self.role,
-                "pid": os.getpid(),
-                "at": now,
-            }
-        ):
-            # Unwritable: behave as the holder rather than silently going quiet.
+                self.held_by = None
+                if not self._write(
+                    {
+                        **current,
+                        "owner": self.owner,
+                        "role": self.role,
+                        "pid": os.getpid(),
+                        "at": now,
+                    }
+                ):
+                    # Unwritable: behave as the holder rather than silently going quiet.
+                    return True
+                return True
+        except (OSError, ValueError):
+            # A home directory that cannot be written is a reason to carry on
+            # polling, not to stop: one process answering twice is a smaller
+            # failure than none answering at all.
+            self.held_by = None
             return True
-        return True
 
     def release(self) -> None:
         """Give it up on a clean stop, so a handover is immediate."""
-        current = self._read()
-        if current.get("owner") != self.owner:
+        try:
+            with exclusive_file_lock(self._lock_path):
+                current = self._read()
+                if current.get("owner") != self.owner:
+                    return
+                # The answered ids outlive the claim: whoever picks it up next needs
+                # them, or a restart re-answers whatever was in flight.
+                current.pop("owner", None)
+                current["at"] = 0.0
+                self._write(current)
+        except (OSError, ValueError):
             return
-        # The answered ids outlive the claim: whoever picks it up next needs
-        # them, or a restart re-answers whatever was in flight.
-        current.pop("owner", None)
-        current["at"] = 0.0
-        self._write(current)
 
     # -- not answering the same thing twice --------------------------------
 
     def already_answered(self, message_id: str) -> bool:
-        return str(message_id) in set(self._read().get("answered") or [])
+        try:
+            with exclusive_file_lock(self._lock_path):
+                return str(message_id) in set(self._read().get("answered") or [])
+        except (OSError, ValueError):
+            return False
 
     def mark_answered(self, message_id: str) -> None:
-        current = self._read()
-        answered = [str(x) for x in (current.get("answered") or [])]
-        if str(message_id) in answered:
+        try:
+            with exclusive_file_lock(self._lock_path):
+                current = self._read()
+                answered = [str(x) for x in (current.get("answered") or [])]
+                if str(message_id) in answered:
+                    return
+                answered.append(str(message_id))
+                current["answered"] = answered[-REMEMBERED:]
+                self._write(current)
+        except (OSError, ValueError):
             return
-        answered.append(str(message_id))
-        current["answered"] = answered[-REMEMBERED:]
-        self._write(current)
 
     def last_answered(self) -> str | None:
         """The most recent message the holder dealt with, for a standby cursor.
@@ -147,11 +175,19 @@ class DiscordLease:
         not answered yet — which is the difference between a clean handover
         and quietly losing whatever was in flight when the holder died.
         """
-        answered = self._read().get("answered") or []
-        return str(answered[-1]) if answered else None
+        try:
+            with exclusive_file_lock(self._lock_path):
+                answered = self._read().get("answered") or []
+                return str(answered[-1]) if answered else None
+        except (OSError, ValueError):
+            return None
 
     def describe(self) -> dict[str, Any]:
-        current = self._read()
+        try:
+            with exclusive_file_lock(self._lock_path):
+                current = self._read()
+        except (OSError, ValueError):
+            current = {}
         return {
             "role": self.role,
             "owner": self.owner,

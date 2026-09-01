@@ -137,6 +137,7 @@ class Task:
             "grade": self.grade,
             "effort": self.effort,
             "attempts": self.attempts,
+            "metadata": self.metadata,
         }
 
     def describe(self) -> str:
@@ -225,12 +226,13 @@ class TaskStore:
         row = self._db.one("SELECT * FROM tasks WHERE name = ? COLLATE NOCASE", (needle,))
         return _from_row(row) if row else None
 
-    def all(self, *, enabled_only: bool = False) -> list[Task]:
+    def all(self, *, enabled_only: bool = False, include_hidden: bool = False) -> list[Task]:
         sql = "SELECT * FROM tasks"
         if enabled_only:
             sql += " WHERE enabled = 1"
         sql += " ORDER BY next_run IS NULL, next_run ASC"
-        return [_from_row(row) for row in self._db.query(sql)]
+        tasks = [_from_row(row) for row in self._db.query(sql)]
+        return tasks if include_hidden else [task for task in tasks if not task.metadata.get("hidden")]
 
     def due(self, now: float | None = None) -> list[Task]:
         now = time.time() if now is None else now
@@ -334,7 +336,7 @@ class TaskStore:
         return [dict(row) for row in self._db.query(sql, (*params, limit))]
 
     def __len__(self) -> int:
-        return int(self._db.scalar("SELECT COUNT(*) FROM tasks", default=0))
+        return len(self.all())
 
     def close(self) -> None:
         self._db.close()

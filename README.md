@@ -19,6 +19,30 @@ itsbob serve           # let it work on its own
 itsbob doctor          # what's configured, and what actually answers
 ```
 
+### Autonomous serve mode
+
+Run the normal scheduler plus one weighted self-directed task when the agent
+is idle:
+
+```bash
+itsbob serve --autonomous --mode guarded
+```
+
+`--autonomous` is an operational mode; `--mode` still independently controls
+tool permissions (`readonly`, `guarded`, `dry_run`, or `trusted`). Normal
+scheduled tasks always run first, and only one agent task can run at a time.
+At most one `itsbobtask` is created per hour. Lightweight work is selected more
+often than complex work; after an hour of silence, the rarer work becomes more
+likely. Generated tasks run immediately when the agent is free, are labelled
+`itsbobtask`, retained in run history but hidden from the ordinary task list,
+and their completion is remembered.
+
+Autonomous notifications are posted to the configured Discord channel with
+`@everyone`. The built-in pool covers memory condensation, user questions,
+news and web digests, script/task creation, and screen observation. Existing
+tool permissions still apply: guarded mode refuses confirmation-required tools
+because no person is present to approve them.
+
 ---
 
 ## What it does

@@ -17,7 +17,7 @@ dependencies = [
 # Install this extra only if you want to wrap the router in a LangChain chain.
 langchain = ["langchain>=0.3", "langchain-openai>=0.2"]
 gui = ["flask>=3.0"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 # Optional accelerator. Recall works without it by scanning the most recent
 # `vector_scan_limit` vectors in pure Python; with numpy the whole table is
 # compared in one matrix multiply, which matters past a few thousand memories.
